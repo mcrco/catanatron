@@ -94,8 +94,18 @@ class StatisticsAccumulator(GameAccumulator):
     def before(self, game):
         self.start = time.time()
 
-    def after(self, game):
-        duration = time.time() - self.start
+    def after(self, game, duration=None):
+        """
+        Process game statistics after completion.
+        
+        Args:
+            game: The completed game
+            duration: Optional pre-calculated duration (for parallel execution).
+                     If None, calculates from self.start (for sequential execution).
+        """
+        if duration is None:
+            duration = time.time() - self.start
+        
         winning_color = game.winning_color()
         if winning_color is None:
             return  # do not track

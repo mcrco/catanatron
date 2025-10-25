@@ -28,11 +28,13 @@ class ReinforcementLearningAccumulator(GameAccumulator):
             "TOURNAMENT_RETURN": get_tournament_total_return,
             "VICTORY_POINTS_RETURN": get_victory_points_total_return,
         },
+        verbose=True,
     ):
         self.include_board_tensor = include_board_tensor
         # TODO: Generalize to "rewards_fn" that can yield intermediary rewards
         #   while still rewarding big on terminal states.
         self.total_return_fns = total_return_fns
+        self.verbose = verbose
 
     def before(self, game):
         self.data = {
@@ -122,16 +124,17 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         else:
             main_df = pd.concat([samples_df, actions_df, returns_df], axis=1)
             results["main_df"] = main_df
-        print(
-            "Building matrices at took",
-            format_secs(time.time() - t1),
-        )
+        if self.verbose:
+            print(
+                "Building matrices at took",
+                format_secs(time.time() - t1),
+            )
         return results
 
 
 class CsvDataAccumulator(ReinforcementLearningAccumulator):
-    def __init__(self, output, include_board_tensor=True):
-        super().__init__(include_board_tensor)
+    def __init__(self, output, include_board_tensor=True, verbose=True):
+        super().__init__(include_board_tensor, verbose=verbose)
         self.output = output
 
     def after(self, game):
@@ -155,17 +158,18 @@ class CsvDataAccumulator(ReinforcementLearningAccumulator):
             main_df,
             self.output,
         )
-        print(
-            f"Saved matrices to {self.output}{' (including board tensors)' if self.include_board_tensor else ''} with shapes: "
-            f"main={main_df.shape}, samples={samples_df.shape}, actions={actions_df.shape}, "
-            f"rewards={returns_df.shape} in {format_secs(time.time() - t1)}"
-        )
+        if self.verbose:
+            print(
+                f"Saved matrices to {self.output}{' (including board tensors)' if self.include_board_tensor else ''} with shapes: "
+                f"main={main_df.shape}, samples={samples_df.shape}, actions={actions_df.shape}, "
+                f"rewards={returns_df.shape} in {format_secs(time.time() - t1)}"
+            )
         return samples_df, board_tensors_df, actions_df, returns_df
 
 
 class ParquetDataAccumulator(ReinforcementLearningAccumulator):
-    def __init__(self, output, include_board_tensor=True):
-        super().__init__(include_board_tensor)
+    def __init__(self, output, include_board_tensor=True, verbose=True):
+        super().__init__(include_board_tensor, verbose=verbose)
         self.output = output
 
     def after(self, game):
@@ -177,7 +181,8 @@ class ParquetDataAccumulator(ReinforcementLearningAccumulator):
         main_df = data["main_df"]
         filepath = os.path.join(self.output, f"{game.id}.parquet")
         main_df.to_parquet(filepath, index=False)
-        print(
-            f"Saved main_df to {self.output} with shapes {main_df.shape} in {format_secs(time.time() - t1)}"
-        )
+        if self.verbose:
+            print(
+                f"Saved main_df to {self.output} with shapes {main_df.shape} in {format_secs(time.time() - t1)}"
+            )
         return main_df

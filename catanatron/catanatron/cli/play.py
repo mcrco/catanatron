@@ -1,15 +1,15 @@
 import os
 import importlib.util
+import multiprocessing
+import time
 from dataclasses import dataclass
 from typing import Literal, Union
 
 import click
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress
 from rich.progress import Progress, BarColumn, TimeRemainingColumn
 from rich import box
-from rich.console import Console
 from rich.theme import Theme
 from rich.text import Text
 
@@ -129,6 +129,12 @@ class CustomTimeRemainingColumn(TimeRemainingColumn):
     help="Show player codes and exits.",
     is_flag=True,
 )
+@click.option(
+    "--workers",
+    default=1,
+    type=int,
+    help="Number of worker processes for parallel game execution. Default is 1 (sequential).",
+)
 def simulate(
     num,
     players,
@@ -142,6 +148,7 @@ def simulate(
     config_map,
     quiet,
     help_players,
+    workers,
 ):
     """
     Catan Bot Simulator.
@@ -152,7 +159,8 @@ def simulate(
         catanatron-play --players R,R,R,R --num 1000\n
         catanatron-play --players W,W,R,R --num 50000 --output data/ --output-format csv\n
         catanatron-play --players VP,F --num 10 --output data/ --ouput-format json\n
-        catanatron-play --players W,F,AB:3 --num 1 --ouput-format csv --db --quiet
+        catanatron-play --players W,F,AB:3 --num 1 --ouput-format csv --db --quiet\n
+        catanatron-play --players R,R,R,R --num 10000 --workers 8 --output data/ --output-format json
     """
     if code:
         abspath = os.path.abspath(code)
@@ -187,6 +195,7 @@ def simulate(
         output_options,
         game_config,
         quiet,
+        workers,
     )
 
 
@@ -227,6 +236,49 @@ def rich_color(color):
     return f"[{style}]{color.value}[/{style}]"
 
 
+def _run_single_game(args):
+    """
+    Run a single game in a worker process.
+    This function must be at module level to be picklable for multiprocessing.
+    
+    Args:
+        args: Tuple of (players, game_config, game_index, worker_accumulators_config)
+    
+    Returns:
+        Tuple of (game, duration) where duration is time taken to play the game
+    """
+    players, game_config, game_index, worker_accumulators_config = args
+    
+    # Reset player state
+    for player in players:
+        player.reset_state()
+    
+    # Create worker-side accumulators (for CSV/Parquet data generation)
+    worker_accumulators = []
+    if worker_accumulators_config:
+        for acc_type, acc_params in worker_accumulators_config:
+            if acc_type == "parquet":
+                from catanatron.gym.accumulators import ParquetDataAccumulator
+                worker_accumulators.append(ParquetDataAccumulator(**acc_params))
+            elif acc_type == "csv":
+                from catanatron.gym.accumulators import CsvDataAccumulator
+                worker_accumulators.append(CsvDataAccumulator(**acc_params))
+    
+    # Create and run the game
+    start_time = time.time()
+    catan_map = build_map(game_config.catan_map)
+    game = Game(
+        players,
+        discard_limit=game_config.discard_limit,
+        vps_to_win=game_config.vps_to_win,
+        catan_map=catan_map,
+    )
+    game.play(accumulators=worker_accumulators)
+    duration = time.time() - start_time
+    
+    return (game, duration)
+
+
 def play_batch_core(num_games, players, game_config, accumulators=[]):
     for accumulator in accumulators:
         if isinstance(accumulator, SimulationAccumulator):
@@ -250,12 +302,232 @@ def play_batch_core(num_games, players, game_config, accumulators=[]):
             accumulator.after_all()
 
 
+def _play_batch_parallel(
+    num_games,
+    players,
+    game_config,
+    accumulators,
+    statistics_accumulator,
+    vp_accumulator,
+    output_options,
+    quiet,
+    workers,
+):
+    """
+    Run games in parallel using multiprocessing.Pool.
+    """
+    # Call before_all for SimulationAccumulators
+    for accumulator in accumulators:
+        if isinstance(accumulator, SimulationAccumulator):
+            accumulator.before_all()
+    
+    # Separate accumulators: main-process vs worker-process
+    # Worker accumulators (CSV/Parquet) need to observe game actions as they happen
+    # Main accumulators (Statistics, VP, JSON, DB) only need final game state
+    worker_accumulators_config = []
+    main_process_accumulators = []
+    
+    for accumulator in accumulators:
+        # Check if this is a data accumulator that needs to run in worker
+        if hasattr(accumulator, '__class__'):
+            class_name = accumulator.__class__.__name__
+            if class_name == 'ParquetDataAccumulator':
+                worker_accumulators_config.append((
+                    'parquet',
+                    {
+                        'output': accumulator.output,
+                        'include_board_tensor': accumulator.include_board_tensor,
+                        'verbose': False  # Suppress output in parallel workers
+                    }
+                ))
+            elif class_name == 'CsvDataAccumulator':
+                worker_accumulators_config.append((
+                    'csv',
+                    {
+                        'output': accumulator.output,
+                        'include_board_tensor': accumulator.include_board_tensor,
+                        'verbose': False  # Suppress output in parallel workers
+                    }
+                ))
+            else:
+                # Other accumulators run in main process
+                main_process_accumulators.append(accumulator)
+        else:
+            main_process_accumulators.append(accumulator)
+    
+    # Prepare arguments for each game
+    game_args = [(players, game_config, i, worker_accumulators_config) for i in range(num_games)]
+    
+    if quiet:
+        # Run games in parallel without progress display
+        with multiprocessing.Pool(processes=workers) as pool:
+            results = pool.map(_run_single_game, game_args)
+        
+        # Process results through main-process accumulators only
+        # (CSV/Parquet already ran in workers)
+        for game, duration in results:
+            for accumulator in main_process_accumulators:
+                # Pass duration directly to StatisticsAccumulator
+                if isinstance(accumulator, StatisticsAccumulator):
+                    accumulator.after(game, duration=duration)
+                else:
+                    accumulator.after(game)
+        
+        # Call after_all for SimulationAccumulators
+        for accumulator in main_process_accumulators:
+            if isinstance(accumulator, SimulationAccumulator):
+                accumulator.after_all()
+        
+        return (
+            dict(statistics_accumulator.wins),
+            dict(statistics_accumulator.results_by_player),
+            statistics_accumulator.games,
+        )
+    
+    # Non-quiet mode: show progress and game details
+    last_n = 10
+    actual_last_n = min(last_n, num_games)
+    table = Table(title=f"Last {actual_last_n} Games", box=box.MINIMAL)
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("SEATING")
+    table.add_column("TURNS", justify="right")
+    for player in players:
+        table.add_column(f"{player.color.value} VP", justify="right")
+    table.add_column("WINNER")
+    if output_options.db:
+        table.add_column("LINK", overflow="fold")
+    
+    with Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        CustomTimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        main_task = progress.add_task(
+            f"Playing {num_games} games with {workers} workers...", total=num_games
+        )
+        player_tasks = [
+            progress.add_task(
+                rich_player_name(player), total=num_games, show_time=False
+            )
+            for player in players
+        ]
+        
+        # Run games in parallel and process results as they complete
+        with multiprocessing.Pool(processes=workers) as pool:
+            for i, (game, duration) in enumerate(pool.imap_unordered(_run_single_game, game_args)):
+                # Process through main-process accumulators only
+                # (CSV/Parquet already ran in workers)
+                for accumulator in main_process_accumulators:
+                    # Pass duration directly to StatisticsAccumulator
+                    if isinstance(accumulator, StatisticsAccumulator):
+                        accumulator.after(game, duration=duration)
+                    else:
+                        accumulator.after(game)
+                
+                winning_color = game.winning_color()
+                
+                # Add to table if in last N games
+                if (num_games - last_n) < (i + 1):
+                    seating = ",".join([rich_color(c) for c in game.state.colors])
+                    row = [
+                        str(i + 1),
+                        seating,
+                        str(game.state.num_turns),
+                    ]
+                    for player in players:
+                        points = get_actual_victory_points(game.state, player.color)
+                        row.append(str(points))
+                    row.append(rich_color(winning_color))
+                    if output_options.db:
+                        # Find DatabaseAccumulator if it exists
+                        db_accumulator = next(
+                            (acc for acc in accumulators if hasattr(acc, 'link')), None
+                        )
+                        if db_accumulator:
+                            row.append(db_accumulator.link)
+                    
+                    table.add_row(*row)
+                
+                # Update progress
+                progress.update(main_task, advance=1)
+                if winning_color is not None:
+                    winning_index = list(map(lambda p: p.color, players)).index(
+                        winning_color
+                    )
+                    winner_task = player_tasks[winning_index]
+                    progress.update(winner_task, advance=1)
+        
+        progress.refresh()
+    
+    console.print(table)
+    
+    # Call after_all for SimulationAccumulators
+    for accumulator in main_process_accumulators:
+        if isinstance(accumulator, SimulationAccumulator):
+            accumulator.after_all()
+    
+    # PLAYER SUMMARY
+    table = Table(title="Player Summary", box=box.MINIMAL)
+    table.add_column("", no_wrap=True)
+    table.add_column("WINS", justify="right")
+    table.add_column("AVG VP", justify="right")
+    table.add_column("AVG SETTLES", justify="right")
+    table.add_column("AVG CITIES", justify="right")
+    table.add_column("AVG ROAD", justify="right")
+    table.add_column("AVG ARMY", justify="right")
+    table.add_column("AVG DEV VP", justify="right")
+    for player in players:
+        vps = statistics_accumulator.results_by_player[player.color]
+        avg_vps = sum(vps) / len(vps)
+        avg_settlements = vp_accumulator.get_avg_settlements(player.color)
+        avg_cities = vp_accumulator.get_avg_cities(player.color)
+        avg_largest = vp_accumulator.get_avg_largest(player.color)
+        avg_longest = vp_accumulator.get_avg_longest(player.color)
+        avg_devvps = vp_accumulator.get_avg_devvps(player.color)
+        table.add_row(
+            rich_player_name(player),
+            str(statistics_accumulator.wins[player.color]),
+            f"{avg_vps:.2f}",
+            f"{avg_settlements:.2f}",
+            f"{avg_cities:.2f}",
+            f"{avg_longest:.2f}",
+            f"{avg_largest:.2f}",
+            f"{avg_devvps:.2f}",
+        )
+    console.print(table)
+    
+    # GAME SUMMARY
+    avg_ticks = f"{statistics_accumulator.get_avg_ticks():.2f}"
+    avg_turns = f"{statistics_accumulator.get_avg_turns():.2f}"
+    avg_duration = format_secs(statistics_accumulator.get_avg_duration())
+    table = Table(box=box.MINIMAL, title="Game Summary")
+    table.add_column("AVG TICKS", justify="right")
+    table.add_column("AVG TURNS", justify="right")
+    table.add_column("AVG DURATION", justify="right")
+    table.add_row(avg_ticks, avg_turns, avg_duration)
+    console.print(table)
+    
+    if output_options.output:
+        console.print(
+            f"{output_options.output_format} files saved at: [green]{output_options.output}[/green]"
+        )
+    
+    return (
+        dict(statistics_accumulator.wins),
+        dict(statistics_accumulator.results_by_player),
+        statistics_accumulator.games,
+    )
+
+
 def play_batch(
     num_games,
     players,
     output_options=None,
     game_config=None,
     quiet=False,
+    workers=1,
 ):
     output_options = output_options or OutputOptions()
     game_config = game_config or GameConfigOptions()
@@ -294,6 +566,21 @@ def play_batch(
     for accumulator_class in CUSTOM_ACCUMULATORS:
         accumulators.append(accumulator_class(players=players, game_config=game_config))
 
+    # Use parallel execution if workers > 1
+    if workers > 1:
+        return _play_batch_parallel(
+            num_games,
+            players,
+            game_config,
+            accumulators,
+            statistics_accumulator,
+            vp_accumulator,
+            output_options,
+            quiet,
+            workers,
+        )
+
+    # Sequential execution (original code path)
     if quiet:
         for _ in play_batch_core(num_games, players, game_config, accumulators):
             pass
