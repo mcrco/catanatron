@@ -168,9 +168,10 @@ class CsvDataAccumulator(ReinforcementLearningAccumulator):
 
 
 class ParquetDataAccumulator(ReinforcementLearningAccumulator):
-    def __init__(self, output, include_board_tensor=True, verbose=True):
+    def __init__(self, output, include_board_tensor=True, verbose=True, sample_rate=0.1):
         super().__init__(include_board_tensor, verbose=verbose)
         self.output = output
+        self.sample_rate = sample_rate
 
     def after(self, game):
         data = super().after(game)
@@ -179,10 +180,15 @@ class ParquetDataAccumulator(ReinforcementLearningAccumulator):
 
         t1 = time.time()
         main_df = data["main_df"]
+        
+        # Randomly sample sample_rate (default 10%) of game states
+        original_shape = main_df.shape
+        main_df = main_df.sample(frac=self.sample_rate, random_state=None)
+        
         filepath = os.path.join(self.output, f"{game.id}.parquet")
         main_df.to_parquet(filepath, index=False)
         if self.verbose:
             print(
-                f"Saved main_df to {self.output} with shapes {main_df.shape} in {format_secs(time.time() - t1)}"
+                f"Saved main_df to {self.output} with shapes {main_df.shape} (sampled {self.sample_rate*100}% from {original_shape[0]} states) in {format_secs(time.time() - t1)}"
             )
         return main_df
