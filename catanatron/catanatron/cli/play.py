@@ -91,6 +91,12 @@ class CustomTimeRemainingColumn(TimeRemainingColumn):
     help="Wether to generate 3D Tensor of the Board for CNN Learning (slower) when using --csv or --parquet.",
 )
 @click.option(
+    "--sample-rate",
+    default=1.0,
+    type=float,
+    help="Fraction of game states to sample per game (0.0-1.0). Default is 1.0 (keep all states).",
+)
+@click.option(
     "--db",
     default=False,
     is_flag=True,
@@ -142,6 +148,7 @@ def simulate(
     output,
     output_format,
     include_board_tensor,
+    sample_rate,
     db,
     config_discard_limit,
     config_vps_to_win,
@@ -187,7 +194,7 @@ def simulate(
                 players.append(player)
                 break
 
-    output_options = OutputOptions(output, output_format, include_board_tensor, db)
+    output_options = OutputOptions(output, output_format, include_board_tensor, sample_rate, db)
     game_config = GameConfigOptions(config_discard_limit, config_vps_to_win, config_map)
     play_batch(
         num,
@@ -206,6 +213,7 @@ class OutputOptions:
     output: Union[str, None] = None  # path to store files
     output_format: Union[Literal["csv", "parquet", "json"], None] = None
     include_board_tensor: bool = False
+    sample_rate: float = 1.0
     db: bool = False
 
 
@@ -337,6 +345,7 @@ def _play_batch_parallel(
                     {
                         'output': accumulator.output,
                         'include_board_tensor': accumulator.include_board_tensor,
+                        'sample_rate': accumulator.sample_rate,
                         'verbose': False  # Suppress output in parallel workers
                     }
                 ))
@@ -346,6 +355,7 @@ def _play_batch_parallel(
                     {
                         'output': accumulator.output,
                         'include_board_tensor': accumulator.include_board_tensor,
+                        'sample_rate': accumulator.sample_rate,
                         'verbose': False  # Suppress output in parallel workers
                     }
                 ))
@@ -544,7 +554,9 @@ def play_batch(
 
             accumulators.append(
                 CsvDataAccumulator(
-                    output_options.output, output_options.include_board_tensor
+                    output_options.output, 
+                    output_options.include_board_tensor,
+                    sample_rate=output_options.sample_rate
                 )
             )
         elif output_options.output_format == "parquet":
@@ -553,7 +565,9 @@ def play_batch(
 
             accumulators.append(
                 ParquetDataAccumulator(
-                    output_options.output, output_options.include_board_tensor
+                    output_options.output, 
+                    output_options.include_board_tensor,
+                    sample_rate=output_options.sample_rate
                 )
             )
         elif output_options.output_format == "json":

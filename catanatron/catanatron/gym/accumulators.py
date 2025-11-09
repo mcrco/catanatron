@@ -29,12 +29,14 @@ class ReinforcementLearningAccumulator(GameAccumulator):
             "VICTORY_POINTS_RETURN": get_victory_points_total_return,
         },
         verbose=True,
+        sample_rate=1.0,
     ):
         self.include_board_tensor = include_board_tensor
         # TODO: Generalize to "rewards_fn" that can yield intermediary rewards
         #   while still rewarding big on terminal states.
         self.total_return_fns = total_return_fns
         self.verbose = verbose
+        self.sample_rate = sample_rate
 
     def before(self, game):
         self.data = {
@@ -124,17 +126,29 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         else:
             main_df = pd.concat([samples_df, actions_df, returns_df], axis=1)
             results["main_df"] = main_df
-        if self.verbose:
-            print(
-                "Building matrices at took",
-                format_secs(time.time() - t1),
-            )
+        
+        # Apply sampling if sample_rate is less than 1.0
+        if self.sample_rate < 1.0:
+            original_shape = main_df.shape
+            main_df = main_df.sample(frac=self.sample_rate, random_state=None)
+            results["main_df"] = main_df
+            if self.verbose:
+                print(
+                    f"Building matrices took {format_secs(time.time() - t1)} "
+                    f"(sampled {self.sample_rate*100:.1f}% from {original_shape[0]} states to {main_df.shape[0]})"
+                )
+        else:
+            if self.verbose:
+                print(
+                    "Building matrices at took",
+                    format_secs(time.time() - t1),
+                )
         return results
 
 
 class CsvDataAccumulator(ReinforcementLearningAccumulator):
-    def __init__(self, output, include_board_tensor=True, verbose=True):
-        super().__init__(include_board_tensor, verbose=verbose)
+    def __init__(self, output, include_board_tensor=True, verbose=True, sample_rate=1.0):
+        super().__init__(include_board_tensor, verbose=verbose, sample_rate=sample_rate)
         self.output = output
 
     def after(self, game):
@@ -168,10 +182,9 @@ class CsvDataAccumulator(ReinforcementLearningAccumulator):
 
 
 class ParquetDataAccumulator(ReinforcementLearningAccumulator):
-    def __init__(self, output, include_board_tensor=True, verbose=True, sample_rate=0.1):
-        super().__init__(include_board_tensor, verbose=verbose)
+    def __init__(self, output, include_board_tensor=True, verbose=True, sample_rate=1.0):
+        super().__init__(include_board_tensor, verbose=verbose, sample_rate=sample_rate)
         self.output = output
-        self.sample_rate = sample_rate
 
     def after(self, game):
         data = super().after(game)
@@ -181,14 +194,10 @@ class ParquetDataAccumulator(ReinforcementLearningAccumulator):
         t1 = time.time()
         main_df = data["main_df"]
         
-        # Randomly sample sample_rate (default 10%) of game states
-        original_shape = main_df.shape
-        main_df = main_df.sample(frac=self.sample_rate, random_state=None)
-        
         filepath = os.path.join(self.output, f"{game.id}.parquet")
         main_df.to_parquet(filepath, index=False)
         if self.verbose:
             print(
-                f"Saved main_df to {self.output} with shapes {main_df.shape} (sampled {self.sample_rate*100}% from {original_shape[0]} states) in {format_secs(time.time() - t1)}"
+                f"Saved main_df to {self.output} with shape {main_df.shape} in {format_secs(time.time() - t1)}"
             )
         return main_df

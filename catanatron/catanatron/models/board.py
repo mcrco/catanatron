@@ -129,20 +129,35 @@ class Board:
 
                     # split this components on here.
                     b_index = self._get_connected_component_index(node_id, edge_color)
-                    del self.connected_components[edge_color][b_index]
-                    self.connected_components[edge_color].append(a_nodeset)
-                    self.connected_components[edge_color].append(c_nodeset)
+                    did_split = False
+                    if b_index is not None:
+                        del self.connected_components[edge_color][b_index]
+                        self.connected_components[edge_color].append(a_nodeset)
+                        self.connected_components[edge_color].append(c_nodeset)
+                        did_split = True
+                    else:
+                        # If the intersection node wasn't tracked in that color's component,
+                        # try to find the single component that contains both sides (a and c)
+                        # and split that one instead.
+                        a_index = self._get_connected_component_index(a, edge_color)
+                        c_index = self._get_connected_component_index(c, edge_color)
+                        if a_index is not None and a_index == c_index:
+                            del self.connected_components[edge_color][a_index]
+                            self.connected_components[edge_color].append(a_nodeset)
+                            self.connected_components[edge_color].append(c_nodeset)
+                            did_split = True
 
-                    # Update longest road by plowed player. Compare again with all
-                    self.road_lengths[edge_color] = max(
-                        *[
-                            len(longest_acyclic_path(self, component, edge_color))
-                            for component in self.connected_components[edge_color]
-                        ]
-                    )
-                    self.road_color, self.road_length = max(
-                        self.road_lengths.items(), key=lambda e: e[1]
-                    )
+                    if did_split:
+                        # Update longest road by plowed player. Compare again with all
+                        self.road_lengths[edge_color] = max(
+                            *[
+                                len(longest_acyclic_path(self, component, edge_color))
+                                for component in self.connected_components[edge_color]
+                            ]
+                        )
+                        self.road_color, self.road_length = max(
+                            self.road_lengths.items(), key=lambda e: e[1]
+                        )
 
         self.board_buildable_ids.discard(node_id)
         for n in STATIC_GRAPH.neighbors(node_id):
