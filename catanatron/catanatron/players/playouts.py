@@ -46,10 +46,10 @@ class GreedyPlayoutsPlayer(Player):
                 best_action = action
                 max_wins = wins
 
-        print(
-            f"Greedy took {time.time() - start} secs to decide "
-            + f"{len(playable_actions)} at {num_playouts} per action"
-        )
+        # print(
+        #     f"Greedy took {time.time() - start} secs to decide "
+        #     + f"{len(playable_actions)} at {num_playouts} per action"
+        # )
         return best_action
 
 
