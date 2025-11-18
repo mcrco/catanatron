@@ -279,7 +279,7 @@ class CatanatronEnv(gym.Env):
     def _turn_vp_reward(self, game: Game, p0_color: Color) -> float:
         current_vps = self._get_actual_vps(p0_color)
         previous_vps = self._previous_actual_vps.get(p0_color, current_vps)
-        reward = current_vps - previous_vps
+        reward = (current_vps - previous_vps) / self.vps_to_win
         self._previous_actual_vps[p0_color] = current_vps
         return reward
 
