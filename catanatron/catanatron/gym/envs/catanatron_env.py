@@ -1,4 +1,4 @@
-from typing import TypedDict, Union
+from typing import Dict, TypedDict, Union
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -17,6 +17,7 @@ from catanatron.gym.board_tensor_features import (
     get_channels,
     is_graph_feature,
 )
+from catanatron.state_functions import player_key
 
 
 BASE_TOPOLOGY = BASE_MAP_TEMPLATE.topology
@@ -134,7 +135,8 @@ class CatanatronEnv(gym.Env):
     def __init__(self, config=None):
         self.config = config or dict()
         self.invalid_action_reward = self.config.get("invalid_action_reward", -1)
-        self.reward_function = self.config.get("reward_function", simple_reward)
+        configured_reward = self.config.get("reward_function")
+        self.reward_function = configured_reward or self._turn_vp_reward
         self.map_type = self.config.get("map_type", "BASE")
         self.vps_to_win = self.config.get("vps_to_win", 10)
         self.enemies = self.config.get("enemies", [RandomPlayer(Color.RED)])
@@ -148,6 +150,7 @@ class CatanatronEnv(gym.Env):
         self.features = get_feature_ordering(len(self.players), self.map_type)
         self.invalid_actions_count = 0
         self.max_invalid_actions = 10
+        self._previous_actual_vps: Dict[Color, int] = {}
 
         # TODO: Make self.action_space tighter if possible (per map_type)
         self.action_space = spaces.Discrete(ACTION_SPACE_SIZE)
@@ -238,6 +241,7 @@ class CatanatronEnv(gym.Env):
         self.invalid_actions_count = 0
 
         self._advance_until_p0_decision()
+        self._cache_player_vps()
 
         observation = self._get_observation()
         info = dict(valid_actions=self.get_valid_actions())
@@ -261,6 +265,23 @@ class CatanatronEnv(gym.Env):
             and self.game.state.current_color() != self.p0.color
         ):
             self.game.play_tick()  # will play bot
+
+    def _cache_player_vps(self):
+        if self.game is None:
+            return
+        for color in self.game.state.colors:
+            self._previous_actual_vps[color] = self._get_actual_vps(color)
+
+    def _get_actual_vps(self, color: Color) -> int:
+        key = player_key(self.game.state, color)
+        return self.game.state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
+
+    def _turn_vp_reward(self, game: Game, p0_color: Color) -> float:
+        current_vps = self._get_actual_vps(p0_color)
+        previous_vps = self._previous_actual_vps.get(p0_color, current_vps)
+        reward = current_vps - previous_vps
+        self._previous_actual_vps[p0_color] = current_vps
+        return reward
 
 
 CatanatronEnv.__doc__ = f"""
