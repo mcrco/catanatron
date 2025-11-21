@@ -30,7 +30,7 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         },
         verbose=True,
         sample_rate=1.0,
-        ignore_single_action_steps=True
+        ignore_single_action_steps=True,
     ):
         self.include_board_tensor = include_board_tensor
         # TODO: Generalize to "rewards_fn" that can yield intermediary rewards
@@ -38,6 +38,7 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         self.total_return_fns = total_return_fns
         self.verbose = verbose
         self.sample_rate = sample_rate
+        self.ignore_single_action_steps = ignore_single_action_steps
 
     def before(self, game):
         self.data = {
@@ -51,21 +52,14 @@ class ReinforcementLearningAccumulator(GameAccumulator):
             self.data["board_tensors"] = []
 
     def step(self, game_before_action, action):
-        # Single action steps (usually dice rolls + end turns) are useless for training models. 
-        if (
-            self.ignore_single_action_steps and 
-            len(game_before_action.state.playable_actions) == 1
-        ):
+        # Single action steps (usually dice rolls + end turns) are useless for training models.
+        if self.ignore_single_action_steps and len(game_before_action.state.playable_actions) == 1:
             return
 
-        self.data["color_action_indices"][action.color].append(
-            len(self.data["samples"])
-        )
+        self.data["color_action_indices"][action.color].append(len(self.data["samples"]))
         self.data["acting_color"].append(action.color)
         self.data["samples"].append(create_sample(game_before_action, action.color))
-        self.data["actions"].append(
-            [to_action_space(action), to_action_type_space(action)]
-        )
+        self.data["actions"].append([to_action_space(action), to_action_type_space(action)])
 
         if self.include_board_tensor:
             board_tensor = create_board_tensor(game_before_action, action.color)
@@ -87,9 +81,7 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         for color, action_indices in self.data["color_action_indices"].items():
             # Set total return for the return of the perspective of this player
             player_returns = {
-                name: np.full_like(
-                    action_indices, total_return_fn(game, color), dtype=np.float64
-                )
+                name: np.full_like(action_indices, total_return_fn(game, color), dtype=np.float64)
                 for name, total_return_fn in self.total_return_fns.items()
             }
 
@@ -111,9 +103,7 @@ class ReinforcementLearningAccumulator(GameAccumulator):
             .astype("float64")
             .add_prefix("F_")
         )
-        actions_df = pd.DataFrame(actions, columns=["ACTION", "ACTION_TYPE"]).astype(
-            "int"
-        )
+        actions_df = pd.DataFrame(actions, columns=["ACTION", "ACTION_TYPE"]).astype("int")
         returns_df = pd.DataFrame({**returns, **discount_columns}).astype("float64")
 
         results = {
@@ -123,18 +113,14 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         }
         if self.include_board_tensor:
             board_tensors = self.data["board_tensors"]
-            board_tensors_df = (
-                pd.DataFrame(board_tensors).astype("float64").add_prefix("BT_")
-            )
-            main_df = pd.concat(
-                [samples_df, board_tensors_df, actions_df, returns_df], axis=1
-            )
+            board_tensors_df = pd.DataFrame(board_tensors).astype("float64").add_prefix("BT_")
+            main_df = pd.concat([samples_df, board_tensors_df, actions_df, returns_df], axis=1)
             results["board_tensors_df"] = board_tensors_df
             results["main_df"] = main_df
         else:
             main_df = pd.concat([samples_df, actions_df, returns_df], axis=1)
             results["main_df"] = main_df
-        
+
         # Apply sampling if sample_rate is less than 1.0
         if self.sample_rate < 1.0:
             original_shape = main_df.shape
@@ -143,7 +129,7 @@ class ReinforcementLearningAccumulator(GameAccumulator):
             if self.verbose:
                 print(
                     f"Building matrices took {format_secs(time.time() - t1)} "
-                    f"(sampled {self.sample_rate*100:.1f}% from {original_shape[0]} states to {main_df.shape[0]})"
+                    f"(sampled {self.sample_rate * 100:.1f}% from {original_shape[0]} states to {main_df.shape[0]})"
                 )
         else:
             if self.verbose:
@@ -167,9 +153,7 @@ class CsvDataAccumulator(ReinforcementLearningAccumulator):
         t1 = time.time()
         main_df = data["main_df"]
         samples_df = data["samples_df"]
-        board_tensors_df = (
-            None if not self.include_board_tensor else data["board_tensors_df"]
-        )
+        board_tensors_df = None if not self.include_board_tensor else data["board_tensors_df"]
         actions_df = data["actions_df"]
         returns_df = data["returns_df"]
         populate_matrices(
@@ -190,8 +174,20 @@ class CsvDataAccumulator(ReinforcementLearningAccumulator):
 
 
 class ParquetDataAccumulator(ReinforcementLearningAccumulator):
-    def __init__(self, output, include_board_tensor=True, verbose=True, sample_rate=1.0):
-        super().__init__(include_board_tensor, verbose=verbose, sample_rate=sample_rate)
+    def __init__(
+        self,
+        output,
+        include_board_tensor=True,
+        verbose=True,
+        sample_rate=1.0,
+        ignore_single_action_steps=True,
+    ):
+        super().__init__(
+            include_board_tensor,
+            verbose=verbose,
+            sample_rate=sample_rate,
+            ignore_single_action_steps=ignore_single_action_steps,
+        )
         self.output = output
 
     def after(self, game):
@@ -201,7 +197,7 @@ class ParquetDataAccumulator(ReinforcementLearningAccumulator):
 
         t1 = time.time()
         main_df = data["main_df"]
-        
+
         filepath = os.path.join(self.output, f"{game.id}.parquet")
         main_df.to_parquet(filepath, index=False)
         if self.verbose:
