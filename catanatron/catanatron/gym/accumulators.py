@@ -30,6 +30,7 @@ class ReinforcementLearningAccumulator(GameAccumulator):
         },
         verbose=True,
         sample_rate=1.0,
+        ignore_single_action_steps=True
     ):
         self.include_board_tensor = include_board_tensor
         # TODO: Generalize to "rewards_fn" that can yield intermediary rewards
@@ -50,6 +51,13 @@ class ReinforcementLearningAccumulator(GameAccumulator):
             self.data["board_tensors"] = []
 
     def step(self, game_before_action, action):
+        # Single action steps (usually dice rolls + end turns) are useless for training models. 
+        if (
+            self.ignore_single_action_steps and 
+            len(game_before_action.state.playable_actions) == 1
+        ):
+            return
+
         self.data["color_action_indices"][action.color].append(
             len(self.data["samples"])
         )
