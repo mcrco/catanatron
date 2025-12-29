@@ -76,8 +76,7 @@ def generate_playable_actions(state) -> List[Action]:
             actions.extend(city_possibilities(state, color))
 
             can_buy_dev_card = (
-                player_can_afford_dev_card(state, color)
-                and len(state.development_listdeck) > 0
+                player_can_afford_dev_card(state, color) and len(state.development_listdeck) > 0
             )
             if can_buy_dev_card:
                 actions.append(Action(color, ActionType.BUY_DEVELOPMENT_CARD, None))
@@ -86,7 +85,7 @@ def generate_playable_actions(state) -> List[Action]:
             actions.extend(maritime_trade_possibilities(state, color))
         return actions
     elif action_prompt == ActionPrompt.DISCARD:
-        return discard_possibilities(color)
+        return discard_possibilities(state, color)
     elif action_prompt == ActionPrompt.DECIDE_TRADE:
         actions = [Action(color, ActionType.REJECT_TRADE, state.current_trade)]
 
@@ -161,21 +160,14 @@ def road_building_possibilities(state, color, check_money=True) -> List[Action]:
 
 def settlement_possibilities(state, color, initial_build_phase=False) -> List[Action]:
     if initial_build_phase:
-        buildable_node_ids = state.board.buildable_node_ids(
-            color, initial_build_phase=True
-        )
+        buildable_node_ids = state.board.buildable_node_ids(color, initial_build_phase=True)
         return [
-            Action(color, ActionType.BUILD_SETTLEMENT, node_id)
-            for node_id in buildable_node_ids
+            Action(color, ActionType.BUILD_SETTLEMENT, node_id) for node_id in buildable_node_ids
         ]
     else:
         key = player_key(state, color)
-        has_money = player_resource_freqdeck_contains(
-            state, color, SETTLEMENT_COST_FREQDECK
-        )
-        has_settlements_available = (
-            state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"] > 0
-        )
+        has_money = player_resource_freqdeck_contains(state, color, SETTLEMENT_COST_FREQDECK)
+        has_settlements_available = state.player_state[f"{key}_SETTLEMENTS_AVAILABLE"] > 0
         if has_money and has_settlements_available:
             buildable_node_ids = state.board.buildable_node_ids(color)
             return [
@@ -223,15 +215,11 @@ def robber_possibilities(state, color) -> List[Action]:
                     to_steal_from.add(candidate_color)
 
         if len(to_steal_from) == 0:
-            actions.append(
-                Action(color, ActionType.MOVE_ROBBER, (coordinate, None, None))
-            )
+            actions.append(Action(color, ActionType.MOVE_ROBBER, (coordinate, None, None)))
         else:
             for enemy_color in to_steal_from:
                 actions.append(
-                    Action(
-                        color, ActionType.MOVE_ROBBER, (coordinate, enemy_color, None)
-                    )
+                    Action(color, ActionType.MOVE_ROBBER, (coordinate, enemy_color, None))
                 )
 
     return actions
@@ -248,24 +236,13 @@ def initial_road_possibilities(state, color) -> List[Action]:
     return [Action(color, ActionType.BUILD_ROAD, edge) for edge in buildable_edges]
 
 
-def discard_possibilities(color) -> List[Action]:
-    return [Action(color, ActionType.DISCARD, None)]
-    # TODO: Be robust to high dimensionality of DISCARD
-    # hand = player.resource_deck.to_array()
-    # num_cards = player.resource_deck.num_cards()
-    # num_to_discard = num_cards // 2
-
-    # num_possibilities = ncr(num_cards, num_to_discard)
-    # if num_possibilities > 100:  # if too many, just take first N
-    #     return [Action(player, ActionType.DISCARD, hand[:num_to_discard])]
-
-    # to_discard = itertools.combinations(hand, num_to_discard)
-    # return list(
-    #     map(
-    #         lambda combination: Action(player, ActionType.DISCARD, combination),
-    #         to_discard,
-    #     )
-    # )
+def discard_possibilities(state, color) -> List[Action]:
+    """Return actions for discarding one card of each resource type the player owns."""
+    actions = []
+    for resource in RESOURCES:
+        if player_num_resource_cards(state, color, resource) > 0:
+            actions.append(Action(color, ActionType.DISCARD, resource))
+    return actions
 
 
 def ncr(n, r):
@@ -277,17 +254,13 @@ def ncr(n, r):
 
 
 def maritime_trade_possibilities(state, color) -> List[Action]:
-    hand_freqdeck = [
-        player_num_resource_cards(state, color, resource) for resource in RESOURCES
-    ]
+    hand_freqdeck = [player_num_resource_cards(state, color, resource) for resource in RESOURCES]
     port_resources = state.board.get_player_port_resources(color)
     trade_offers = inner_maritime_trade_possibilities(
         hand_freqdeck, state.resource_freqdeck, port_resources
     )
 
-    return list(
-        map(lambda t: Action(color, ActionType.MARITIME_TRADE, t), trade_offers)
-    )
+    return list(map(lambda t: Action(color, ActionType.MARITIME_TRADE, t), trade_offers))
 
 
 def inner_maritime_trade_possibilities(hand_freqdeck, bank_freqdeck, port_resources):
@@ -309,10 +282,7 @@ def inner_maritime_trade_possibilities(hand_freqdeck, bank_freqdeck, port_resour
             resource_out: List[Any] = [resource] * rates[resource]
             resource_out += [None] * (4 - rates[resource])
             for j_resource in RESOURCES:
-                if (
-                    resource != j_resource
-                    and freqdeck_count(bank_freqdeck, j_resource) > 0
-                ):
+                if resource != j_resource and freqdeck_count(bank_freqdeck, j_resource) > 0:
                     trade_offer = tuple(resource_out + [j_resource])
                     trade_offers.add(trade_offer)
 

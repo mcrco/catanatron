@@ -54,7 +54,6 @@ from catanatron.state_functions import (
     player_deck_random_draw,
     player_deck_replenish,
     player_freqdeck_subtract,
-    player_deck_to_array,
     player_key,
     player_num_resource_cards,
     player_resource_freqdeck_contains,
@@ -146,9 +145,7 @@ class State:
             for index in range(len(self.colors)):
                 for key, value in PLAYER_INITIAL_STATE.items():
                     self.player_state[f"P{index}_{key}"] = value
-            self.color_to_index = {
-                color: index for index, color in enumerate(self.colors)
-            }
+            self.color_to_index = {color: index for index, color in enumerate(self.colors)}
 
             self.resource_freqdeck = starting_resource_bank()
             self.development_listdeck = starting_devcard_bank()
@@ -177,6 +174,9 @@ class State:
             self.is_resolving_trade = False
             self.current_trade: Tuple = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             self.acceptees = tuple(False for _ in self.colors)
+
+            # Track how many cards each player still needs to discard
+            self.cards_to_discard: Dict[Color, int] = {}
 
             self.playable_actions = generate_playable_actions(self)
 
@@ -208,9 +208,7 @@ class State:
         state_copy.resource_freqdeck = self.resource_freqdeck.copy()
         state_copy.development_listdeck = self.development_listdeck.copy()
 
-        state_copy.buildings_by_color = pickle.loads(
-            pickle.dumps(self.buildings_by_color)
-        )
+        state_copy.buildings_by_color = pickle.loads(pickle.dumps(self.buildings_by_color))
         state_copy.actions = self.actions.copy()
         state_copy.num_turns = self.num_turns
 
@@ -229,6 +227,8 @@ class State:
         state_copy.is_resolving_trade = self.is_resolving_trade
         state_copy.current_trade = self.current_trade
         state_copy.acceptees = self.acceptees
+
+        state_copy.cards_to_discard = self.cards_to_discard.copy()
 
         state_copy.playable_actions = self.playable_actions
         return state_copy
@@ -257,9 +257,7 @@ def yield_resources(board: Board, resource_freqdeck, number):
             Second is an array of resources that couldn't be yieleded
             because they depleted.
     """
-    intented_payout: Dict[Color, Dict[FastResource, int]] = defaultdict(
-        lambda: defaultdict(int)
-    )
+    intented_payout: Dict[Color, Dict[FastResource, int]] = defaultdict(lambda: defaultdict(int))
     resource_totals: Dict[FastResource, int] = defaultdict(int)
     for coordinate, tile in board.map.land_tiles.items():
         if tile.number != number or board.robber_coordinate == coordinate:
@@ -346,7 +344,7 @@ def apply_action(state: State, action: Action):
             if is_second_house:
                 key = player_key(state, action.color)
                 for tile in state.board.map.adjacent_tiles[node_id]:
-                    if tile.resource != None:
+                    if tile.resource is not None:
                         freqdeck_draw(state.resource_freqdeck, 1, tile.resource)  # type: ignore
                         state.player_state[f"{key}_{tile.resource}_IN_HAND"] += 1
 
@@ -462,14 +460,21 @@ def apply_action(state: State, action: Action):
         action = Action(action.color, action.action_type, dices)
 
         if number == 7:
-            discarders = [
-                player_num_resource_cards(state, color) > state.discard_limit
-                for color in state.colors
-            ]
-            should_enter_discarding_sequence = any(discarders)
+            # Calculate how many cards each player needs to discard
+            state.cards_to_discard = {}
+            for color in state.colors:
+                num_cards = player_num_resource_cards(state, color)
+                if num_cards > state.discard_limit:
+                    state.cards_to_discard[color] = num_cards // 2
+
+            should_enter_discarding_sequence = bool(state.cards_to_discard)
 
             if should_enter_discarding_sequence:
-                state.current_player_index = discarders.index(True)
+                # Find first player who needs to discard
+                first_discarder_index = next(
+                    i for i, color in enumerate(state.colors) if state.cards_to_discard[color] > 0
+                )
+                state.current_player_index = first_discarder_index
                 state.current_prompt = ActionPrompt.DISCARD
                 state.is_discarding = True
             else:
@@ -490,32 +495,54 @@ def apply_action(state: State, action: Action):
             state.current_prompt = ActionPrompt.PLAY_TURN
             state.playable_actions = generate_playable_actions(state)
     elif action.action_type == ActionType.DISCARD:
-        hand = player_deck_to_array(state, action.color)
-        num_to_discard = len(hand) // 2
-        if action.value is None:
-            # TODO: Forcefully discard randomly so that decision tree doesnt explode in possibilities.
-            discarded = random.sample(hand, k=num_to_discard)
+        if isinstance(action.value, (list, tuple)) and len(action.value) > 0:
+            # Backward compatibility: old format with list of cards
+            # Discard all at once for replay compatibility
+            discarded = action.value
+            to_discard = freqdeck_from_listdeck(discarded)
+            player_freqdeck_subtract(state, action.color, to_discard)
+            state.resource_freqdeck = freqdeck_add(state.resource_freqdeck, to_discard)
+            # Player is done discarding
+            state.cards_to_discard.pop(action.color, None)
+            resource_to_discard = None  # Skip single card discard logic
         else:
-            discarded = action.value  # for replay functionality
-        to_discard = freqdeck_from_listdeck(discarded)
+            # New format: single resource type
+            resource_to_discard = action.value
 
-        player_freqdeck_subtract(state, action.color, to_discard)
-        state.resource_freqdeck = freqdeck_add(state.resource_freqdeck, to_discard)
-        action = Action(action.color, action.action_type, discarded)
+        if resource_to_discard is not None:
+            to_discard = freqdeck_from_listdeck([resource_to_discard])
+            player_freqdeck_subtract(state, action.color, to_discard)
+            state.resource_freqdeck = freqdeck_add(state.resource_freqdeck, to_discard)
+            action = Action(action.color, action.action_type, resource_to_discard)
+            if action.color in state.cards_to_discard:
+                state.cards_to_discard[action.color] -= 1
+                if state.cards_to_discard[action.color] <= 0:
+                    state.cards_to_discard.pop(action.color, None)
 
-        # Advance turn
-        discarders_left = [
-            player_num_resource_cards(state, color) > 7 for color in state.colors
-        ][state.current_player_index + 1 :]
-        if any(discarders_left):
-            to_skip = discarders_left.index(True)
-            state.current_player_index = state.current_player_index + 1 + to_skip
-            # state.current_prompt stays the same
-        else:
-            state.current_player_index = state.current_turn_index
-            state.current_prompt = ActionPrompt.MOVE_ROBBER
-            state.is_discarding = False
-            state.is_moving_knight = True
+        # Check if current player is done discarding
+        current_color = state.colors[state.current_player_index]
+        if state.cards_to_discard.get(current_color, 0) <= 0:
+            state.cards_to_discard.pop(current_color, None)
+            # Current player is done, move to next player who needs to discard
+            remaining_after_current = next(
+                (
+                    i
+                    for i in range(state.current_player_index + 1, len(state.colors))
+                    if state.cards_to_discard.get(state.colors[i], 0) > 0
+                ),
+                None,
+            )
+
+            if remaining_after_current is not None:
+                state.current_player_index = remaining_after_current
+                # state.current_prompt stays the same (DISCARD)
+            else:
+                # All players are done discarding, move onto robber placement
+                state.current_player_index = state.current_turn_index
+                state.current_prompt = ActionPrompt.MOVE_ROBBER
+                state.is_discarding = False
+                state.is_moving_knight = True
+                state.cards_to_discard = {}
 
         state.playable_actions = generate_playable_actions(state)
     elif action.action_type == ActionType.MOVE_ROBBER:
@@ -552,9 +579,7 @@ def apply_action(state: State, action: Action):
         if not freqdeck_contains(state.resource_freqdeck, cards_selected):
             raise ValueError("Not enough resources of this type (these types?) in bank")
         player_freqdeck_add(state, action.color, cards_selected)
-        state.resource_freqdeck = freqdeck_subtract(
-            state.resource_freqdeck, cards_selected
-        )
+        state.resource_freqdeck = freqdeck_subtract(state.resource_freqdeck, cards_selected)
         play_dev_card(state, action.color, YEAR_OF_PLENTY)
 
         # state.current_player_index stays the same
@@ -568,12 +593,8 @@ def apply_action(state: State, action: Action):
         for color in state.colors:
             if not color == action.color:
                 key = player_key(state, color)
-                number_of_cards_to_steal = state.player_state[
-                    f"{key}_{mono_resource}_IN_HAND"
-                ]
-                freqdeck_replenish(
-                    cards_stolen, number_of_cards_to_steal, mono_resource
-                )
+                number_of_cards_to_steal = state.player_state[f"{key}_{mono_resource}_IN_HAND"]
+                freqdeck_replenish(cards_stolen, number_of_cards_to_steal, mono_resource)
                 player_deck_draw(state, color, mono_resource, number_of_cards_to_steal)
         player_freqdeck_add(state, action.color, cards_stolen)
         play_dev_card(state, action.color, MONOPOLY)
@@ -594,9 +615,7 @@ def apply_action(state: State, action: Action):
         state.playable_actions = generate_playable_actions(state)
     elif action.action_type == ActionType.MARITIME_TRADE:
         trade_offer = action.value
-        offering = freqdeck_from_listdeck(
-            filter(lambda r: r is not None, trade_offer[:-1])
-        )
+        offering = freqdeck_from_listdeck(filter(lambda r: r is not None, trade_offer[:-1]))
         asking = freqdeck_from_listdeck(trade_offer[-1:])
         if not player_resource_freqdeck_contains(state, action.color, offering):
             raise ValueError("Trying to trade without money")

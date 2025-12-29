@@ -26,7 +26,7 @@ ACTIONS_ARRAY = [
     (ActionType.ROLL, None),
     # TODO: One for each tile (and abuse 1v1 setting).
     *[(ActionType.MOVE_ROBBER, tile) for tile in TILE_COORDINATES],
-    (ActionType.DISCARD, None),
+    *[(ActionType.DISCARD, resource) for resource in RESOURCES],
     *[(ActionType.BUILD_ROAD, tuple(sorted(edge))) for edge in get_edges()],
     *[(ActionType.BUILD_SETTLEMENT, node_id) for node_id in range(NUM_NODES)],
     *[(ActionType.BUILD_CITY, node_id) for node_id in range(NUM_NODES)],
@@ -80,8 +80,6 @@ def normalize_action(action):
     elif normalized.action_type == ActionType.BUILD_ROAD:
         return Action(action.color, action.action_type, tuple(sorted(action.value)))
     elif normalized.action_type == ActionType.BUY_DEVELOPMENT_CARD:
-        return Action(action.color, action.action_type, None)
-    elif normalized.action_type == ActionType.DISCARD:
         return Action(action.color, action.action_type, None)
     return normalized
 
@@ -162,9 +160,7 @@ class CatanatronEnv(gym.Env):
             board_tensor_space = spaces.Box(
                 low=0, high=1, shape=(channels, 21, 11), dtype=np.float64
             )
-            self.numeric_features = [
-                f for f in self.features if not is_graph_feature(f)
-            ]
+            self.numeric_features = [f for f in self.features if not is_graph_feature(f)]
             # TODO: This could be tigher (e.g. _ROADS_AVAILABLE <= 15)
             numeric_space = spaces.Box(
                 low=0, high=HIGH, shape=(len(self.numeric_features),), dtype=np.float64
@@ -200,8 +196,7 @@ class CatanatronEnv(gym.Env):
             observation = self._get_observation()
             winning_color = self.game.winning_color()
             done = (
-                winning_color is not None
-                or self.invalid_actions_count > self.max_invalid_actions
+                winning_color is not None or self.invalid_actions_count > self.max_invalid_actions
             )
             terminated = winning_color is not None
             truncated = (
@@ -221,7 +216,7 @@ class CatanatronEnv(gym.Env):
         terminated = winning_color is not None
         truncated = self.game.state.num_turns >= TURNS_LIMIT
         reward = self.reward_function(self.game, self.p0.color)
-        
+
         # For VP difference reward, adjust terminal reward to make total = -1 or 1
         if self.reward_function == self._turn_vp_difference_reward:
             self._cumulative_reward += reward
@@ -254,12 +249,12 @@ class CatanatronEnv(gym.Env):
 
         self._advance_until_p0_decision()
         self._cache_player_vps()
-        
+
         # Initialize previous VP difference for VP difference reward
         p0_vps = self._get_actual_vps(self.p0.color)
         opponent_vps = max(
-            self._get_actual_vps(color) 
-            for color in self.game.state.colors 
+            self._get_actual_vps(color)
+            for color in self.game.state.colors
             if color != self.p0.color
         )
         self._previous_vp_difference = p0_vps - opponent_vps
@@ -272,9 +267,7 @@ class CatanatronEnv(gym.Env):
     def _get_observation(self) -> Union[np.ndarray, MixedObservation]:
         sample = create_sample(self.game, self.p0.color)
         if self.representation == "mixed":
-            board_tensor = create_board_tensor(
-                self.game, self.p0.color, channels_first=True
-            )
+            board_tensor = create_board_tensor(self.game, self.p0.color, channels_first=True)
             numeric = np.array([float(sample[i]) for i in self.numeric_features])
             return {"board": board_tensor, "numeric": numeric}
 
@@ -282,8 +275,7 @@ class CatanatronEnv(gym.Env):
 
     def _advance_until_p0_decision(self):
         while (
-            self.game.winning_color() is None
-            and self.game.state.current_color() != self.p0.color
+            self.game.winning_color() is None and self.game.state.current_color() != self.p0.color
         ):
             self.game.play_tick()  # will play bot
 
@@ -306,23 +298,21 @@ class CatanatronEnv(gym.Env):
 
     def _turn_vp_difference_reward(self, game: Game, p0_color: Color) -> float:
         """Reward based on change in VP difference between p0 and opponents.
-        
+
         During the game: reward = (change in VP difference) / vps_to_win
         At the end: adds terminal reward to make total reward = -1 or 1
         """
         # Calculate current VP difference (p0 VPs - max opponent VPs)
         p0_vps = self._get_actual_vps(p0_color)
         opponent_vps = max(
-            self._get_actual_vps(color) 
-            for color in game.state.colors 
-            if color != p0_color
+            self._get_actual_vps(color) for color in game.state.colors if color != p0_color
         )
         current_vp_difference = p0_vps - opponent_vps
-        
+
         # Calculate reward based on change in difference
         reward = (current_vp_difference - self._previous_vp_difference) / self.vps_to_win
         self._previous_vp_difference = current_vp_difference
-        
+
         return reward
 
 
