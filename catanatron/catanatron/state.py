@@ -472,7 +472,9 @@ def apply_action(state: State, action: Action):
             if should_enter_discarding_sequence:
                 # Find first player who needs to discard
                 first_discarder_index = next(
-                    i for i, color in enumerate(state.colors) if state.cards_to_discard[color] > 0
+                    i
+                    for i, color in enumerate(state.colors)
+                    if color in state.cards_to_discard and state.cards_to_discard[color] > 0
                 )
                 state.current_player_index = first_discarder_index
                 state.current_prompt = ActionPrompt.DISCARD
