@@ -17,9 +17,14 @@ from catanatron.gym.board_tensor_features import (
     get_channels,
     is_graph_feature,
 )
-from catanatron.state_functions import player_key
 
 
+COLOR_ORDER = (
+    Color.BLUE,
+    Color.RED,
+    Color.WHITE,
+    Color.ORANGE,
+)
 BASE_TOPOLOGY = BASE_MAP_TEMPLATE.topology
 TILE_COORDINATES = [x for x, y in BASE_TOPOLOGY.items() if y == LandTile]
 ACTIONS_ARRAY = [
@@ -148,9 +153,6 @@ class CatanatronEnv(gym.Env):
         self.features = get_feature_ordering(len(self.players), self.map_type)
         self.invalid_actions_count = 0
         self.max_invalid_actions = 10
-        self._previous_actual_vps: Dict[Color, int] = {}
-        self._cumulative_reward = 0.0
-        self._previous_vp_difference = 0.0
 
         # TODO: Make self.action_space tighter if possible (per map_type)
         self.action_space = spaces.Discrete(ACTION_SPACE_SIZE)
@@ -217,15 +219,6 @@ class CatanatronEnv(gym.Env):
         truncated = self.game.state.num_turns >= TURNS_LIMIT
         reward = self.reward_function(self.game, self.p0.color)
 
-        # For VP difference reward, adjust terminal reward to make total = -1 or 1
-        if self.reward_function == self._turn_vp_difference_reward:
-            self._cumulative_reward += reward
-            if terminated:
-                target_reward = 1.0 if winning_color == self.p0.color else -1.0
-                # Adjust reward to make cumulative reach target
-                reward = target_reward - (self._cumulative_reward - reward)
-                self._cumulative_reward = target_reward
-
         return observation, reward, terminated, truncated, info
 
     def reset(
@@ -245,19 +238,9 @@ class CatanatronEnv(gym.Env):
             vps_to_win=self.vps_to_win,
         )
         self.invalid_actions_count = 0
-        self._cumulative_reward = 0.0
 
         self._advance_until_p0_decision()
         self._cache_player_vps()
-
-        # Initialize previous VP difference for VP difference reward
-        p0_vps = self._get_actual_vps(self.p0.color)
-        opponent_vps = max(
-            self._get_actual_vps(color)
-            for color in self.game.state.colors
-            if color != self.p0.color
-        )
-        self._previous_vp_difference = p0_vps - opponent_vps
 
         observation = self._get_observation()
         info = dict(valid_actions=self.get_valid_actions())
@@ -278,42 +261,6 @@ class CatanatronEnv(gym.Env):
             self.game.winning_color() is None and self.game.state.current_color() != self.p0.color
         ):
             self.game.play_tick()  # will play bot
-
-    def _cache_player_vps(self):
-        if self.game is None:
-            return
-        for color in self.game.state.colors:
-            self._previous_actual_vps[color] = self._get_actual_vps(color)
-
-    def _get_actual_vps(self, color: Color) -> int:
-        key = player_key(self.game.state, color)
-        return self.game.state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
-
-    def _turn_vp_reward(self, game: Game, p0_color: Color) -> float:
-        current_vps = self._get_actual_vps(p0_color)
-        previous_vps = self._previous_actual_vps.get(p0_color, current_vps)
-        reward = (current_vps - previous_vps) / self.vps_to_win
-        self._previous_actual_vps[p0_color] = current_vps
-        return reward
-
-    def _turn_vp_difference_reward(self, game: Game, p0_color: Color) -> float:
-        """Reward based on change in VP difference between p0 and opponents.
-
-        During the game: reward = (change in VP difference) / vps_to_win
-        At the end: adds terminal reward to make total reward = -1 or 1
-        """
-        # Calculate current VP difference (p0 VPs - max opponent VPs)
-        p0_vps = self._get_actual_vps(p0_color)
-        opponent_vps = max(
-            self._get_actual_vps(color) for color in game.state.colors if color != p0_color
-        )
-        current_vp_difference = p0_vps - opponent_vps
-
-        # Calculate reward based on change in difference
-        reward = (current_vp_difference - self._previous_vp_difference) / self.vps_to_win
-        self._previous_vp_difference = current_vp_difference
-
-        return reward
 
 
 CatanatronEnv.__doc__ = f"""
