@@ -1,7 +1,7 @@
 import math
+import random
 import time
 from collections import defaultdict
-import random
 
 from catanatron.game import Game
 from catanatron.models.player import Player
@@ -86,14 +86,12 @@ class StateNode:
         for action in actions:
             outcomes = execute_spectrum(self.game, action)
             for state, proba in outcomes:
-                children[action].append(
-                    (StateNode(self.color, state, self, self.prunning), proba)
-                )
+                children[action].append((StateNode(self.color, state, self, self.prunning), proba))
         self.children = children
 
     def select(self):
         """select a child StateNode"""
-        action = self.choose_best_action()
+        action = self.choose_action_for_traversal()
 
         # Idea: Allow randomness to guide to next children too
         children = self.children[action]
@@ -101,24 +99,45 @@ class StateNode:
         children_probas = list(map(lambda c: c[1], children))
         return random.choices(children_states, weights=children_probas, k=1)[0]
 
-    def choose_best_action(self):
-        scores = []
-        for action in self.game.state.playable_actions:
-            score = self.action_children_expected_score(action)
-            scores.append(score)
+    def choose_action_for_traversal(self):
+        actions = list(self.children.keys())
+        if not actions:
+            return self.game.state.playable_actions[0]
 
+        maximizing = self.game.state.current_color() == self.color
+        scores = [
+            self.action_children_expected_score(a, maximizing, include_exploration=True)
+            for a in actions
+        ]
         idx = max(range(len(scores)), key=lambda i: scores[i])
-        action = self.game.state.playable_actions[idx]
-        return action
+        return actions[idx]
 
-    def action_children_expected_score(self, action):
+    def choose_best_action(self):
+        actions = list(self.children.keys())
+        if not actions:
+            return self.game.state.playable_actions[0]
+
+        # Final action selection should be exploitation-only.
+        scores = [
+            self.action_children_expected_score(a, maximizing=True, include_exploration=False)
+            for a in actions
+        ]
+        idx = max(range(len(scores)), key=lambda i: scores[i])
+        return actions[idx]
+
+    def action_children_expected_score(self, action, maximizing, include_exploration):
         score = 0
         for child, proba in self.children[action]:
-            score += proba * (
-                child.wins / (child.visits + epsilon)
-                + EXP_C
-                * (math.log(self.visits + epsilon) / (child.visits + epsilon)) ** 0.5
-            )
+            exploitation = child.wins / (child.visits + epsilon)
+            if not maximizing:
+                exploitation = -exploitation
+
+            exploration = 0.0
+            if include_exploration:
+                exploration = (
+                    EXP_C * (math.log(self.visits + epsilon) / (child.visits + epsilon)) ** 0.5
+                )
+            score += proba * (exploitation + exploration)
         return score
 
     def playout(self):
