@@ -132,10 +132,13 @@ class State:
         players: Sequence[Player],
         catan_map=None,
         discard_limit=7,
+        shuffle_players: bool = True,
         initialize=True,
     ):
         if initialize:
-            self.players = random.sample(players, len(players))
+            self.players = (
+                random.sample(players, len(players)) if shuffle_players else list(players)
+            )
             self.colors = tuple([player.color for player in self.players])
             self.board = Board(catan_map or CatanMap.from_template(BASE_MAP_TEMPLATE))
             self.discard_limit = discard_limit

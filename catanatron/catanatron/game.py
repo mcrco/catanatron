@@ -93,6 +93,7 @@ class Game:
         discard_limit: int = 7,
         vps_to_win: int = 10,
         catan_map: Optional[CatanMap] = None,
+        shuffle_players: bool = True,
         initialize: bool = True,
     ):
         """Creates a game (doesn't run it).
@@ -111,7 +112,12 @@ class Game:
 
             self.id = str(uuid.uuid4())
             self.vps_to_win = vps_to_win
-            self.state = State(players, catan_map, discard_limit=discard_limit)
+            self.state = State(
+                players,
+                catan_map,
+                discard_limit=discard_limit,
+                shuffle_players=shuffle_players,
+            )
 
     def play(self, accumulators=[], decide_fn=None):
         """Executes game until a player wins or exceeded TURNS_LIMIT.
