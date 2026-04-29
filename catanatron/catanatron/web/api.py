@@ -13,22 +13,49 @@ from catanatron.players.value import ValueFunctionPlayer
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.web.mcts_analysis import GameAnalyzer
+from catanatron.web.player_registry import (
+    PlayerFactoryContext,
+    PlayerRegistry,
+    VALID_MAP_TEMPLATES,
+)
 
 bp = Blueprint("api", __name__, url_prefix="/api")
-VALID_MAP_TEMPLATES = {"BASE", "MINI", "TOURNAMENT"}
+player_registry = PlayerRegistry()
 
 
-def player_factory(player_key):
-    if player_key[0] == "CATANATRON":
-        return AlphaBetaPlayer(player_key[1], 2, True)
-    elif player_key[0] == "WEIGHTED_RANDOM":
-        return WeightedRandomPlayer(player_key[1])
-    elif player_key[0] == "RANDOM":
-        return RandomPlayer(player_key[1])
-    elif player_key[0] == "HUMAN":
-        return ValueFunctionPlayer(player_key[1], is_bot=False)
-    else:
-        raise ValueError("Invalid player key")
+def register_builtin_players(registry):
+    registry.register(
+        key="HUMAN",
+        label="Human",
+        description="Human player controlled from the web UI.",
+        factory=lambda color, context: ValueFunctionPlayer(color, is_bot=False),
+    )
+    registry.register(
+        key="RANDOM",
+        label="Random",
+        description="Chooses legal actions uniformly at random.",
+        factory=lambda color, context: RandomPlayer(color),
+    )
+    registry.register(
+        key="CATANATRON",
+        label="Catanatron",
+        description="Built-in alpha-beta Catanatron bot.",
+        factory=lambda color, context: AlphaBetaPlayer(color, 2, True),
+    )
+    registry.register(
+        key="WEIGHTED_RANDOM",
+        label="Weighted Random",
+        description="Random player biased toward high-value build actions.",
+        factory=lambda color, context: WeightedRandomPlayer(color),
+    )
+
+
+register_builtin_players(player_registry)
+
+
+@bp.route("/players", methods=("GET",))
+def get_players_endpoint():
+    return jsonify({"players": player_registry.list_players()})
 
 
 @bp.route("/games", methods=("POST",))
@@ -59,7 +86,24 @@ def post_game_endpoint():
     if not isinstance(friendly_robber, bool):
         abort(400, description="'friendly_robber' must be a boolean")
 
-    players = list(map(player_factory, zip(player_keys, Color)))
+    try:
+        players = [
+            player_registry.create(
+                PlayerFactoryContext(
+                    player_key=player_key,
+                    color=color,
+                    player_keys=player_keys,
+                    map_template=map_template,
+                    discard_limit=discard_limit,
+                    vps_to_win=vps_to_win,
+                    friendly_robber=friendly_robber,
+                )
+            )
+            for player_key, color in zip(player_keys, Color)
+        ]
+    except ValueError as exc:
+        abort(400, description=str(exc))
+
     catan_map = build_map(map_template)
 
     game = Game(

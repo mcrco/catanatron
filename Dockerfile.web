@@ -1,5 +1,5 @@
 # Build Command:
-# docker build -t bcollazo/catanatron-server:latest . -f Dockerfile.web
+# docker build -t bcollazo/catanatron-server:latest .. -f catanatron/Dockerfile.web
 FROM python:3.12
 
 WORKDIR /app
@@ -7,12 +7,14 @@ WORKDIR /app
 RUN pip install --upgrade pip
 
 COPY . .
-RUN pip install -e .[web]
+RUN pip install -e ./catanatron[web]
+RUN pip install -e .
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 EXPOSE 5001
 
 ENV FLASK_DEBUG=1
-ENV FLASK_APP=catanatron.web/catanatron.web
+ENV FLASK_APP=catanatron.web
 ENV FLASK_RUN_HOST=0.0.0.0
 ENV FLASK_RUN_PORT=5001
 

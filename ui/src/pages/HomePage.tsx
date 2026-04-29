@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Alert,
@@ -14,24 +14,63 @@ import HelpOutlineRoundedIcon from "@mui/icons-material/HelpOutlineRounded";
 import { GridLoader } from "react-spinners";
 import {
   createGame,
+  getPlayers,
   type MapTemplate,
+  type PlayerOption,
   type PlayerArchetype,
 } from "../utils/apiClient";
 
 import "./HomePage.scss";
 
-const PLAYER_ARCHETYPES: Array<{
-  value: PlayerArchetype;
-  label: string;
-}> = [
-  { value: "HUMAN", label: "Human" },
-  { value: "RANDOM", label: "Random" },
-  { value: "CATANATRON", label: "Catanatron" },
-  { value: "WEIGHTED_RANDOM", label: "Weighted Random" },
+const FALLBACK_PLAYER_OPTIONS: PlayerOption[] = [
+  {
+    key: "HUMAN",
+    label: "Human",
+    description: "Human player controlled from the web UI.",
+    min_players: 2,
+    max_players: 4,
+    map_templates: ["BASE", "MINI", "TOURNAMENT"],
+  },
+  {
+    key: "RANDOM",
+    label: "Random",
+    description: "Chooses legal actions uniformly at random.",
+    min_players: 2,
+    max_players: 4,
+    map_templates: ["BASE", "MINI", "TOURNAMENT"],
+  },
+  {
+    key: "CATANATRON",
+    label: "Catanatron",
+    description: "Built-in alpha-beta Catanatron bot.",
+    min_players: 2,
+    max_players: 4,
+    map_templates: ["BASE", "MINI", "TOURNAMENT"],
+  },
+  {
+    key: "WEIGHTED_RANDOM",
+    label: "Weighted Random",
+    description: "Random player biased toward high-value build actions.",
+    min_players: 2,
+    max_players: 4,
+    map_templates: ["BASE", "MINI", "TOURNAMENT"],
+  },
 ];
 
 const MAP_TEMPLATES: MapTemplate[] = ["BASE", "MINI", "TOURNAMENT"];
 const PLAYER_COLORS = ["RED", "BLUE", "ORANGE", "WHITE"] as const;
+
+function isOptionUnsupported(
+  option: PlayerOption,
+  playerCount: number,
+  mapTemplate: MapTemplate
+) {
+  return (
+    playerCount < option.min_players ||
+    playerCount > option.max_players ||
+    !option.map_templates.includes(mapTemplate)
+  );
+}
 
 export default function HomePage() {
   const [loading, setLoading] = useState(false);
@@ -39,6 +78,9 @@ export default function HomePage() {
   const [vpsToWin, setVpsToWin] = useState(15);
   const [discardLimit, setDiscardLimit] = useState(9);
   const [friendlyRobber, setFriendlyRobber] = useState(true);
+  const [playerOptions, setPlayerOptions] = useState<PlayerOption[]>(
+    FALLBACK_PLAYER_OPTIONS
+  );
   const [players, setPlayers] = useState<PlayerArchetype[]>([
     "HUMAN",
     "CATANATRON",
@@ -46,6 +88,22 @@ export default function HomePage() {
   const navigate = useNavigate();
   const humanCount = players.filter((player) => player === "HUMAN").length;
   const hasTooManyHumans = humanCount > 1;
+  const hasUnsupportedPlayers = players.some((player) => {
+    const option = playerOptions.find((candidate) => candidate.key === player);
+    return option ? isOptionUnsupported(option, players.length, mapTemplate) : false;
+  });
+
+  useEffect(() => {
+    getPlayers()
+      .then((options) => {
+        if (options.length > 0) {
+          setPlayerOptions(options);
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to fetch player options:", error);
+      });
+  }, []);
 
   const handlePlayerChange = (index: number, value: PlayerArchetype) => {
     if (
@@ -64,8 +122,14 @@ export default function HomePage() {
   };
 
   const handleAddPlayer = () => {
+    const defaultBot =
+      playerOptions.find(
+        (option) =>
+          option.key !== "HUMAN" &&
+          !isOptionUnsupported(option, players.length + 1, mapTemplate)
+      )?.key ?? "WEIGHTED_RANDOM";
     setPlayers((current) =>
-      current.length >= 4 ? current : [...current, "WEIGHTED_RANDOM"]
+      current.length >= 4 ? current : [...current, defaultBot]
     );
   };
 
@@ -197,6 +261,12 @@ export default function HomePage() {
                   Only one Human player is allowed.
                 </Alert>
               )}
+              {hasUnsupportedPlayers && (
+                <Alert severity="error" className="players-alert">
+                  One or more selected players do not support this map or
+                  player count.
+                </Alert>
+              )}
               <div className="players-list">
                 {players.map((player, index) => (
                   <div className="player-row" key={`${player}-${index}`}>
@@ -219,14 +289,19 @@ export default function HomePage() {
                         )
                       }
                     >
-                      {PLAYER_ARCHETYPES.map((option) => (
+                      {playerOptions.map((option) => (
                         <MenuItem
-                          key={option.value}
-                          value={option.value}
+                          key={option.key}
+                          value={option.key}
                           disabled={
-                            option.value === "HUMAN" &&
-                            humanCount >= 1 &&
-                            player !== "HUMAN"
+                            (option.key === "HUMAN" &&
+                              humanCount >= 1 &&
+                              player !== "HUMAN") ||
+                            isOptionUnsupported(
+                              option,
+                              players.length,
+                              mapTemplate
+                            )
                           }
                         >
                           {option.label}
@@ -259,7 +334,7 @@ export default function HomePage() {
               variant="contained"
               color="primary"
               className="start-btn"
-              disabled={hasTooManyHumans}
+              disabled={hasTooManyHumans || hasUnsupportedPlayers}
               onClick={handleCreateGame}
             >
               Start

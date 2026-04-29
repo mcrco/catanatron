@@ -31,6 +31,12 @@ def create_app(test_config=None):
 
     # ===== Initialize Routes
     from . import api
+    from .player_registry import load_external_player_modules, module_paths_from_env
+
+    load_external_player_modules(
+        api.player_registry,
+        module_paths_from_env(os.environ.get("CATANATRON_PLAYER_MODULES")),
+    )
 
     app.register_blueprint(api.bp)
 

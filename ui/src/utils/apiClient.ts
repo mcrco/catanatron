@@ -3,11 +3,15 @@ import axios from "axios";
 import { API_URL } from "../configuration";
 import type { Color, GameAction, GameState } from "./api.types";
 
-export type PlayerArchetype =
-  | "HUMAN"
-  | "RANDOM"
-  | "CATANATRON"
-  | "WEIGHTED_RANDOM";
+export type PlayerArchetype = string;
+export type PlayerOption = {
+  key: PlayerArchetype;
+  label: string;
+  description: string;
+  min_players: number;
+  max_players: number;
+  map_templates: MapTemplate[];
+};
 export type MapTemplate = "BASE" | "MINI" | "TOURNAMENT";
 export type StateIndex = number | `${number}` | "latest";
 
@@ -34,6 +38,11 @@ export async function createGame({
     friendly_robber: friendlyRobber,
   });
   return response.data.game_id;
+}
+
+export async function getPlayers(): Promise<PlayerOption[]> {
+  const response = await axios.get(API_URL + "/api/players");
+  return response.data.players;
 }
 
 export async function getState(
