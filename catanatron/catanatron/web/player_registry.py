@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import sys
 from dataclasses import dataclass
+from hashlib import sha1
 from typing import Callable, Iterable, Sequence
 
 from catanatron.models.player import Color, Player
@@ -111,12 +113,14 @@ def load_external_player_modules(registry: PlayerRegistry, module_paths: Iterabl
         abs_path = os.path.abspath(path)
         if abs_path in registry._loaded_module_paths:
             continue
-        module_name = f"catanatron_web_player_{abs(hash(abs_path))}"
+        module_hash = sha1(abs_path.encode("utf-8")).hexdigest()
+        module_name = f"catanatron_web_player_{module_hash}"
         spec = importlib.util.spec_from_file_location(module_name, abs_path)
         if spec is None or spec.loader is None:
             raise ValueError(f"Could not load player module at '{abs_path}'.")
 
         module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
         spec.loader.exec_module(module)
 
         register_players = getattr(module, "register_players", None)
