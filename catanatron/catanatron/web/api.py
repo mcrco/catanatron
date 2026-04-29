@@ -147,9 +147,13 @@ def post_action_endpoint(game_id):
 
     # TODO: remove `or body_is_empty` when fully implement actions in FE
     body_is_empty = (not request.data) or request.json is None or request.json == {}
-    if game.state.current_player().is_bot or body_is_empty:
+    if game.state.current_player().is_bot:
         game.play_tick()
         upsert_game_state(game)
+    elif body_is_empty:
+        # Empty action bodies are frontend bot-turn ticks. If a duplicate tick
+        # arrives after control has passed to a human, do not choose for them.
+        pass
     else:
         action = action_from_json(request.json)
         game.execute(action)
