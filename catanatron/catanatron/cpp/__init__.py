@@ -13,7 +13,10 @@ try:
         Edge,
         Game,
         Player,
+        Resource,
         static_edges,
+        static_tile_numbers,
+        static_tile_resources,
     )
 
     AVAILABLE = True
@@ -27,12 +30,16 @@ except ImportError:  # pragma: no cover - depends on local build state
     Edge = None  # type: ignore
     Game = None  # type: ignore
     Player = None  # type: ignore
+    Resource = None  # type: ignore
 
     def static_edges():
         raise RuntimeError(
             "The C++ engine extension is not built. Install with `pip install -e .` "
             "in an environment with pybind11."
         )
+
+    static_tile_numbers = static_edges
+    static_tile_resources = static_edges
 
 
 __all__ = [
@@ -44,5 +51,8 @@ __all__ = [
     "Edge",
     "Game",
     "Player",
+    "Resource",
     "static_edges",
+    "static_tile_numbers",
+    "static_tile_resources",
 ]

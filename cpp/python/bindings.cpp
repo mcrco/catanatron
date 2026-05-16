@@ -13,6 +13,17 @@ std::vector<T> to_vector(const std::array<T, N>& values) {
   return std::vector<T>(values.begin(), values.end());
 }
 
+template <typename T, std::size_t Rows, std::size_t Columns>
+std::vector<std::vector<T>> to_nested_vector(
+    const std::array<std::array<T, Columns>, Rows>& values) {
+  std::vector<std::vector<T>> result;
+  result.reserve(Rows);
+  for (const auto& row : values) {
+    result.push_back(to_vector(row));
+  }
+  return result;
+}
+
 py::dict snapshot_to_dict(const Snapshot& snapshot) {
   py::dict result;
   result["colors"] = snapshot.colors;
@@ -22,10 +33,19 @@ py::dict snapshot_to_dict(const Snapshot& snapshot) {
   result["current_prompt_id"] = static_cast<int>(snapshot.current_prompt);
   result["is_initial_build_phase"] = snapshot.is_initial_build_phase;
   result["num_turns"] = snapshot.num_turns;
+  result["vps_to_win"] = snapshot.vps_to_win;
+  result["discard_limit"] = snapshot.discard_limit;
+  result["robber_tile_id"] = snapshot.robber_tile_id;
   result["victory_points"] = to_vector(snapshot.victory_points);
   result["roads_available"] = to_vector(snapshot.roads_available);
   result["settlements_available"] = to_vector(snapshot.settlements_available);
   result["cities_available"] = to_vector(snapshot.cities_available);
+  result["has_rolled"] = to_vector(snapshot.has_rolled);
+  result["player_resources"] = to_nested_vector(snapshot.player_resources);
+  result["resource_bank"] = to_vector(snapshot.resource_bank);
+  result["discard_counts"] = to_vector(snapshot.discard_counts);
+  result["tile_resource"] = to_vector(snapshot.tile_resource);
+  result["tile_number"] = to_vector(snapshot.tile_number);
   result["node_owner"] = to_vector(snapshot.node_owner);
   result["node_building"] = to_vector(snapshot.node_building);
   result["edge_owner"] = to_vector(snapshot.edge_owner);
@@ -72,6 +92,13 @@ PYBIND11_MODULE(_cpp_engine, m) {
       .value("CANCEL_TRADE", ActionType::CancelTrade)
       .value("END_TURN", ActionType::EndTurn);
 
+  py::enum_<Resource>(m, "Resource")
+      .value("WOOD", Resource::Wood)
+      .value("BRICK", Resource::Brick)
+      .value("SHEEP", Resource::Sheep)
+      .value("WHEAT", Resource::Wheat)
+      .value("ORE", Resource::Ore);
+
   py::class_<Edge>(m, "Edge")
       .def(py::init([](int a, int b) { return Edge{a, b}; }))
       .def_readwrite("a", &Edge::a)
@@ -90,6 +117,8 @@ PYBIND11_MODULE(_cpp_engine, m) {
            py::arg("value0") = -1, py::arg("value1") = -1)
       .def_static("build_settlement", &Action::build_settlement)
       .def_static("build_road", &Action::build_road)
+      .def_static("build_city", &Action::build_city)
+      .def_static("roll", &Action::roll)
       .def_static("end_turn", &Action::end_turn)
       .def_readwrite("color", &Action::color)
       .def_readwrite("type", &Action::type)
@@ -108,9 +137,11 @@ PYBIND11_MODULE(_cpp_engine, m) {
       .def_readwrite("is_bot", &Player::is_bot);
 
   py::class_<Game>(m, "Game")
-      .def(py::init<std::vector<Player>, int>(), py::arg("players"), py::arg("vps_to_win") = 10)
+      .def(py::init<std::vector<Player>, int, int>(), py::arg("players"),
+           py::arg("vps_to_win") = 10, py::arg("discard_limit") = 7)
       .def("execute", &Game::execute, py::arg("action"), py::arg("validate_action") = true)
       .def("generate_playable_actions", &Game::generate_playable_actions)
+      .def("set_player_resources", &Game::set_player_resources)
       .def("snapshot", [](const Game& game) { return snapshot_to_dict(game.snapshot()); });
 
   m.def("static_edges", []() {
@@ -120,4 +151,7 @@ PYBIND11_MODULE(_cpp_engine, m) {
     }
     return result;
   });
+
+  m.def("static_tile_resources", []() { return to_vector(static_tile_resources()); });
+  m.def("static_tile_numbers", []() { return to_vector(static_tile_numbers()); });
 }
