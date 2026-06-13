@@ -136,9 +136,9 @@ def create_board_tensor(game: Game, p0_color: Color, channels_first=False):
     # add n hot-encoded color multiplier planes (nodes), and n edge planes. 2*n planes
     n = len(game.state.colors)
     channels = 2 * n + 5 + 1 + 6
-    planes = [
-        [[0.0 for i in range(HEIGHT)] for j in range(WIDTH)] for _ in range(channels)
-    ]
+    # NumPy zero-init (C-level) instead of a channels*WIDTH*HEIGHT nested list
+    # comprehension; the sparse writes below operate on array views unchanged.
+    planes = np.zeros((channels, WIDTH, HEIGHT))
     node_map, edge_map = get_node_and_edge_maps()
     for i, color in iter_players(tuple(game.state.colors), p0_color):
         for node_id in get_player_buildings(game.state, color, SETTLEMENT):
@@ -192,7 +192,7 @@ def create_board_tensor(game: Game, p0_color: Color, channels_first=False):
             (x, y) = node_map[node_id]
             planes[channel_idx][x][y] = 1
 
-    result = np.array(planes)
+    result = planes
     if not channels_first:
         return np.transpose(result, (1, 2, 0))
     return result

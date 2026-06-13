@@ -1,4 +1,3 @@
-import pickle
 import random
 from collections import defaultdict
 from typing import Any, Dict, List, Sequence, Tuple
@@ -171,9 +170,13 @@ class State:
         state_copy.resource_freqdeck = self.resource_freqdeck.copy()
         state_copy.development_listdeck = self.development_listdeck.copy()
 
-        state_copy.buildings_by_color = pickle.loads(
-            pickle.dumps(self.buildings_by_color)
-        )
+        # Structural copy instead of pickle round-trip: buildings_by_color is
+        # Dict[Color, defaultdict(list)] whose lists hold immutable node ids / edge
+        # tuples, so copying the lists (one level) is sufficient.
+        state_copy.buildings_by_color = {
+            color: defaultdict(list, {btype: list(items) for btype, items in inner.items()})
+            for color, inner in self.buildings_by_color.items()
+        }
         state_copy.action_records = self.action_records.copy()
         state_copy.num_turns = self.num_turns
 

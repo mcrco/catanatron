@@ -1,5 +1,3 @@
-import pickle
-import copy
 from collections import defaultdict
 from typing import Any, Set, Dict, Tuple, List
 import functools
@@ -301,8 +299,15 @@ class Board:
         board.map = self.map  # reuse since its immutable
         board.buildings = self.buildings.copy()
         board.roads = self.roads.copy()
-        board.connected_components = pickle.loads(
-            pickle.dumps(self.connected_components)
+        # Structural copy instead of pickle round-trip: connected_components is
+        # Dict[Color, List[Set[NodeId]]] of small int sets. The sets are mutable
+        # so each is copied; everything below them is immutable.
+        board.connected_components = defaultdict(
+            list,
+            {
+                color: [set(component) for component in components]
+                for color, components in self.connected_components.items()
+            },
         )
         board.board_buildable_ids = self.board_buildable_ids.copy()
         board.road_lengths = self.road_lengths.copy()
@@ -311,10 +316,15 @@ class Board:
 
         board.robber_coordinate = self.robber_coordinate
         board.buildable_subgraph = self.buildable_subgraph
-        board.buildable_edges_cache = copy.deepcopy(self.buildable_edges_cache)
-        board.player_port_resources_cache = copy.deepcopy(
-            self.player_port_resources_cache
-        )
+        # Caches hold lists of immutable edge tuples / sets of immutable resources,
+        # so a one-level structural copy is sufficient (and far cheaper than deepcopy).
+        board.buildable_edges_cache = {
+            color: list(edges) for color, edges in self.buildable_edges_cache.items()
+        }
+        board.player_port_resources_cache = {
+            color: set(resources)
+            for color, resources in self.player_port_resources_cache.items()
+        }
         return board
 
     # ===== Helper functions
