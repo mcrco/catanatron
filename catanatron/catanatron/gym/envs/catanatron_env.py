@@ -89,7 +89,10 @@ class CatanatronEnv(gym.Env):
             ]
             # TODO: This could be tigher (e.g. _ROADS_AVAILABLE <= 15)
             numeric_space = spaces.Box(
-                low=LOW, high=HIGH, shape=(len(self.numeric_features),), dtype=self.dtype
+                low=LOW,
+                high=HIGH,
+                shape=(len(self.numeric_features),),
+                dtype=self.dtype,
             )
             mixed = spaces.Dict(
                 {
