@@ -27,6 +27,7 @@ FEATURES = get_feature_ordering(num_players=2)
 NUM_FEATURES = len(FEATURES)
 
 # Highest features is NUM_RESOURCES_IN_HAND which in theory is all resource cards
+LOW = -1  # TURNS_SINCE_LAST_* use -1 for "never"
 HIGH = 19 * 5
 
 
@@ -88,7 +89,7 @@ class CatanatronEnv(gym.Env):
             ]
             # TODO: This could be tigher (e.g. _ROADS_AVAILABLE <= 15)
             numeric_space = spaces.Box(
-                low=0, high=HIGH, shape=(len(self.numeric_features),), dtype=self.dtype
+                low=LOW, high=HIGH, shape=(len(self.numeric_features),), dtype=self.dtype
             )
             mixed = spaces.Dict(
                 {
@@ -100,7 +101,7 @@ class CatanatronEnv(gym.Env):
         else:
             # TODO: This could be tigher (e.g. _ROADS_AVAILABLE <= 15)
             self.observation_space = spaces.Box(
-                low=0, high=HIGH, shape=(len(self.features),), dtype=self.dtype
+                low=LOW, high=HIGH, shape=(len(self.features),), dtype=self.dtype
             )
 
         self.reset()
