@@ -6,6 +6,7 @@ import networkx as nx
 from catanatron.models.decks import freqdeck_count
 from catanatron.state_functions import (
     get_player_buildings,
+    player_can_play_dev,
     player_key,
     player_num_dev_cards,
     player_num_resource_cards,
@@ -106,6 +107,14 @@ def resource_hand_features(game: Game, p0_color: Color):
                 ]
             for card in DEVELOPMENT_CARDS:
                 features[f"P0_{card}_IN_HAND"] = player_state[key + f"_{card}_IN_HAND"]
+            # Whether each dev card can actually be played *this* turn (owned at the
+            # start of the turn, in hand, and no dev card played yet this turn). A
+            # snapshot of IN_HAND alone can't tell a playable card from one bought
+            # this turn, so expose playability explicitly for the acting player.
+            for card in DEVELOPMENT_CARDS:
+                if card == VICTORY_POINT:
+                    continue  # cant play VPs
+                features[f"P0_{card}_PLAYABLE"] = player_can_play_dev(state, color, card)
             features["P0_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"] = player_state[
                 key + "_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"
             ]
@@ -480,6 +489,53 @@ def port_distance_features(game: Game, p0_color: Color):
     return features
 
 
+def game_clock_features(game: Game, p0_color: Color):
+    # TURN_NUMBER, IS_INITIAL_BUILD_PHASE
+    # Pure snapshots can't tell early- from late-game; expose the clock/phase so a
+    # feedforward net has explicit tempo awareness.
+    return {
+        "TURN_NUMBER": game.state.num_turns,
+        "IS_INITIAL_BUILD_PHASE": game.state.is_initial_build_phase,
+    }
+
+
+def dev_card_timing_features(game: Game, p0_color: Color):
+    # P{i}_TURNS_SINCE_LAST_KNIGHT, P{i}_TURNS_SINCE_LAST_DEV_BOUGHT
+    # Knight plays and dev-card buys are public events; recency is a strong proxy
+    # for army-swing threat and hidden VP cards. Measured in completed turns
+    # (END_TURN actions) since the event, with -1 meaning "never".
+    colors = game.state.colors
+    turns_since_knight = {color: -1 for color in colors}
+    turns_since_dev_bought = {color: -1 for color in colors}
+
+    turns_elapsed = 0
+    remaining = 2 * len(colors)
+    for record in reversed(game.state.action_records):
+        action = record.action
+        action_type = action.action_type
+        if action_type == ActionType.END_TURN:
+            turns_elapsed += 1
+            continue
+        if remaining == 0:
+            break
+        color = action.color
+        if action_type == ActionType.PLAY_KNIGHT_CARD and turns_since_knight[color] == -1:
+            turns_since_knight[color] = turns_elapsed
+            remaining -= 1
+        elif (
+            action_type == ActionType.BUY_DEVELOPMENT_CARD
+            and turns_since_dev_bought[color] == -1
+        ):
+            turns_since_dev_bought[color] = turns_elapsed
+            remaining -= 1
+
+    features = {}
+    for i, color in iter_players(colors, p0_color):
+        features[f"P{i}_TURNS_SINCE_LAST_KNIGHT"] = turns_since_knight[color]
+        features[f"P{i}_TURNS_SINCE_LAST_DEV_BOUGHT"] = turns_since_dev_bought[color]
+    return features
+
+
 def game_features(game: Game, p0_color: Color):
     # BANK_WOODS, BANK_WHEATS, ..., BANK_DEV_CARDS
     possibilities = set([a.action_type for a in game.playable_actions])
@@ -510,6 +566,8 @@ feature_extractors = [
     graph_features,
     # GAME FEATURES =====
     game_features,
+    game_clock_features,
+    dev_card_timing_features,
 ]
 
 
