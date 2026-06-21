@@ -174,7 +174,9 @@ class State:
         # Dict[Color, defaultdict(list)] whose lists hold immutable node ids / edge
         # tuples, so copying the lists (one level) is sufficient.
         state_copy.buildings_by_color = {
-            color: defaultdict(list, {btype: list(items) for btype, items in inner.items()})
+            color: defaultdict(
+                list, {btype: list(items) for btype, items in inner.items()}
+            )
             for color, inner in self.buildings_by_color.items()
         }
         state_copy.action_records = self.action_records.copy()

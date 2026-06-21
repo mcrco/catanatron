@@ -114,7 +114,9 @@ def resource_hand_features(game: Game, p0_color: Color):
             for card in DEVELOPMENT_CARDS:
                 if card == VICTORY_POINT:
                     continue  # cant play VPs
-                features[f"P0_{card}_PLAYABLE"] = player_can_play_dev(state, color, card)
+                features[f"P0_{card}_PLAYABLE"] = player_can_play_dev(
+                    state, color, card
+                )
             features["P0_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"] = player_state[
                 key + "_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"
             ]
@@ -519,7 +521,10 @@ def dev_card_timing_features(game: Game, p0_color: Color):
         if remaining == 0:
             break
         color = action.color
-        if action_type == ActionType.PLAY_KNIGHT_CARD and turns_since_knight[color] == -1:
+        if (
+            action_type == ActionType.PLAY_KNIGHT_CARD
+            and turns_since_knight[color] == -1
+        ):
             turns_since_knight[color] = turns_elapsed
             remaining -= 1
         elif (
