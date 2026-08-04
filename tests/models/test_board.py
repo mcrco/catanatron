@@ -303,6 +303,41 @@ def test_building_into_enemy_doesnt_merge_components():
     assert len(board.find_connected_components(Color.RED)) == 2
 
 
+def test_settlement_cut_recovers_stale_connected_component_cache():
+    board = Board()
+    board.build_settlement(Color.RED, 3, initial_build_phase=True)
+    board.build_road(Color.RED, (3, 4))
+    board.build_road(Color.RED, (4, 15))
+    board.build_road(Color.RED, (15, 17))
+
+    board.build_settlement(Color.BLUE, 13, initial_build_phase=True)
+    board.build_road(Color.BLUE, (13, 14))
+    board.build_road(Color.BLUE, (14, 15))
+
+    # Reproduce the stale-cache shape from the training crash: the roads say
+    # node 15 belongs to RED, but the incremental component cache has lost it.
+    red_component = board.find_connected_components(Color.RED)[0]
+    red_component.remove(15)
+
+    board.build_settlement(Color.BLUE, 15)
+
+    red_components = board.find_connected_components(Color.RED)
+    assert len(red_components) == 2
+    assert all(15 in component for component in red_components)
+    assert board.road_lengths[Color.RED] == 2
+
+
+def test_cannot_build_road_through_enemy_settlement():
+    board = Board()
+    board.build_settlement(Color.RED, 3, initial_build_phase=True)
+    board.build_road(Color.RED, (3, 2))
+    board.build_road(Color.RED, (2, 1))
+
+    board.build_settlement(Color.BLUE, 1, initial_build_phase=True)
+
+    assert (0, 1) not in board.buildable_edges(Color.RED)
+
+
 def test_enemy_edge_not_buildable():
     board = Board()
     board.build_settlement(Color.BLUE, 0, initial_build_phase=True)

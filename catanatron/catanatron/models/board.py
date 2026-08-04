@@ -108,7 +108,10 @@ class Board:
         if initial_build_phase:
             self.connected_components[color].append({node_id})
         else:
-            # Maybe cut connected components.
+            # An opponent's settlement can split a road network. Rebuild the
+            # affected component cache from the authoritative roads/buildings
+            # instead of incrementally editing it: previous cuts and cycles can
+            # leave the cache with overlapping or missing nodes.
             edges_by_color = defaultdict(list)
             for edge in STATIC_GRAPH.edges(node_id):
                 edges_by_color[self.roads.get(edge, None)].append(edge)
@@ -116,27 +119,16 @@ class Board:
             for edge_color, edges in edges_by_color.items():
                 if edge_color == color or edge_color is None:
                     continue  # ignore
-                if len(edges) == 2:  # rip, edge_color has been plowed
-                    # consider cut was at b=node_id for edges (a, b) and (b, c)
-                    a = [n for n in edges[0] if n != node_id].pop()
-                    c = [n for n in edges[1] if n != node_id].pop()
+                if len(edges) >= 2:
+                    self._rebuild_connected_components(edge_color)
 
-                    # do dfs from a adding all encountered nodes
-                    a_nodeset = self.dfs_walk(a, edge_color)
-                    c_nodeset = self.dfs_walk(c, edge_color)
-
-                    # split this components on here.
-                    b_index = self._get_connected_component_index(node_id, edge_color)
-                    del self.connected_components[edge_color][b_index]
-                    self.connected_components[edge_color].append(a_nodeset)
-                    self.connected_components[edge_color].append(c_nodeset)
-
-                    # Update longest road by plowed player. Compare again with all
+                    # Update longest road by plowed player. Compare again with all.
                     self.road_lengths[edge_color] = max(
-                        *[
+                        (
                             len(longest_acyclic_path(self, component, edge_color))
                             for component in self.connected_components[edge_color]
-                        ]
+                        ),
+                        default=0,
                     )
                     self.road_color, self.road_length = max(
                         self.road_lengths.items(), key=lambda e: e[1]
@@ -181,6 +173,42 @@ class Board:
         for i, component in enumerate(self.connected_components[color]):
             if node_id in component:
                 return i
+
+    def _rebuild_connected_components(self, color):
+        """Rebuild a player's road components, stopping at enemy buildings."""
+        unvisited_edges = {
+            tuple(sorted(edge))
+            for edge, edge_color in self.roads.items()
+            if edge_color == color
+        }
+        components = []
+
+        while unvisited_edges:
+            first_edge = unvisited_edges.pop()
+            component = set(first_edge)
+            agenda = [first_edge]
+
+            while agenda:
+                edge = agenda.pop()
+                for node_id in edge:
+                    if self.is_enemy_node(node_id, color):
+                        continue
+                    for neighbor in STATIC_GRAPH.neighbors(node_id):
+                        next_edge = tuple(sorted((node_id, neighbor)))
+                        if next_edge in unvisited_edges:
+                            unvisited_edges.remove(next_edge)
+                            component.update(next_edge)
+                            agenda.append(next_edge)
+
+            components.append(component)
+
+        # Preserve isolated friendly settlements as build origins.
+        connected_nodes = set().union(*components)
+        for node_id, (building_color, _) in self.buildings.items():
+            if building_color == color and node_id not in connected_nodes:
+                components.append({node_id})
+
+        self.connected_components[color] = components
 
     def build_road(self, color, edge):
         buildable = self.buildable_edges(color)
@@ -256,6 +284,11 @@ class Board:
         # We can take advantage of that.
         expandable_nodes = set()
         expandable_nodes = expandable_nodes.union(*self.connected_components[color])
+        expandable_nodes = {
+            node_id
+            for node_id in expandable_nodes
+            if not self.is_enemy_node(node_id, color)
+        }
 
         candidate_edges = self.buildable_subgraph.edges(expandable_nodes)
         for edge in candidate_edges:
