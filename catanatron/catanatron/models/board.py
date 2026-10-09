@@ -133,6 +133,10 @@ class Board:
                     self.road_color, self.road_length = max(
                         self.road_lengths.items(), key=lambda e: e[1]
                     )
+                # A settlement on an opponent's road endpoint (len(edges) == 1)
+                # stays in that opponent's component: the road into it still
+                # counts toward longest road, and buildable_edges() refuses to
+                # expand from enemy nodes.
 
         self.board_buildable_ids.discard(node_id)
         for n in STATIC_GRAPH.neighbors(node_id):

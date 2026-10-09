@@ -338,6 +338,23 @@ def test_cannot_build_road_through_enemy_settlement():
     assert (0, 1) not in board.buildable_edges(Color.RED)
 
 
+def test_road_into_enemy_settlement_at_endpoint_still_counts():
+    board = Board()
+    board.build_settlement(Color.BLUE, 12, initial_build_phase=True)
+    board.build_road(Color.BLUE, (12, 11))
+    board.build_road(Color.BLUE, (11, 10))
+
+    board.build_settlement(Color.RED, 8, initial_build_phase=True)
+    board.build_road(Color.RED, (8, 9))
+    board.build_road(Color.RED, (9, 10))
+    board.build_settlement(Color.RED, 10)
+
+    board.build_road(Color.BLUE, (12, 13))
+
+    assert all(10 not in edge for edge in board.buildable_edges(Color.BLUE))
+    assert board.road_lengths[Color.BLUE] == 3  # 13-12-11-10
+
+
 def test_enemy_edge_not_buildable():
     board = Board()
     board.build_settlement(Color.BLUE, 0, initial_build_phase=True)
