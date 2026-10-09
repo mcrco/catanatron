@@ -2,7 +2,8 @@ import os
 
 import pytest
 import json
-from catanatron import Color, Game, RandomPlayer
+from catanatron import Color, Game, Player, RandomPlayer
+from catanatron.registry import REGISTRY
 from catanatron.serialization import SCHEMA_VERSION
 from catanatron.web import create_app
 from catanatron.web.models import (
@@ -301,6 +302,42 @@ def test_post_game_rejects_unknown_player_with_400(client):
 def test_post_game_rejects_unknown_param_with_400(client):
     response = client.post("/api/games", json={"players": ["R", "AB:dpeth=3"]})
     assert response.status_code == 400
+
+
+class PickNth(Player):
+    """Always plays the Nth playable action (or the last, if fewer)."""
+
+    N = 0
+
+    def decide(self, game, playable_actions):
+        return playable_actions[min(self.N, len(playable_actions) - 1)]
+
+
+def test_player_registered_by_another_package_is_seatable(client):
+    # What an embedding package does before serving: one class per model, its
+    # configuration a class attribute so the published params cannot re-point it.
+    third = type("PickThird", (PickNth,), {"N": 2, "LABEL": "Pick Third"})
+    REGISTRY.register("PICK_THIRD", third)
+    try:
+        listed = json.loads(client.get("/api/players").data)
+        entry = next(e for e in listed if e["key"] == "PICK_THIRD")
+        assert entry["name"] == "Pick Third"
+        assert entry["is_bot"] is True
+
+        response = client.post("/api/games", json={"players": ["PICK_THIRD", "R"]})
+        assert response.status_code == 200
+        game_id = json.loads(response.data)["game_id"]
+        for _ in range(4):
+            client.post(f"/api/games/{game_id}/actions", json={})
+
+        with client.application.app_context():
+            row = db.session.get(StoredGame, game_id)
+            assert {"key": "PICK_THIRD", "params": {}} in json.loads(row.player_specs)
+            game = get_game_state(game_id)
+        assert len(game.state.action_records) == 4
+        assert any(type(p) is third for p in game.state.players)
+    finally:
+        REGISTRY.pop("PICK_THIRD")
 
 
 # ===== spectator and seat views =====

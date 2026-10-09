@@ -124,3 +124,25 @@ is not JSON, or dies forfeits that turn, and is dropped after three failures
 in a row. A failed handshake or a program that cannot be run stops the run.
 
 See `examples/stdio_bot.py` for a complete bot in about forty lines.
+
+## Playing against your bot in the web UI
+
+The web server seats any player in `catanatron.registry.REGISTRY`, and the
+UI's player dropdown lists what `GET /api/players` returns. The server never
+imports code named in a request, so register your bot in the process that
+serves the API:
+
+```python
+from catanatron.registry import REGISTRY
+from catanatron.web import create_app
+
+REGISTRY.register("MYBOT", MyBot)
+app = create_app()
+```
+
+The dropdown shows the class's `LABEL`, or its name. A game is stored as each
+seat's key and params, and its players are rebuilt from them on every request,
+so keep construction cheap: load anything heavy, like a neural network, once
+per process. Settings a browser must not change, like which model to load,
+belong in class attributes rather than `Params`, which `GET /api/players`
+publishes and `POST /api/games` accepts.
