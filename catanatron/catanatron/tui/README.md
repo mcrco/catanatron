@@ -159,8 +159,8 @@ choose, `.frame().actions` lists the choices, `.choose(action)` plays one.
 | | `new [SEED]` | a new game with the same rules and seats |
 
 Forced outcomes apply to the next roll, purchase or steal by anyone and are
-noted in the log. Every change goes through the undo history: edits, loads
-and forced outcomes can all be taken back.
+noted in the log. Moves with forced outcomes and edits go through the undo
+history like any move; `load` and `new` replace the game and its history.
 
 **Files.** `save` writes one JSON file that is both a position and a full
 game log: `state` (Catanatron's `state_to_json`, everything including the
