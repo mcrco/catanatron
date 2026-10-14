@@ -262,7 +262,7 @@ def state_to_json(game: Game):
         "map": map_to_json(s.board.map),
         "board": board_to_json(s.board),
         "colors": [c.value for c in s.colors],
-        "player_state": s.player_state,
+        "player_state": dict(s.player_state),  # a snapshot, not the live dict
         "buildings_by_color": {
             c.value: {bt: _plain(v) for bt, v in d.items()}
             for c, d in s.buildings_by_color.items()

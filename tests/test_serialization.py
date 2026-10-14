@@ -295,6 +295,15 @@ def test_client_view_hides_the_seed():
     assert "seed" not in view["game"]
 
 
+def test_a_document_does_not_change_as_the_game_goes_on():
+    game, _ = played_game(ticks=30)
+    doc = state_to_json(game)
+    before = json.dumps(doc)
+    for _ in range(60):
+        game.play_tick()
+    assert json.dumps(doc) == before
+
+
 def test_client_view_does_not_mutate_the_document():
     game, _ = played_game()
     doc = state_to_json(game)
