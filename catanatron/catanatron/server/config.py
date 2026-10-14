@@ -2,23 +2,25 @@
 
 :func:`new_game` is shared by the server and the verifier: given the same
 config, master seed and game id it builds the same game, which is what lets a
-transcript be replayed in stock Catanatron.
+transcript be replayed in stock Catanatron. Nothing here needs the
+``cryptography`` package, so local tools (the TUI) use it too.
 """
 
 from __future__ import annotations
 
+import functools
 import random
 from dataclasses import asdict, dataclass
 from typing import Any, Optional, Sequence
 
 from catanatron.game import TURNS_LIMIT, Game
 from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY, Supply
-from catanatron.models.enums import Action, ActionType
-from catanatron.models.map import CatanMap, build_map
+from catanatron.models.enums import Action, ActionPrompt, ActionType
+from catanatron.models.map import CatanMap, Layout, build_map, layout_graph
 from catanatron.models.player import Color, Player
-from catanatron.serialization import action_to_json
-from catanatron.server.crypto import canonical, derive_seed
+from catanatron.server.hashing import derive_seed
 from catanatron.server.maps import MapError, normalize_map, parse_map
+from catanatron.state_functions import player_has_rolled, player_num_dev_cards
 
 MAP_TYPES = ("BASE", "MINI", "TOURNAMENT")
 NUMBER_PLACEMENTS = ("official_spiral", "random")
@@ -42,13 +44,20 @@ class GameConfig:
     vps_to_win: int = 10
     discard_limit: int = 7
     friendly_robber: bool = False
-    #: "base" or "extension" (the 5-6 player bank and deck).
-    supply: str = "base"
+    #: "base" or "extension" (the 5-6 player bank and deck); None picks by
+    #: the number of players.
+    supply: Optional[str] = None
     #: How long a seat may take over one decision before the server plays
     #: :func:`default_action` for it.
     decision_timeout_ms: int = 60_000
-    #: Play a seat's only legal action without asking it.
+    #: Play a seat's move without asking it when everyone can see it has
+    #: only one (see :func:`publicly_forced`).
     autoplay_forced: bool = True
+
+    def __post_init__(self):
+        if self.supply is None and type(self.num_players) is int:
+            name = "extension" if self.num_players > 4 else "base"
+            object.__setattr__(self, "supply", name)
 
     @classmethod
     def from_json(cls, payload: Any) -> "GameConfig":
@@ -57,15 +66,11 @@ class GameConfig:
             payload = {}
         if not isinstance(payload, dict):
             raise ConfigError("a config is a JSON object")
-        known = {f for f in cls.__dataclass_fields__}
-        unknown = set(payload) - known
+        unknown = set(payload) - set(cls.__dataclass_fields__)
         if unknown:
             raise ConfigError(f"unknown config keys: {sorted(unknown)}")
-        values = dict(payload)
-        num_players = values.get("num_players", 4)
-        values.setdefault("supply", "extension" if _int(num_players) > 4 else "base")
         try:
-            config = cls(**values)
+            config = cls(**payload)
         except TypeError as error:
             raise ConfigError(str(error))
         config.validate()
@@ -91,11 +96,17 @@ class GameConfig:
         for name in ("friendly_robber", "autoplay_forced"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} must be true or false")
-        if self.map is not None:
-            try:
-                parse_map(self.map)
-            except MapError as error:
-                raise ConfigError(f"map: {error}")
+        try:
+            catan_map = self.build_map(random.Random(0))
+        except MapError as error:
+            raise ConfigError(f"map: {error}")
+        seats = settlement_spots(catan_map.layout)
+        if seats < 2 * self.num_players:
+            raise ConfigError(
+                f"this map can run out of settlement spots after {seats} "
+                f"settlements; {self.num_players} players need "
+                f"{2 * self.num_players} to start"
+            )
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -107,13 +118,49 @@ class GameConfig:
 
     @property
     def game_supply(self) -> Supply:
-        return SUPPLIES[self.supply]
+        return SUPPLIES[self.supply or "base"]
+
+    def build_map(self, rng: random.Random) -> CatanMap:
+        """The board: the explicit map, or the template shuffled by ``rng``."""
+        if self.map is not None:
+            return parse_map(self.map)
+        return build_map(self.map_type, self.number_placement, rng=rng)  # type: ignore[arg-type]
 
 
 def _int(value: Any) -> int:
     if type(value) is not int:
         raise ConfigError(f"expected an integer, got {value!r}")
     return value
+
+
+@functools.lru_cache(maxsize=64)
+def settlement_spots(layout: Layout, trials: int = 48) -> int:
+    """How few settlements can use up a board's spots, as far as seeded
+    random and greedy placements find (an estimate of the smallest maximal
+    set of spots no two of which are neighbors)."""
+    graph = layout_graph(layout)
+    nodes = sorted(graph.nodes)
+    rng = random.Random(0)
+    fewest = len(nodes)
+    for trial in range(trials):
+        free, placed = set(nodes), 0
+        while free:
+            candidates = sorted(free)
+            if trial % 2:  # greedily block as many spots as possible
+                node = max(
+                    candidates,
+                    key=lambda v: (
+                        sum(1 for u in graph.neighbors(v) if u in free),
+                        rng.random(),
+                    ),
+                )
+            else:
+                node = rng.choice(candidates)
+            free.discard(node)
+            free.difference_update(graph.neighbors(node))
+            placed += 1
+        fewest = min(fewest, placed)
+    return fewest
 
 
 class ServerSeat(Player):
@@ -125,9 +172,7 @@ class ServerSeat(Player):
 
 
 def build_catan_map(config: GameConfig, rng: random.Random) -> CatanMap:
-    if config.map is not None:
-        return parse_map(config.map)
-    return build_map(config.map_type, config.number_placement, rng=rng)  # type: ignore[arg-type]
+    return config.build_map(rng)
 
 
 def new_game(
@@ -142,7 +187,7 @@ def new_game(
     board, one that the game owns for everything else (turn order, the
     deck's shuffle, dice and steals).
     """
-    catan_map = build_catan_map(config, random.Random(derive_seed(master, "map")))
+    catan_map = config.build_map(random.Random(derive_seed(master, "map")))
     game = Game(
         (
             list(players)
@@ -168,15 +213,39 @@ def is_over(game: Game) -> bool:
     )
 
 
-def ordered(actions: Sequence[Action]) -> list:
-    """``actions`` in a canonical order.
+#: Prompts whose legal actions follow from the board and public counts alone.
+PUBLIC_PROMPTS = (
+    ActionPrompt.BUILD_INITIAL_SETTLEMENT,
+    ActionPrompt.BUILD_INITIAL_ROAD,
+    ActionPrompt.MOVE_ROBBER,
+)
 
-    Catanatron generates some actions from sets of strings (port resources,
-    robbery victims), whose order changes with Python's hash seed. Whatever
-    has to be the same in the server and in a verifier running in another
-    process uses this order instead.
+
+def publicly_forced(game: Game) -> bool:
+    """Whether everyone can see that the seat to move has one legal action.
+
+    Only then may the server play it without asking: autoplaying a move
+    whose being forced depends on hidden cards (a roll from someone holding
+    only victory point cards, a discard from a one-resource hand) would tell
+    the table what is in that hand. Holds for the initial placements, robber
+    moves without the friendly robber (victims are chosen by public card
+    counts), free roads, and the roll of a seat that holds no development
+    card.
     """
-    return sorted(actions, key=lambda action: canonical(action_to_json(action)))
+    if len(game.playable_actions) != 1:
+        return False
+    state = game.state
+    prompt = state.current_prompt
+    if prompt in PUBLIC_PROMPTS:
+        return prompt != ActionPrompt.MOVE_ROBBER or not state.friendly_robber
+    if prompt != ActionPrompt.PLAY_TURN:
+        return False
+    if state.is_road_building:
+        return True
+    color = state.current_color()
+    return (
+        not player_has_rolled(state, color) and player_num_dev_cards(state, color) == 0
+    )
 
 
 #: What a seat that ran out of time plays, in order of preference: the moves
@@ -186,11 +255,11 @@ DEFAULT_PREFERENCE = (ActionType.ROLL, ActionType.END_TURN)
 
 def default_action(playable_actions: Sequence[Action]) -> Action:
     """The move the server plays for a seat that timed out: the first
-    preferred kind of move, else the first in canonical order. Deterministic,
-    so a verifier can check the server did not pick a convenient one."""
-    candidates = ordered(playable_actions)
+    preferred kind of move, else the first legal action (Catanatron lists
+    them in the same order in every process). Deterministic, so a verifier
+    can check the server did not pick a convenient one."""
     for action_type in DEFAULT_PREFERENCE:
-        for action in candidates:
+        for action in playable_actions:
             if action.action_type == action_type:
                 return action
-    return candidates[0]
+    return playable_actions[0]

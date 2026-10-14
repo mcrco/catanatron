@@ -9,9 +9,11 @@
         result = await client.play(lambda view, actions: actions[0])
 
 The client does the fairness work on its own: it checks every message's
-signature and its place in the hash chain as it arrives, contributes a fresh
-seed when it joins, signs every action, saves its transcript when the game
-ends and (by default) verifies it with :func:`catanatron.server.verify.verify_transcript`.
+signature and its place in the hash chain as it arrives; commits to a fresh
+seed when it joins (signing the join with its key) and reveals it only once
+the server has published every seat's commitment; signs every action with
+the action's index; saves its transcript when the game ends and (by default)
+verifies it with :func:`catanatron.server.verify.verify_transcript`.
 
 The decision callback gets the seat's view (a ``client_view`` document, see
 :class:`~catanatron.server.table.Table`) and the playable actions as JSON
@@ -41,22 +43,27 @@ from catanatron.server.crypto import (
     GENESIS,
     SigningKey,
     action_statement,
+    client_seed_commitment,
+    digest,
     envelope_hash,
+    is_hex,
+    join_statement,
     random_hex,
     verify_envelope,
 )
-from catanatron.server.messages import PROTOCOL_VERSION
+from catanatron.server.messages import GAME_MESSAGES, PROTOCOL_VERSION
 from catanatron.server.table import Table
 
 logger = logging.getLogger(__name__)
 
-TRANSCRIPT_FORMAT = "catanatron-transcript/1"
+TRANSCRIPT_FORMAT = "catanatron-transcript/2"
 
 Decide = Callable[[dict, list], Any]
 
 
 class ServerMisbehaved(RuntimeError):
-    """A message failed its signature or hash-chain check."""
+    """A message failed its signature or hash-chain check, or contradicted
+    what the client agreed to."""
 
 
 class Refused(RuntimeError):
@@ -72,6 +79,8 @@ class GameResult:
     transcript_path: Optional[str]
     verified: Optional[bool]
     report: Any = None
+    #: The ``aborted`` body, if the game was called off.
+    aborted: Optional[dict] = None
 
     def summary(self) -> dict:
         return {
@@ -81,6 +90,7 @@ class GameResult:
             "winning_color": self.winning_color,
             "transcript": self.transcript_path,
             "verified": self.verified,
+            "aborted": self.aborted,
             "errors": getattr(self.report, "errors", []),
         }
 
@@ -154,10 +164,16 @@ class GameClient:
         self.reconnect_attempts = reconnect_attempts
 
         self.client_seed = random_hex()
+        self.client_commitment = client_seed_commitment(
+            self.room_id, self.key.public_hex, self.client_seed
+        )
         self.table = Table()
         self.room: Optional[dict] = None
         self.seat: Optional[int] = None
         self.seat_key: Optional[str] = None
+        self.server_commitment: Optional[str] = None
+        self.config: Optional[dict] = None
+        self.commitments: Optional[dict] = None
         self.messages: list = []
         self.sent: list = []
         self.head = GENESIS
@@ -165,7 +181,8 @@ class GameClient:
         self._pending: Optional[dict] = None
         self._answer: Optional[dict] = None
         self._decision: Optional[asyncio.Task] = None
-        #: Called with every body, for UIs and logging.
+        self._revealed = False
+        #: Called with every body once the client has taken it in.
         self.on_message: Optional[Callable[[dict], None]] = None
         #: The live connection, if any.
         self.connection: Any = None
@@ -189,7 +206,7 @@ class GameClient:
         if not self.transcript_dir:
             return None
         os.makedirs(self.transcript_dir, exist_ok=True)
-        who = self.table.color or "spectator"
+        who = self.table.color or ("spectator" if self.spectate else "seat")
         game = self.table.game_id or "nogame"
         path = os.path.join(self.transcript_dir, f"{self.room_id}-{game}-{who}.json")
         with open(path, "w") as file:
@@ -201,7 +218,7 @@ class GameClient:
         """Check a message's signature and chain link, record it, return its body."""
         if self.server_key is None:
             body = envelope.get("body", {})
-            if body.get("type") != "hello" or "server_key" not in body:
+            if body.get("type") != "hello" or not is_hex(body.get("server_key"), 32):
                 raise ServerMisbehaved(
                     "the first message must be a hello with the server's key"
                 )
@@ -213,10 +230,9 @@ class GameClient:
                 f"message {envelope['seq']} breaks the hash chain "
                 f"(expected seq {len(self.messages)})"
             )
-        expected_to = (
-            None if (self.spectate or not self.messages) else self.key.public_hex
-        )
-        if envelope["to"] not in (None, expected_to):
+        seated = self.seat is not None and not self.spectate
+        allowed = (self.key.public_hex,) if seated else (None, self.key.public_hex)
+        if envelope["to"] not in allowed:
             raise ServerMisbehaved(
                 f"message {envelope['seq']} was addressed to someone else"
             )
@@ -229,7 +245,7 @@ class GameClient:
         """Join, play until the game ends, save and verify the transcript."""
         if decide is None and not self.spectate:
             raise ValueError("a seated client needs a decide callback")
-        attempts = 0
+        self._attempts = 0
         while True:
             try:
                 return await self._session(decide)
@@ -238,89 +254,198 @@ class GameClient:
                     self.seat_key is None and not self.spectate
                 ):
                     raise
-                attempts += 1
-                if attempts > self.reconnect_attempts:
+                self._attempts += 1
+                if self._attempts > self.reconnect_attempts:
                     raise
-                logger.info("connection lost (%s); reconnecting (%d)", error, attempts)
-                await asyncio.sleep(min(0.2 * 2**attempts, 5))
+                logger.info(
+                    "connection lost (%s); reconnecting (%d)", error, self._attempts
+                )
+                await asyncio.sleep(min(0.2 * 2**self._attempts, 5))
 
     async def _session(self, decide: Optional[Decide]) -> GameResult:
         async with websockets.connect(self.url, max_size=None) as ws:
             self.connection = ws
             first = json.loads(await ws.recv())
-            reconnecting = self.seat_key is not None or (
-                self.spectate and self.messages
-            )
-            if reconnecting:
+            rejoining = self.seat_key is not None
+            if rejoining:
+                # This connection's hello opens a throw-away chain; the seat's
+                # own chain resumes after our last message.
                 if not verify_envelope(self.server_key, first):
                     raise ServerMisbehaved("bad signature on hello")
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "join",
+                            "protocol_version": PROTOCOL_VERSION,
+                            "seat": self.seat,
+                            "seat_key": self.seat_key,
+                            "public_key": self.key.public_hex,
+                            "last_seq": len(self.messages) - 1,
+                        }
+                    )
+                )
+                await self._resume(ws, decide)
+            else:
                 if self.spectate:
                     # A spectator's chain is per connection: start over.
                     self.messages, self.head, self.table = [], GENESIS, Table()
-                    self._accept(first)
-                    await ws.send(json.dumps({"type": "spectate", "name": self.name}))
-                else:
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "join",
-                                "protocol_version": PROTOCOL_VERSION,
-                                "seat": self.seat,
-                                "seat_key": self.seat_key,
-                                "public_key": self.key.public_hex,
-                                "last_seq": len(self.messages) - 1,
-                            }
-                        )
-                    )
-            else:
+                    self.commitments = None
                 body = self._accept(first)
-                self.room = body["room"]
-                if body.get("protocol_version") != PROTOCOL_VERSION:
-                    raise Refused(
-                        f"server speaks protocol {body.get('protocol_version')}"
-                    )
-                if self.spectate:
-                    await ws.send(json.dumps({"type": "spectate", "name": self.name}))
-                else:
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "join",
-                                "protocol_version": PROTOCOL_VERSION,
-                                "name": self.name,
-                                "seat": self.wanted_seat,
-                                "public_key": self.key.public_hex,
-                                "client_seed": self.client_seed,
-                            }
-                        )
-                    )
-            if reconnecting and self._pending is not None:
-                if self._answer is not None:
-                    await ws.send(json.dumps(self._answer))
-                elif self._decision is None or self._decision.done():
-                    self._start_decision(decide)
+                self._on_hello(body)
+                await ws.send(json.dumps(self._join_request()))
+                self._notify(body)
 
+            resyncing = rejoining
             async for text in ws:
-                body = self._accept(json.loads(text))
-                if self.on_message is not None:
-                    self.on_message(body)
-                kind = body.get("type")
-                if kind == "joined":
-                    self.seat, self.seat_key = body["seat"], body["seat_key"]
-                elif kind == "room":
-                    self.room = body["room"]
-                elif kind == "error":
-                    await self._on_error(body)
-                elif kind in ("before", "step", "decide", "after"):
-                    self.table.update(body)
-                    # Any newer game message supersedes an open decision.
-                    self._pending = self._answer = None
-                    if kind == "decide":
-                        self._pending = self.messages[-1]
-                        self._start_decision(decide)
-                    elif kind == "after":
-                        return self._finish()
+                envelope = json.loads(text)
+                if resyncing:
+                    if not self._resumes_chain(envelope):
+                        continue
+                    resyncing = False
+                body = self._accept(envelope)
+                self._attempts = 0  # the connection works: count afresh
+                result = await self._handle(ws, body, decide)
+                self._notify(body)
+                if result is not None:
+                    return result
             raise ConnectionClosed(None, None)
+
+    def _resumes_chain(self, envelope: dict) -> bool:
+        """While rejoining: skip (after checking) what arrives on the
+        throw-away chain until the seat's chain resumes."""
+        if (
+            envelope.get("seq") == len(self.messages)
+            and envelope.get("prev") == self.head
+        ):
+            return True
+        if not verify_envelope(self.server_key, envelope):
+            raise ServerMisbehaved("bad signature while rejoining")
+        body = envelope.get("body", {})
+        if body.get("type") == "error":
+            raise Refused(body.get("message"))
+        return False
+
+    async def _resume(self, ws, decide: Optional[Decide]) -> None:
+        """After a rejoin: finish what the drop interrupted."""
+        if self.commitments is not None and self.table.state is None:
+            await ws.send(
+                json.dumps({"type": "reveal", "client_seed": self.client_seed})
+            )
+        if self._pending is not None:
+            if self._answer is not None:
+                await ws.send(json.dumps(self._answer))
+            elif self._decision is None or self._decision.done():
+                self._start_decision(decide)
+
+    def _notify(self, body: dict) -> None:
+        if self.on_message is not None:
+            self.on_message(body)
+
+    def _on_hello(self, body: dict) -> None:
+        if body.get("protocol_version") != PROTOCOL_VERSION:
+            raise Refused(f"server speaks protocol {body.get('protocol_version')}")
+        room = body["room"]
+        if room.get("id") != self.room_id:
+            raise ServerMisbehaved("the hello is for another room")
+        self.room = room
+        self.server_commitment = room["seed_commitment"]
+        self.config = room["config"]
+
+    def _join_request(self) -> dict:
+        if self.spectate:
+            return {"type": "spectate", "name": self.name}
+        statement = join_statement(
+            self.room_id,
+            self.server_commitment,
+            self.wanted_seat,
+            self.client_commitment,
+        )
+        return {
+            "type": "join",
+            "protocol_version": PROTOCOL_VERSION,
+            "name": self.name,
+            "seat": self.wanted_seat,
+            "public_key": self.key.public_hex,
+            "client_commitment": self.client_commitment,
+            "pop": self.key.sign(statement),
+        }
+
+    async def _handle(self, ws, body: dict, decide: Optional[Decide]):
+        kind = body.get("type")
+        if kind == "joined":
+            if (
+                body.get("public_key") != self.key.public_hex
+                or body.get("client_commitment") != self.client_commitment
+                or body.get("room_id") != self.room_id
+            ):
+                raise ServerMisbehaved("the server seated another key or commitment")
+            self.seat, self.seat_key = body["seat"], body["seat_key"]
+            self.room = body["room"]
+        elif kind == "room":
+            self.room = body["room"]
+        elif kind == "commitments":
+            self._check_commitments(body)
+            self.commitments = body
+            if not self.spectate and not self._revealed:
+                self._revealed = True
+                await ws.send(
+                    json.dumps({"type": "reveal", "client_seed": self.client_seed})
+                )
+        elif kind == "error":
+            await self._on_error(body)
+        elif kind == "aborted":
+            return self._finish(aborted=body)
+        elif kind in GAME_MESSAGES:
+            if kind == "before":
+                self._check_before(body)
+            self.table.update(body)
+            # Any newer game message supersedes an open decision.
+            self._pending = self._answer = None
+            if kind == "decide":
+                self._pending = self.messages[-1]
+                self._start_decision(decide)
+            elif kind == "after":
+                return self._finish()
+        return None
+
+    def _check_commitments(self, body: dict) -> None:
+        if (
+            body.get("room_id") != self.room_id
+            or body.get("seed_commitment") != self.server_commitment
+            or body.get("config") != self.config
+        ):
+            raise ServerMisbehaved("the commitments change the room's rules or seed")
+        if not self.spectate:
+            mine = [
+                s
+                for s in body.get("seats", [])
+                if s.get("public_key") == self.key.public_hex
+            ]
+            if (
+                len(mine) != 1
+                or mine[0].get("seat") != self.seat
+                or mine[0].get("client_commitment") != self.client_commitment
+            ):
+                raise ServerMisbehaved(
+                    "the commitments do not seat this client as it joined"
+                )
+
+    def _check_before(self, body: dict) -> None:
+        if self.commitments is not None and (
+            body.get("config") != self.commitments["config"]
+            or body.get("seats") != self.commitments["seats"]
+        ):
+            raise ServerMisbehaved("the game is not the one whose seats were committed")
+        if not self.spectate:
+            seeds = body.get("client_seeds") or []
+            if (
+                self.seat is None
+                or self.seat >= len(seeds)
+                or seeds[self.seat] != self.client_seed
+            ):
+                raise ServerMisbehaved(
+                    "the game was not seeded with this client's seed"
+                )
 
     def _start_decision(self, decide: Optional[Decide]) -> None:
         if decide is None:
@@ -351,8 +476,14 @@ class GameClient:
             action = action_to_json(action)
         pending = self._pending
         assert pending is not None
+        body = pending["body"]
         statement = action_statement(
-            pending["body"]["game_id"], pending["seq"], envelope_hash(pending), action
+            self.room_id,
+            body["game_id"],
+            body["index"],
+            pending["seq"],
+            envelope_hash(pending),
+            action,
         )
         self._answer = {
             "type": "action",
@@ -371,27 +502,27 @@ class GameClient:
             "seat_taken",
             "room_full",
             "bad_join",
+            "duplicate_key",
             "game_started",
-            "aborted",
         ):
             raise Refused(body.get("message"))
-        pending = self._pending
+        # A refused answer is not followed by another one: a client that
+        # signed a second move for the same decide would let the server
+        # choose between them. The server's timeout (flagged, and checked
+        # by the verifier against this refusal) settles the decision.
         if (
             body.get("code") == "bad_action"
-            and pending is not None
-            and body.get("seq") == pending["seq"]
             and self._answer is not None
-            and self._answer["statement"]["action"]
-            != pending["body"]["playable_actions"][0]
+            and body.get("refused") == digest(self._answer["statement"])
         ):
-            # Our answer was refused and the decision is still open: play the
-            # first legal action rather than stall until the timeout.
-            await self._answer_with(pending["body"]["playable_actions"][0])
+            logger.error("the server refused our signed move: %s", body.get("message"))
 
-    def _finish(self) -> GameResult:
+    def _finish(self, aborted: Optional[dict] = None) -> GameResult:
         path = self.save_transcript()
         verified, report = None, None
-        if self.verify:
+        if aborted is not None:
+            verified = False
+        elif self.verify:
             from catanatron.server.verify import verify_transcript
 
             report = verify_transcript(self.transcript())
@@ -406,4 +537,5 @@ class GameClient:
             transcript_path=path,
             verified=verified,
             report=report,
+            aborted=aborted,
         )

@@ -6,21 +6,30 @@ Routes (one port, HTTP and WebSocket):
     GET /static/FILE       its assets
     GET /api/rooms         rooms, as JSON
     GET /api/players       the registry's bots, as JSON
-    GET /api/server        the server's public key and protocol version
+    GET /api/server        the server's public key, protocol version and the
+                           SHA-256 of the app.js it serves
     WS  /lobby             create_room, list_rooms, players
     WS  /room/ROOM_ID      join a seat, or spectate, and play
+
+The API answers any origin, so a copy of the browser client served from
+elsewhere (see the README: that is what makes browser seats verifiable) can
+use it.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import secrets
 import signal
 import sys
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Optional, Sequence
 
@@ -30,10 +39,11 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
 from catanatron.registry import REGISTRY, describe
+from catanatron.server.bot import BotRunner
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import SigningKey
 from catanatron.server.messages import PROTOCOL_VERSION
-from catanatron.server.room import Outbox, Peer, Room, RoomError
+from catanatron.server.room import Outbox, Peer, Room, RoomError, RoomLimits
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +58,59 @@ CONTENT_TYPES = {
 MAX_MESSAGE = 1 << 20
 
 
+@dataclass(frozen=True)
+class ServerLimits:
+    max_rooms: int = 500
+    max_connections: int = 2000
+    connections_per_ip: int = 64
+    connections_per_room: int = 64
+    #: Rooms one address may create per minute, and keep waiting at once.
+    rooms_per_minute_per_ip: int = 10
+    waiting_rooms_per_ip: int = 10
+    #: Waiting rooms nobody is connected to are dropped after this long.
+    idle_waiting_s: float = 600.0
+    #: Games in which no remote seat has been connected for this long are
+    #: aborted.
+    abandoned_playing_s: float = 1800.0
+    #: Finished and aborted rooms are forgotten after this long.
+    finished_ttl_s: float = 3600.0
+    #: Bot decisions running at once, across rooms.
+    bot_threads: int = 32
+    room: RoomLimits = field(default_factory=RoomLimits)
+
+
+class TooMuch(Exception):
+    """A request over one of the server's limits."""
+
+
+class _Floats(ValueError):
+    pass
+
+
+def parse_request(text: Any) -> dict:
+    """A client message: a JSON object whose numbers are all integers."""
+
+    def no_float(token):
+        raise _Floats(f"numbers must be integers, got {token}")
+
+    try:
+        request = json.loads(text, parse_float=no_float, parse_constant=no_float)
+    except _Floats as error:
+        raise RoomError("bad_request", str(error))
+    except (ValueError, TypeError, RecursionError) as error:
+        raise RoomError("bad_request", f"not JSON: {error}")
+    if not isinstance(request, dict):
+        raise RoomError("bad_request", "expected a JSON object")
+    return request
+
+
 class GameServer:
     def __init__(
         self,
         key: Optional[SigningKey] = None,
         *,
         archive_dir: Optional[str] = None,
-        max_rooms: int = 500,
+        limits: ServerLimits = ServerLimits(),
         room_class: type = Room,
     ):
         from catanatron.players import register_builtins
@@ -62,42 +118,134 @@ class GameServer:
         register_builtins()
         self.key = key or SigningKey.generate()
         self.archive_dir = archive_dir
-        self.max_rooms = max_rooms
+        self.limits = limits
         self.room_class = room_class
+        self.runner = BotRunner(limits.bot_threads)
         self.rooms: dict = {}
+        self.connections = 0
+        self.by_ip: dict = defaultdict(int)
+        self.by_room: dict = defaultdict(int)
+        self.created_by: dict = defaultdict(deque)
+        self.room_owner: dict = {}
+        self.janitor: Optional[asyncio.Task] = None
+        self.app_sha256 = _file_sha256("app.js")
 
     # ===== rooms =====
     def create_room(
-        self, config: Any, seats: Optional[list] = None, name: str = ""
+        self,
+        config: Any,
+        seats: Optional[list] = None,
+        name: str = "",
+        address: Optional[str] = None,
     ) -> Room:
         game_config = GameConfig.from_json(config)
+        if game_config.friendly_robber:
+            raise ConfigError(
+                "friendly_robber is not offered here: whether a robbery is legal "
+                "would depend on (and reveal) hidden victory point cards"
+            )
+        if seats is not None and not isinstance(seats, list):
+            raise ConfigError("seats must be a list")
         seats = list(seats or [])
         if len(seats) > game_config.num_players:
             raise ConfigError(
                 f"{len(seats)} seat specs for {game_config.num_players} seats"
             )
+        if address is not None:
+            self._admit_creation(address)
         self._evict()
         room_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
         room = self.room_class(
-            room_id, game_config, self.key, name=name, on_finish=self._archive
+            room_id,
+            game_config,
+            self.key,
+            name=name,
+            on_finish=self._archive,
+            limits=self.limits.room,
+            runner=self.runner,
         )
         for index, spec in enumerate(seats):
             if spec is not None:
                 room.set_bot(index, spec)
         self.rooms[room_id] = room
+        if address is not None:
+            self.room_owner[room_id] = address
+            self.created_by[address].append(time.time())
         return room
 
-    def _evict(self) -> None:
-        if len(self.rooms) < self.max_rooms:
-            return
-        finished = sorted(
-            (r for r in self.rooms.values() if r.status == "finished"),
-            key=lambda r: r.created,
+    def _admit_creation(self, address: str) -> None:
+        recent = self.created_by[address]
+        while recent and recent[0] < time.time() - 60:
+            recent.popleft()
+        if len(recent) >= self.limits.rooms_per_minute_per_ip:
+            raise TooMuch("too many rooms created from your address; wait a minute")
+        waiting = sum(
+            1
+            for room_id, owner in self.room_owner.items()
+            if owner == address
+            and room_id in self.rooms
+            and self.rooms[room_id].status in ("waiting", "revealing")
         )
-        for room in finished[: max(1, len(self.rooms) - self.max_rooms + 1)]:
-            del self.rooms[room.id]
-        if len(self.rooms) >= self.max_rooms:
-            raise ConfigError("the server is full")
+        if waiting >= self.limits.waiting_rooms_per_ip:
+            raise TooMuch("you have too many rooms waiting for players")
+
+    def _evict(self) -> None:
+        self.sweep()
+        if len(self.rooms) >= self.limits.max_rooms:
+            done = sorted(
+                (r for r in self.rooms.values() if r.status in ("finished", "aborted")),
+                key=lambda r: r.created,
+            )
+            for room in done[: len(self.rooms) - self.limits.max_rooms + 1]:
+                self._forget(room)
+        if len(self.rooms) >= self.limits.max_rooms:
+            raise TooMuch("the server is full")
+
+    def _forget(self, room: Room) -> None:
+        self.rooms.pop(room.id, None)
+        self.room_owner.pop(room.id, None)
+
+    def sweep(self, now: Optional[float] = None) -> None:
+        """Expire idle waiting rooms, abandoned games and old results."""
+        now = time.time() if now is None else now
+        limits = self.limits
+        for room in list(self.rooms.values()):
+            if room.has_peers():
+                room.last_seen = now
+            absent = now - room.last_seen
+            if room.status == "waiting" and absent > limits.idle_waiting_s:
+                room.abort("nobody came")
+                self._forget(room)
+            elif room.status == "playing" and absent > limits.abandoned_playing_s:
+                if any(s.kind == "remote" for s in room.seats):
+                    room.abort("every remote seat left the game")
+            elif (
+                room.status in ("finished", "aborted")
+                and room.ended is not None
+                and now - room.ended > limits.finished_ttl_s
+            ):
+                self._forget(room)
+
+    async def _janitor(self) -> None:
+        while True:
+            await asyncio.sleep(10)
+            try:
+                self.sweep()
+            except Exception:
+                logger.exception("sweeping rooms failed")
+
+    def start(self) -> None:
+        if self.janitor is None:
+            self.janitor = asyncio.get_running_loop().create_task(self._janitor())
+
+    def shutdown(self) -> None:
+        """Abort every game still going (revealing the server seed)."""
+        if self.janitor is not None:
+            self.janitor.cancel()
+        for room in list(self.rooms.values()):
+            room.abort("the server is shutting down")
+            if room.task is not None:
+                room.task.cancel()
 
     def _archive(self, room: Room) -> None:
         """Keep the server's own record of a finished game."""
@@ -108,7 +256,7 @@ class GameServer:
             "room": room.describe(),
             "server_key": self.key.public_hex,
             "reveal": room._reveal(),
-            "commitments": room.commitments,
+            "commitments": room.state_commitments,
             "final_state": room.doc,
         }
         path = os.path.join(self.archive_dir, f"{room.id}-{room.game_id}.json")
@@ -138,6 +286,7 @@ class GameServer:
                 {
                     "server_key": self.key.public_hex,
                     "protocol_version": PROTOCOL_VERSION,
+                    "app_sha256": self.app_sha256,
                 }
             )
         return _json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -145,27 +294,57 @@ class GameServer:
     # ===== WebSocket =====
     async def handler(self, websocket: ServerConnection) -> None:
         path = websocket.request.path.split("?", 1)[0] if websocket.request else ""
-        if path == "/lobby":
-            await self._lobby(websocket)
-        elif path.startswith("/room/"):
+        address = _address(websocket)
+        room = None
+        if path.startswith("/room/"):
             room = self.rooms.get(path[len("/room/") :].strip("/"))
             if room is None:
                 await websocket.close(4004, "no such room")
                 return
-            await self._room(websocket, room)
-        else:
+        elif path != "/lobby":
             await websocket.close(4004, "unknown path")
+            return
+        limits = self.limits
+        if (
+            self.connections >= limits.max_connections
+            or self.by_ip[address] >= limits.connections_per_ip
+            or (
+                room is not None
+                and self.by_room[room.id] >= limits.connections_per_room
+            )
+        ):
+            await websocket.close(1013, "too many connections; try again later")
+            return
+        self.connections += 1
+        self.by_ip[address] += 1
+        if room is not None:
+            self.by_room[room.id] += 1
+        try:
+            if room is None:
+                await self._lobby(websocket, address)
+            else:
+                await self._room(websocket, room)
+        finally:
+            self.connections -= 1
+            self.by_ip[address] -= 1
+            if not self.by_ip[address]:
+                del self.by_ip[address]
+            if room is not None:
+                self.by_room[room.id] -= 1
+                if not self.by_room[room.id]:
+                    del self.by_room[room.id]
 
-    async def _lobby(self, websocket: ServerConnection) -> None:
+    async def _lobby(self, websocket: ServerConnection, address: str) -> None:
         async for text in websocket:
             try:
-                request = json.loads(text)
+                request = parse_request(text)
                 kind = request.get("type")
                 if kind == "create_room":
                     room = self.create_room(
                         request.get("config"),
                         request.get("seats"),
                         str(request.get("name") or ""),
+                        address=address,
                     )
                     reply = {"type": "room_created", "room": room.describe()}
                 elif kind == "list_rooms":
@@ -177,30 +356,31 @@ class GameServer:
                     reply = {"type": "players", "players": _players()}
                 else:
                     reply = {"type": "error", "message": f"unknown request {kind!r}"}
-            except (ValueError, AttributeError, RoomError) as error:
+            except (ValueError, AttributeError, RoomError, TooMuch) as error:
                 reply = {"type": "error", "message": str(error)}
             await websocket.send(json.dumps(reply))
 
     async def _room(self, websocket: ServerConnection, room: Room) -> None:
-        peer = Peer(websocket)
+        peer = Peer(websocket, room.limits.max_queue)
         outbox: Outbox = room.connect(peer)
         seat, watching = None, False
         try:
             async for text in websocket:
-                request = None
+                request: Optional[dict] = None
                 try:
-                    request = json.loads(text)
-                    if not isinstance(request, dict):
-                        raise RoomError("bad_request", "expected a JSON object")
+                    request = parse_request(text)
                     kind = request.get("type")
                     if kind == "join" and seat is None and not watching:
-                        outbox = room.join(outbox, peer, request)
-                        seat = next(s for s in room.seats if s.outbox is outbox)
+                        seat = room.join(outbox, peer, request)
+                        assert seat.outbox is not None
+                        outbox = seat.outbox
                     elif kind == "spectate" and seat is None and not watching:
                         room.spectate(outbox, request)
                         watching = True
+                    elif kind == "reveal" and seat is not None:
+                        room.on_reveal(seat, peer, request)
                     elif kind == "action" and seat is not None:
-                        room.on_action(seat, request)
+                        room.on_action(seat, peer, request)
                     elif kind == "seat_bot":
                         room.set_bot(request.get("seat"), request.get("spec"))
                     elif kind == "ping":
@@ -208,13 +388,24 @@ class GameServer:
                     else:
                         raise RoomError("bad_request", f"unexpected {kind!r} here")
                 except RoomError as error:
+                    if (
+                        seat is not None
+                        and seat.outbox is not None
+                        and seat.outbox.peer is not peer
+                    ):
+                        continue  # a superseded connection: nothing more to say
                     room.error(outbox, error.code, str(error), request)
-                except ValueError as error:
-                    room.error(outbox, "bad_request", f"not JSON: {error}")
         except ConnectionClosed:
             pass
         finally:
             room.disconnect(outbox, peer)
+
+
+def _address(websocket: ServerConnection) -> str:
+    remote = getattr(websocket, "remote_address", None)
+    if isinstance(remote, (tuple, list)) and remote:
+        return str(remote[0])
+    return str(remote)
 
 
 def _players() -> list:
@@ -223,6 +414,14 @@ def _players() -> list:
         for key, cls in sorted(REGISTRY.items())
         if getattr(cls, "IS_BOT", True)
     ]
+
+
+def _file_sha256(name: str) -> Optional[str]:
+    try:
+        with open(os.path.join(STATIC_DIR, name), "rb") as file:
+            return hashlib.sha256(file.read()).hexdigest()
+    except OSError:
+        return None
 
 
 def _json_response(payload: Any, status: HTTPStatus = HTTPStatus.OK) -> Response:
@@ -248,6 +447,7 @@ def _response(status: HTTPStatus, body: bytes, content_type: str) -> Response:
             ("Content-Type", content_type),
             ("Content-Length", str(len(body))),
             ("Cache-Control", "no-cache"),
+            ("Access-Control-Allow-Origin", "*"),
             ("Connection", "close"),
         ]
     )
@@ -256,6 +456,7 @@ def _response(status: HTTPStatus, body: bytes, content_type: str) -> Response:
 
 async def run_server(server: GameServer, host: str = "127.0.0.1", port: int = 8765):
     """Start serving; returns the websockets server (``.close()`` to stop)."""
+    server.start()
     return await serve(
         server.handler,
         host,
@@ -302,16 +503,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     async def run() -> None:
         ws_server = await run_server(server, args.host, args.port)
         print(
-            f"catanatron-server on http://{args.host}:{args.port}/ "
-            f"(key {server.key.public_hex})",
+            f"catanatron-server on http://{args.host}:{args.port}/\n"
+            f"  server key {server.key.public_hex}\n"
+            f"  app.js sha256 {server.app_sha256}",
             file=sys.stderr,
         )
         stop = asyncio.get_running_loop().create_future()
         for sig in (signal.SIGINT, signal.SIGTERM):
             asyncio.get_running_loop().add_signal_handler(sig, stop.set_result, None)
         await stop
+        # Bot decisions run in daemon threads, so nothing here waits on them.
+        server.shutdown()
         ws_server.close()
-        await ws_server.wait_closed()
+        try:
+            await asyncio.wait_for(ws_server.wait_closed(), 5)
+        except asyncio.TimeoutError:
+            pass
 
     asyncio.run(run())
     return 0

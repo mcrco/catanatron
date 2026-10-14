@@ -1,22 +1,26 @@
-"""The bodies of the game messages, built from the authoritative game.
+"""The bodies of the server's messages.
 
-The server builds every body it sends with these functions, and the verifier
-rebuilds them from its own replay and compares: so whatever a body contains
-is exactly what an honest server would have sent at that point, and nothing
-more. Only fields that cannot be derived from the game (who sits where,
-their keys and seeds) are taken from the message being checked.
+The server builds every game-message body with these functions, and the
+verifier rebuilds them from its own replay and compares: so whatever a body
+contains is exactly what an honest server would have sent at that point, and
+nothing more. Only fields that cannot be derived from the game (who sits
+where, their keys and seeds) are taken from the commitments the client saw
+before it revealed its seed.
 
 The vocabulary is :mod:`catanatron.protocol`'s, extended for a networked
 table:
 
-    hello    server -> client, first message on every connection
-    joined   server -> client, the seat it now holds
-    room     server -> client, seats changed before the game started
-    before   the game starts (or a spectator arrives): board, seats, seeds
-    decide   the seat must answer with a signed action
-    step     somebody acted; the new state and that action's log entry
-    after    the game is over, with the reveal: server seed, salts, actions
-    error    a request was refused
+    hello        server -> client, first message on every connection
+    joined       the seat this connection now holds (and the room)
+    room         seats changed before the game started (to seats and spectators)
+    commitments  every seat is taken: the locked seats, the config and every
+                 seat's seed commitment; seats now reveal their seeds
+    before       the game starts (or a spectator arrives): board, seats, seeds
+    decide       the seat must answer with a signed action
+    step         somebody acted; the new state and that action's log entry
+    after        the game is over, with the reveal: server seed, salts, actions
+    aborted      the game will not be played (who is to blame, the server seed)
+    error        a request was refused
 
 Every game message (``before``, ``decide``, ``step``, ``after``) carries
 ``state``: the recipient's view of the game (``client_view`` for a seat,
@@ -32,11 +36,12 @@ from typing import Optional
 
 from catanatron.game import Game
 from catanatron.serialization import action_to_json, client_view, public_view
-from catanatron.server.config import ordered
 from catanatron.server.maps import board_geometry
 
 #: Bumped when a change would break clients written against the old shape.
-PROTOCOL_VERSION = 1
+#: 2: seeds are committed, then revealed; statements carry the room and the
+#: action's index.
+PROTOCOL_VERSION = 2
 
 GAME_MESSAGES = ("before", "decide", "step", "after")
 
@@ -59,11 +64,35 @@ def _status(game: Game) -> dict:
     }
 
 
+def playable_json(game: Game) -> list:
+    """The legal actions, in Catanatron's order (the same in every process)."""
+    return [action_to_json(a) for a in game.playable_actions]
+
+
+def commitments_body(
+    room_id: str,
+    *,
+    config: dict,
+    seats: list,
+    seed_commitment: str,
+    reveal_timeout_ms: int,
+) -> dict:
+    return {
+        "type": "commitments",
+        "room_id": room_id,
+        "config": config,
+        "seats": seats,
+        "seed_commitment": seed_commitment,
+        "reveal_timeout_ms": reveal_timeout_ms,
+    }
+
+
 def before_body(
     game: Game,
     doc: dict,
     color: Optional[str],
     *,
+    room_id: str,
     config: dict,
     seats: list,
     client_seeds: list,
@@ -74,6 +103,7 @@ def before_body(
     return {
         "type": "before",
         "protocol_version": PROTOCOL_VERSION,
+        "room_id": room_id,
         "game_id": game.id,
         "color": color,
         "config": config,
@@ -100,7 +130,7 @@ def decide_body(game: Game, doc: dict, color: str, *, timeout_ms: int) -> dict:
         "state": state,
         "log_start": len(records),
         "log": [],
-        "playable_actions": [action_to_json(a) for a in ordered(game.playable_actions)],
+        "playable_actions": playable_json(game),
         "timeout_ms": timeout_ms,
         **_status(game),
     }
@@ -134,4 +164,16 @@ def after_body(game: Game, doc: dict, color: Optional[str], *, reveal: dict) -> 
         "num_turns": game.state.num_turns,
         "reveal": reveal,
         **_status(game),
+    }
+
+
+def aborted_body(
+    room_id: str, *, reason: str, blame: list, server_seed: Optional[str]
+) -> dict:
+    return {
+        "type": "aborted",
+        "room_id": room_id,
+        "reason": reason,
+        "blame": blame,
+        "server_seed": server_seed,
     }

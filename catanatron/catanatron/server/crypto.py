@@ -1,19 +1,19 @@
-"""Hashes, signatures and seeds: everything that makes a game auditable.
-
-Every value that crosses the wire as a hash, key, signature or seed is a
-lowercase hex string, and every object that is hashed or signed is first
-turned into bytes by :func:`canonical`, so a verifier written in any
-language reproduces the exact bytes from the parsed JSON.
+"""Signatures and the signed shapes of the protocol.
 
 The scheme (see the server README for the threat model):
 
-* :func:`seed_commitment` -- ``H(server_seed)``, published before any client
-  contributes a seed.
-* :func:`master_seed` -- ``H(server_seed, client seeds in seat order)``; the
-  game's random stream and its board are both derived from it
-  (:func:`derive_seed`).
-* :func:`state_commitment` -- ``H(canonical(full state) || salt)``, sent with
-  every message once the game has started; the salts are revealed at the end.
+* :func:`~catanatron.server.hashing.seed_commitment` -- ``H(server_seed)``,
+  published in every ``hello`` before any client contributes.
+* :func:`~catanatron.server.hashing.client_seed_commitment` -- each seat's
+  commitment to its own seed, sent (with :func:`join_statement` signed as a
+  proof of possession of its key) when it joins. Seeds are revealed only
+  after the server has published every seat's commitment.
+* :func:`~catanatron.server.hashing.master_seed` -- the game's random stream
+  and board are derived from the server seed, the revealed client seeds and
+  the room's committed config and seats.
+* :func:`~catanatron.server.hashing.state_commitment` -- ``H(canonical(full
+  state) || salt)``, sent with every message once the game has started; the
+  salts are revealed at the end.
 * :func:`seal` -- a server message: recipient, sequence number, the hash of
   the previous message to that recipient, the state commitment and the
   body, signed with the server's Ed25519 key.
@@ -22,10 +22,7 @@ The scheme (see the server README for the threat model):
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import secrets
 from typing import Any, Optional
 
 from cryptography.exceptions import InvalidSignature
@@ -35,44 +32,23 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from catanatron.server.hashing import (  # noqa: F401  (re-exported)
+    SALT_BYTES,
+    SEED_BYTES,
+    canonical,
+    client_seed_commitment,
+    derive_seed,
+    digest,
+    is_hex,
+    master_seed,
+    random_hex,
+    seed_commitment,
+    sha256_hex,
+    state_commitment,
+)
+
 #: The ``prev`` of the first message to a recipient.
 GENESIS = "0" * 64
-SEED_BYTES = 32
-SALT_BYTES = 16
-
-
-def canonical(obj: Any) -> bytes:
-    """The one byte encoding of a JSON value that gets hashed or signed.
-
-    Sorted keys, no whitespace, UTF-8, no NaN. Matches a recursive
-    sorted-keys ``JSON.stringify`` for the integers and strings the protocol
-    uses (it never puts a float in a signed body).
-    """
-    return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode("utf-8")
-
-
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def digest(obj: Any) -> str:
-    return sha256_hex(canonical(obj))
-
-
-def random_hex(num_bytes: int = SEED_BYTES) -> str:
-    return secrets.token_hex(num_bytes)
-
-
-def is_hex(value: Any, num_bytes: Optional[int] = None) -> bool:
-    if not isinstance(value, str) or len(value) % 2 or value != value.lower():
-        return False
-    try:
-        raw = bytes.fromhex(value)
-    except ValueError:
-        return False
-    return num_bytes is None or len(raw) == num_bytes
 
 
 # ===== keys =====
@@ -120,37 +96,15 @@ class SigningKey:
         return self._key.sign(canonical(obj)).hex()
 
 
-def verify_signature(public_hex: str, obj: Any, signature_hex: str) -> bool:
+def verify_signature(public_hex: Any, obj: Any, signature_hex: Any) -> bool:
+    if not is_hex(public_hex, 32) or not is_hex(signature_hex, 64):
+        return False
     try:
         key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex))
         key.verify(bytes.fromhex(signature_hex), canonical(obj))
     except (InvalidSignature, ValueError, TypeError):
         return False
     return True
-
-
-# ===== seeds =====
-def seed_commitment(server_seed: str) -> str:
-    return sha256_hex(bytes.fromhex(server_seed))
-
-
-def master_seed(server_seed: str, client_seeds: list) -> bytes:
-    """What every chance event in the game is derived from.
-
-    ``client_seeds`` is in seat order, None for seats that contribute none
-    (the server's own bots, whose randomness would be the server's anyway).
-    """
-    material = {"server_seed": server_seed, "client_seeds": list(client_seeds)}
-    return hashlib.sha256(b"catanatron-seed/1" + canonical(material)).digest()
-
-
-def derive_seed(master: bytes, label: str) -> int:
-    """An integer seed for one purpose (``"game"``, ``"map"``)."""
-    return int.from_bytes(hashlib.sha256(master + label.encode()).digest(), "big")
-
-
-def state_commitment(full_state: dict, salt: str) -> str:
-    return sha256_hex(canonical(full_state) + bytes.fromhex(salt))
 
 
 # ===== messages =====
@@ -177,14 +131,39 @@ def envelope_hash(envelope: dict) -> str:
     return digest(head_of(envelope))
 
 
-def verify_envelope(server_key: str, envelope: dict) -> bool:
+def verify_envelope(server_key: Any, envelope: Any) -> bool:
     try:
         return verify_signature(server_key, head_of(envelope), envelope["sig"])
-    except KeyError:
+    except (KeyError, TypeError):
         return False
 
 
-def action_statement(game_id: str, seq: int, decide_hash: str, action: list) -> dict:
-    """What a client signs to play ``action`` in answer to the ``decide``
-    message number ``seq``, whose hash is ``decide_hash``."""
-    return {"game_id": game_id, "seq": seq, "decide": decide_hash, "action": action}
+def join_statement(
+    room_id: str, server_commitment: str, seat: Optional[int], client_commitment: str
+) -> dict:
+    """What a joining client signs with its seat key: proof that it holds
+    the key, bound to the room, the server's seed commitment it saw, the
+    seat it asked for and its own seed commitment."""
+    return {
+        "domain": "catanatron-join/1",
+        "room_id": room_id,
+        "seed_commitment": server_commitment,
+        "seat": seat,
+        "client_commitment": client_commitment,
+    }
+
+
+def action_statement(
+    room_id: str, game_id: str, index: int, seq: int, decide_hash: str, action: list
+) -> dict:
+    """What a client signs to play ``action`` as the game's action number
+    ``index``, in answer to the ``decide`` message number ``seq`` (whose hash
+    is ``decide_hash``)."""
+    return {
+        "room_id": room_id,
+        "game_id": game_id,
+        "index": index,
+        "seq": seq,
+        "decide": decide_hash,
+        "action": action,
+    }

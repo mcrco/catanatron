@@ -171,7 +171,7 @@ class FalseTimeoutRoom(Room):
         if decided and seat.color.value == "RED" and not self.forged:
             if playable[-1] != default_action(playable):
                 self.forged = True
-                return None  # recorded as a timeout
+                return "timeout"  # recorded as a timeout
         return decided
 
     def _timeout_action(self, playable):

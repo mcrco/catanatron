@@ -164,7 +164,7 @@ def test_a_game_on_an_explicit_map():
 @pytest.mark.parametrize("name", ["extension", "blob25_stringy"])
 def test_a_verified_game_on_an_irregular_map(name):
     with open(os.path.join(MAPS_DIR, name + ".json")) as file:
-        spec = json.load(file)
+        spec = {"tiles": json.load(file)["tiles"]}
     num_players = 6 if name == "extension" else 3
 
     async def scenario():

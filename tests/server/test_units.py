@@ -205,3 +205,20 @@ def test_a_sampled_game_looks_exactly_like_the_view(num_players):
                 if game.state.current_color() == color:
                     # (Another seat's options depend on its hidden hand.)
                     assert sampled.playable_actions == game.playable_actions
+
+
+def test_configs_and_games_need_no_cryptography():
+    """Local tools (the TUI) build games from configs without the server's
+    optional dependencies."""
+    import subprocess
+    import sys
+
+    program = """
+import sys
+sys.modules["cryptography"] = None  # importing it now fails
+from catanatron.server.config import GameConfig, new_game
+from catanatron.server.hashing import master_seed
+game = new_game(GameConfig.from_json({"num_players": 3}), master_seed("ab" * 32, [None] * 3), "g")
+assert len(game.state.colors) == 3
+"""
+    subprocess.run([sys.executable, "-c", program], check=True, timeout=120)

@@ -81,7 +81,7 @@ def _tiles_document(spec: Any) -> dict:
                 entry.update(type="LAND", resource=None, number=None)
             elif resource in RESOURCES:
                 number = tile.get("number")
-                if number not in NUMBERS:
+                if type(number) is not int or number not in NUMBERS:
                     raise MapError(f"{where}: number must be one of {NUMBERS}")
                 entry.update(type="LAND", resource=resource, number=number)
             else:
