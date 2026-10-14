@@ -7,6 +7,7 @@ ordinary client is also shown to refuse the game outright where it can.
 """
 
 import asyncio
+import copy
 import dataclasses
 import json
 import os
@@ -30,7 +31,7 @@ from catanatron.server.client import (
     create_room,
 )
 from catanatron.server.config import ConfigError, GameConfig
-from catanatron.server.crypto import digest, random_hex
+from catanatron.server.crypto import digest, random_hex, rejoin_statement
 from catanatron.server.messages import PROTOCOL_VERSION, decide_body
 from catanatron.server.room import Room, RoomError, RoomLimits
 from catanatron.server.verify import verify_transcript
@@ -112,9 +113,10 @@ class SilentClient(GameClient):
         return await super()._handle(ws, body, decide)
 
 
-def test_a_seat_that_does_not_reveal_is_replaced_and_the_others_commit_afresh():
-    """Withholding no longer voids the game: the withholder is out (and
-    barred), every seed is replaced, and the room fills again."""
+def test_a_seat_that_does_not_reveal_voids_the_room_and_is_blamed():
+    """Withholding voids the room (protocol 4: no second round, so nobody
+    is ever asked to reveal twice); the withholder is blamed, its key may
+    not sit again, and a new room starts from new seeds."""
 
     async def scenario():
         limits = ServerLimits(room=RoomLimits(reveal_timeout_ms=400))
@@ -123,48 +125,34 @@ def test_a_seat_that_does_not_reveal_is_replaced_and_the_others_commit_afresh():
             url = f"{base}/room/{room['id']}"
             honest, decide = bot_client(url, seat=0, verify=False)
             silent, decide2 = bot_client(url, client_class=SilentClient, seat=1)
-            playing = asyncio.create_task(honest.play(decide))
-            withheld = await asyncio.gather(
-                silent.play(decide2), return_exceptions=True
-            )
-            # The withholder's key may not come back.
-            again, decide3 = bot_client(url, key=silent.key, seat=1)
-            with pytest.raises(Refused, match="withheld"):
-                await again.play(decide3)
-            room_obj = server.rooms[room["id"]]
-            # Its address is barred from this room too: allow a second one in.
-            room_obj.banned_addresses.clear()
-            late, decide4 = bot_client(url, seat=1, verify=False)
-            results = await asyncio.gather(playing, late.play(decide4))
-            return honest, late, results, room_obj, withheld
-
-    honest, late, results, room, withheld = run(scenario())
-    assert room.status == "finished" and room.round == 1
-    kinds = [m["body"]["type"] for m in honest.messages]
-    assert kinds.count("commitments") == 2 and kinds.count("restart") == 1
-    for client in (honest, late):
-        report = verify_transcript(client.transcript())
-        assert report.ok, report.errors
-
-
-def test_a_room_whose_seats_keep_withholding_is_called_off():
-    async def scenario():
-        limits = ServerLimits(room=RoomLimits(reveal_timeout_ms=300, max_rounds=1))
-        async with serving(limits=limits) as (server, base):
-            room = await create_room(base, CONFIG, [None, None, "F"])
-            url = f"{base}/room/{room['id']}"
-            honest, decide = bot_client(url, seat=0, verify=False)
-            silent, decide2 = bot_client(url, client_class=SilentClient, seat=1)
             results = await asyncio.gather(
                 honest.play(decide), silent.play(decide2), return_exceptions=True
             )
-            return results[0], honest
+            # The withholder's key may not sit anywhere for a while.
+            again_room = await create_room(base, CONFIG, [None, None, "F"])
+            again_url = f"{base}/room/{again_room['id']}"
+            again, decide3 = bot_client(again_url, key=silent.key, seat=1)
+            with pytest.raises(Refused, match="withheld"):
+                await again.play(decide3)
+            # Anyone else plays the new room from fresh seeds.
+            server.blames.clear()
+            a, decide4 = bot_client(again_url, seat=0, verify=False)
+            b, decide5 = bot_client(again_url, seat=1, verify=False)
+            replay = await asyncio.gather(a.play(decide4), b.play(decide5))
+            return results[0], honest, server.rooms[room["id"]], replay, (a, b)
 
-    result, honest = run(scenario())
-    assert result.aborted["blame"] == [1]
-    assert result.verified is False
-    errors = verify_transcript(honest.transcript()).errors
-    assert any_error(errors, "aborted", "blamed seats: [1]")
+    result, honest, room, replay, (a, b) = run(scenario())
+    assert room.status == "aborted"
+    assert result.aborted["blame"] == [1] and result.verified is False
+    kinds = [m["body"]["type"] for m in honest.messages]
+    assert kinds.count("commitments") == 1 and kinds[-1] == "aborted"
+    report = verify_transcript(honest.transcript())
+    assert report.void is not None and not report.errors, report.errors
+    assert report.void["blame"] == [1]
+    assert all(r.aborted is None and r.winning_color for r in replay)
+    assert honest.client_seed not in (a.client_seed, b.client_seed)
+    for client in (a, b):
+        assert verify_transcript(client.transcript()).ok
 
 
 def test_a_reveal_must_open_its_commitment():
@@ -176,11 +164,12 @@ def test_a_reveal_must_open_its_commitment():
             await ws.send(json.dumps(request))
             await next_body(ws, "commitments")
             await ws.send(json.dumps({"type": "reveal", "client_seed": random_hex()}))
-            refusal = await next_body(ws, "error")
+            refusal = await next_body(ws, "received")
             await ws.close()
             return refusal
 
-    assert run(scenario())["code"] == "bad_reveal"
+    refusal = run(scenario())
+    assert refusal["accepted"] is False and "does not open" in refusal["reason"]
 
 
 def test_a_join_needs_proof_of_the_key_and_a_key_not_already_seated():
@@ -242,7 +231,8 @@ class SeatSwapRoom(Room):
     """Swaps the two remote seats once every seed is in."""
 
     async def _play(self):
-        a, b = self.locked[0], self.locked[1]
+        self.commitments = copy.deepcopy(self.commitments)
+        a, b = self.commitments["seats"][0], self.commitments["seats"][1]
         for key in ("kind", "name", "public_key", "client_commitment"):
             a[key], b[key] = b[key], a[key]
         await super()._play()
@@ -322,7 +312,7 @@ def test_a_refused_legal_move_is_not_replaced_and_is_reported():
     assert all(
         len(statements) == 1 for statements in by_index.values()
     ), "never a second move"
-    assert any_error(errors_of(red), "never acknowledged this client's legal")
+    assert any_error(errors_of(red), "an action answered with an error")
 
 
 class ResolicitRoom(Room):
@@ -846,16 +836,17 @@ def test_a_rejoin_closes_the_old_connection():
             old, hello = await raw_connect(url)
             request, key, _ = join_request(hello, seat=0)
             await old.send(json.dumps(request))
-            joined = await next_body(old, "joined")
-            new, _ = await raw_connect(url)
+            await next_body(old, "joined")
+            new, hello2 = await raw_connect(url)
             await new.send(
                 json.dumps(
                     {
-                        "type": "join",
+                        "type": "rejoin",
                         "protocol_version": PROTOCOL_VERSION,
-                        "seat": 0,
-                        "seat_key": joined["seat_key"],
                         "public_key": key.public_hex,
+                        "sig": key.sign(
+                            rejoin_statement(created["id"], hello2["nonce"])
+                        ),
                         "last_seq": -1,
                     }
                 )

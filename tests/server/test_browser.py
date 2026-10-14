@@ -15,7 +15,8 @@ import urllib.request
 import pytest
 
 from catanatron.server.client import GameClient, create_room, list_rooms
-from catanatron.server.crypto import envelope_hash, verify_signature
+from catanatron.server.crypto import digest, envelope_hash, verify_signature
+from catanatron.server.room import Room
 from catanatron.server.verify import verify_transcript
 
 from tests.server.helpers import bot_client, join_request, raw_connect, run, serving
@@ -100,7 +101,7 @@ const fs = require("fs");
 const vm = require("vm");
 const [host, roomId, seat, mode, appJs] = process.argv.slice(-5);
 const store = new Map();
-const noSubtle = mode === "watch-nosubtle";
+const noSubtle = mode.startsWith("watch-nosubtle");
 globalThis.window = {
   crypto: noSubtle ? { getRandomValues: (a) => crypto.getRandomValues(a) } : globalThis.crypto,
   addEventListener() {},
@@ -112,11 +113,43 @@ globalThis.localStorage = {
   setItem: (k, v) => store.set(k, String(v)),
   removeItem: (k) => store.delete(k),
 };
+globalThis.harnessStore = store;
 vm.runInThisContext(fs.readFileSync(appJs, "utf8"));
 vm.runInThisContext(`
   const mode = ${JSON.stringify(mode)};
-  let asked = false, dropped = false, lost = false, again = false;
-  const sits = !["watch-nosubtle", "watch-room"].includes(mode);
+  let asked = false, dropped = false, lost = false, again = false, reloaded = false;
+  const sends = [];
+  const sits = !["watch-nosubtle", "watch-room", "idle-watch", "watch-nosubtle-waiting"].includes(mode);
+  function done(out) {
+    session.close();
+    process.stdout.write(JSON.stringify(out), () => process.exit(0));
+    render = () => {};
+  }
+  function wrap(s) {
+    // Every request the page sends, for the test to look at.
+    const send = s.send.bind(s);
+    s.send = (payload) => {
+      sends.push(payload);
+      const sent = send(payload);
+      if (mode === "lose-joined" && payload.type === "join" && !dropped) {
+        dropped = true; s.ws.close();  // the link dies before "joined" comes back
+      }
+      if (mode === "drop-after-answer" && payload.type === "action" && !dropped &&
+          payload.statement.index > 5) {
+        dropped = true; setTimeout(() => s.ws.close(), 0);  // answer delivered, then a drop
+      }
+      return sent;
+    };
+  }
+  if (mode === "foreign-record") {
+    // Records another server (another key) left for a room with this id,
+    // and protocol 3's unkeyed record: neither may be used here.
+    const record = JSON.stringify({ identity: { publicHex: "ab".repeat(32), privatePkcs8: "00" },
+      clientSeed: "cd".repeat(32), clientCommitment: "ef".repeat(32), joined: true, seat: 0,
+      sent: [], unreceipted: [] });
+    harnessStore.set("catanatron-seat-" + "12".repeat(32) + "-" + ${JSON.stringify(roomId)}, record);
+    harnessStore.set("catanatron-seat-" + ${JSON.stringify(roomId)}, record);
+  }
   render = function () {
     if (mode === "watch-room") {
       // Never sits: the seat picker must still follow the room.
@@ -131,11 +164,26 @@ vm.runInThisContext(`
       // The page loses its connection before it sits.
       dropped = true; session.ws.close(); return;
     }
-    if (sits && session.room && !session.seated && !asked && !session.first) {
+    if (mode === "watch-nosubtle-waiting" && session.room && !session.spectating && !asked) {
+      asked = true; session.spectate();
+    }
+    if (sits && session.room && !session.joinSent && !asked && !session.first) {
       asked = true;
       if (mode === "doubleclick-bot") session.seatBot(${seat}, "NOSUCHBOT");  // fails
       session.takeSeat(${seat});
       if (mode === "doubleclick") session.takeSeat(${seat});  // a double click
+      if (mode === "bot-while-joining") {
+        // "Add bot" on a taken seat while the join is in flight: the page
+        // does not send it, and an error answering it (sent anyway) must
+        // not end the wait for the join.
+        session.seatBot(1, "R");
+        session.ws.send(JSON.stringify({ type: "seat_bot", seat: 1, spec: "R" }));
+      }
+    }
+    if (mode === "regrind") {
+      const reveals = new Set(sends.filter((p) => p.type === "reveal").map((p) => p.sig));
+      if (session.problems.length) done({ problems: session.problems, reveals: [...reveals] });
+      return;
     }
     if (mode === "doubleclick-bot" && !again && session.problems.some((p) => p.includes("NOSUCHBOT"))) {
       // The bot's error comes back while the join is in flight; click again.
@@ -143,9 +191,21 @@ vm.runInThisContext(`
       session.problems = session.problems.filter((p) => !p.includes("NOSUCHBOT"));
       session.takeSeat(${seat});
     }
+    if (mode === "bot-while-joining") {
+      session.problems = session.problems.filter((p) => !p.includes("taken"));
+    }
     if (session.problems.length) { console.error(session.problems); process.exit(2); }
     if (mode === "play" && session.game && session.game.index > 30 && !dropped) {
       dropped = true; session.ws.close();
+    }
+    if (mode === "reload" && session.game && session.game.index > 20 && !reloaded && session.sent.length) {
+      // The tab reloads: a new page, the same localStorage.
+      reloaded = true;
+      session.close();
+      session = new Session(${JSON.stringify(roomId)});
+      wrap(session);
+      session.connect();
+      return;
     }
     if (session.pending && !session.answered) {
       const actions = session.pending.body.playable_actions;
@@ -156,15 +216,19 @@ vm.runInThisContext(`
       session.act(actions[actions.length - 1]);
     }
     if ((session.game && session.game.over) || session.aborted) {
-      session.close();
-      const out = mode === "watch-nosubtle"
-        ? { over: session.game.over, unverified: session.unverified, verified: session.verifiedCount }
+      if (session.unreceipted.length) return;  // receipts still owed
+      const out = mode.startsWith("watch-nosubtle")
+        ? { over: session.game.over, unverified: session.unverified, verified: session.verifiedCount,
+            problems: session.problems }
         : session.transcript();
-      process.stdout.write(JSON.stringify(out), () => process.exit(0));
-      render = () => {};
+      if (mode === "foreign-record" || mode === "bot-while-joining") {
+        out.sends = sends.map((p) => p.type);
+      }
+      done(out);
     }
   };
   session = new Session(${JSON.stringify(roomId)});
+  wrap(session);
   session.connect();
 `);
 """
@@ -483,3 +547,242 @@ def test_the_lobby_and_the_http_api():
 def _get(url):
     with urllib.request.urlopen(url, timeout=10) as response:
         return response.read().decode()
+
+
+# ===== protocol 4: the page's side of PROTOCOL.md's invariants =====
+needs_node_ws = pytest.mark.skipif(
+    not _node_has_websocket(), reason="needs Node.js with WebSocket"
+)
+
+
+@needs_node_ws
+def test_a_page_that_loses_joined_takes_its_seat_back():
+    """I9. Round 3: the page forgot the join, auto-spectated, and was blamed
+    as a withholder (its address banned)."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, "R"])
+            transcript = await run_session(base, room["id"], "lose-joined")
+            return transcript, server
+
+    transcript, server = run(scenario())
+    report = verify_transcript(transcript)
+    assert report.ok, report.errors
+    assert report.color == "RED" and not server.blames
+
+
+class PageGrindRoom(Room):
+    """Once every seed is in, sends a second commitments (it would like a
+    reveal over it, to pick among games it can already compute)."""
+
+    ground = False
+
+    def _start(self):
+        if self.ground:
+            return super()._start()
+        self.ground = True
+        self.status = "revealing"
+        self.commitments = dict(self.commitments, reveal_timeout_ms=1)
+        self.commitments_digest = digest(self.commitments)
+        for seat in self.seats:
+            if seat.kind == "remote":
+                seat.client_seed = seat.reveal_sig = None
+                seat.outbox.push(self.commitments)
+
+
+@needs_node_ws
+def test_a_regrinding_server_is_refused_by_the_page():
+    """I1. Round 3: the page signed a new reveal for every commitments."""
+
+    async def scenario():
+        async with serving(room_class=PageGrindRoom) as (server, base):
+            room = await create_room(base, {"num_players": 2}, [None, "R"])
+            return await run_session(base, room["id"], "regrind")
+
+    out = run(scenario())
+    assert any("second, different commitments" in p for p in out["problems"])
+    assert len(out["reveals"]) == 1, "one reveal, ever"
+
+
+@needs_node_ws
+def test_a_reload_keeps_what_the_page_signed():
+    """Round 3: a reload lost every answer signed before it, and with them
+    the proof of a refused move."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 5, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, "R"])
+            return await run_session(base, room["id"], "reload")
+
+    transcript = run(scenario())
+    indices = [item["statement"]["index"] for item in transcript["sent"]]
+    assert min(indices) <= 20 < max(indices), indices
+    report = verify_transcript(transcript)
+    assert report.ok, report.errors
+
+
+@needs_node_ws
+def test_a_resent_answer_that_was_played_is_not_shown_as_refused():
+    """Round 3: the stale receipt for a resent, played answer showed as
+    'the server did not take your move' (the harness fails on problems)."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, "R"])
+            return await run_session(base, room["id"], "drop-after-answer")
+
+    report = verify_transcript(run(scenario()))
+    assert report.ok, report.errors
+
+
+@needs_node_ws
+def test_a_page_looking_at_a_room_that_fills_watches_the_game():
+    """Round 3: a page still looking at the room when it filled (both joins
+    in one tick) saw 'revealing seeds...' for the whole game."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, None])
+            url = f"{base}/room/{room['id']}"
+            page = asyncio.create_task(run_session(base, room["id"], "idle-watch"))
+            await asyncio.sleep(1.0)
+            red, d1 = bot_client(url, "R", seat=0)
+            blue, d2 = bot_client(url, "R", seat=1)
+            await asyncio.gather(red.play(d1), blue.play(d2))
+            return await asyncio.wait_for(page, 120)
+
+    transcript = run(scenario())
+    report = verify_transcript(transcript)
+    assert report.ok and report.color is None, report.errors
+
+
+@needs_node_ws
+def test_a_browser_without_subtle_crypto_watches_a_room_fill():
+    """Round 3: the commitments handler hashed with SubtleCrypto
+    unguarded, and threw on every commitments."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            room = await create_room(
+                base, {"num_players": 2, "vps_to_win": 4}, [None, "R"]
+            )
+            page = asyncio.create_task(
+                run_session(base, room["id"], "watch-nosubtle-waiting")
+            )
+            await asyncio.sleep(1.0)
+            client, decide = bot_client(f"{base}/room/{room['id']}", "R")
+            await client.play(decide)
+            return await asyncio.wait_for(page, 120)
+
+    out = run(scenario())
+    assert out["over"] and out["problems"] == [], out
+
+
+@needs_node_ws
+def test_seat_records_belong_to_one_server():
+    """Round 3: a copy of the page used with two servers handed one
+    server's seat key and unrevealed seed to the other (same room id)."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, "R"])
+            return await run_session(base, room["id"], "foreign-record")
+
+    transcript = run(scenario())
+    assert transcript["sends"][0] == "join" and "rejoin" not in transcript["sends"]
+    assert verify_transcript(transcript).ok
+
+
+@needs_node_ws
+def test_an_error_for_another_request_does_not_end_a_join():
+    """Round 3: an 'Add bot' error carrying a join-refusal code re-enabled
+    'Sit here' while the join was in flight; a second click replaced the
+    page's key and lost the seat."""
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, "R"])
+            return await run_session(base, room["id"], "bot-while-joining")
+
+    transcript = run(scenario())
+    assert transcript["sends"].count("join") == 1
+    assert "seat_bot" not in transcript["sends"], "not sent while joining"
+    assert verify_transcript(transcript).ok
+
+
+STORE_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+// Just enough IndexedDB: one store, put/get/getAll, answered asynchronously.
+const rows = new Map();
+const later = (request, value) => setTimeout(() => { request.result = value; request.onsuccess && request.onsuccess(); }, 0);
+const objectStore = {
+  put(row) { const r = {}; rows.set(row.id, JSON.parse(JSON.stringify(row))); later(r, row.id); return r; },
+  get(id) { const r = {}; later(r, rows.get(id)); return r; },
+  getAll() { const r = {}; later(r, [...rows.values()]); return r; },
+};
+globalThis.indexedDB = { open() { const r = {}; later(r, { transaction: () => ({ objectStore: () => objectStore }) }); return r; } };
+globalThis.window = { crypto: globalThis.crypto, addEventListener() {} };
+globalThis.document = { querySelector() { return null; } };
+globalThis.location = { hash: "", protocol: "http:", host: "localhost" };
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+vm.runInThisContext(fs.readFileSync(process.argv[process.argv.length - 1], "utf8"));
+globalThis.rows = rows;
+globalThis.tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+vm.runInThisContext(`
+(async () => {
+  const out = {};
+  const rich = { messages: ["a", "b", "c"], sent: [1, 2] };
+  await saveTranscript("t", rich);
+  await saveTranscript("t", { messages: ["a"], sent: [] });  // a reopened room's replay
+  await saveTranscript("t", { messages: ["a", "b", "c"], sent: [] });  // as many, nothing signed
+  out.kept = JSON.parse(rows.get("t").json);
+  await saveTranscript("t", { messages: ["a", "b", "c", "d"], sent: [1, 2, 3] });  // more of it
+  out.extended = JSON.parse(rows.get("t").json).messages.length;
+  await saveTranscript("t", { messages: ["a", "x", "y", "z", "w"], sent: [] });  // another story
+  out.both = [...rows.keys()].filter((k) => k.startsWith("t")).length;
+  for (const key of [...rows.keys()]) rows.delete(key);
+  // A finished game still owed a receipt is saved only once it comes.
+  const s = new Session("room");
+  s.serverKey = "ab".repeat(32);
+  s.saved = { identity: { publicHex: "cd".repeat(32) }, joined: true, seat: 0, color: "RED",
+              clientSeed: "00", sent: [{ statement: {}, sig: "s" }],
+              unreceipted: [{ digest: "d1", answer: {} }] };
+  s.game = { gameId: "g", over: true, color: "RED" };
+  s.finish();
+  await tick();
+  out.savedBeforeReceipt = rows.size;  // (none)
+  s.messages.push("receipt");
+  s.onReceipt({ submission: "d1", accepted: true });
+  await tick();
+  out.savedAfterReceipt = rows.size;
+  out.withReceipt = JSON.parse(rows.get(s.saveId).json).messages.includes("receipt");
+  process.stdout.write(JSON.stringify(out));
+})().catch((error) => { console.error(error); process.exit(3); });
+`);
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js")
+def test_saved_transcripts_wait_for_receipts_and_are_never_made_poorer():
+    """Round 3: the page saved at 'after', before receipts still owed, and
+    replaced a saved transcript with the poorer one of a reopened room."""
+    result = subprocess.run(
+        ["node", "-e", STORE_HARNESS, APP_JS],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["kept"] == {"messages": ["a", "b", "c"], "sent": [1, 2]}
+    assert out["extended"] == 4 and out["both"] == 2
+    assert out["savedBeforeReceipt"] == 0
+    assert out["savedAfterReceipt"] == 1 and out["withReceipt"]

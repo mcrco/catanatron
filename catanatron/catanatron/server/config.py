@@ -68,11 +68,15 @@ class GameConfig:
             raise ConfigError("a config is a JSON object")
         unknown = set(payload) - set(cls.__dataclass_fields__)
         if unknown:
-            raise ConfigError(f"unknown config keys: {sorted(unknown)}")
+            raise ConfigError(
+                "unknown config keys (known: "
+                + ", ".join(sorted(cls.__dataclass_fields__))
+                + ")"
+            )
         try:
             config = cls(**payload)
-        except TypeError as error:
-            raise ConfigError(str(error))
+        except TypeError:
+            raise ConfigError("a config is a JSON object of known keys")
         config.validate()
         if config.map is not None:
             config = cls(**{**asdict(config), "map": normalize_map(config.map)})
@@ -129,7 +133,7 @@ class GameConfig:
 
 def _int(value: Any) -> int:
     if type(value) is not int:
-        raise ConfigError(f"expected an integer, got {value!r}")
+        raise ConfigError("expected an integer")
     return value
 
 

@@ -10,21 +10,23 @@ before it revealed its seed.
 The vocabulary is :mod:`catanatron.protocol`'s, extended for a networked
 table:
 
-    hello        server -> client, first message on every connection
+    hello        server -> client, first message on every connection (with
+                 a nonce a rejoining client signs)
     joined       the seat this connection now holds (and the room)
     room         seats changed before the game started
     commitments  every seat is taken: the locked seats with their keys,
                  seed commitments and join signatures, and the config; seats
-                 now reveal their seeds (signing the commitments' digest)
-    restart      a seat did not reveal: it is out, the server's seed is
-                 revealed and replaced, and seated clients commit afresh
+                 now reveal their seeds (signing the commitments' digest).
+                 Sent once per room: there is no second round
     before       the game starts (or a spectator arrives): board, seats, seeds
     decide       the seat must answer with a signed action
-    received     the server's receipt for a submitted action
+    received     the server's receipt for a submitted reveal or action
     step         somebody acted; the new state and that action's log entry
     after        the game is over, with the reveal: server seed, salts, actions
-    aborted      the game will not be played (who is to blame, the server seed)
+    aborted      the game is void (why, who is to blame, the server seed)
     error        a request was refused
+
+See PROTOCOL.md next to this module for the state machine and invariants.
 
 Every game message (``before``, ``decide``, ``step``, ``after``) carries
 ``state``: the recipient's view of the game (``client_view`` for a seat,
@@ -46,7 +48,20 @@ from catanatron.server.maps import board_geometry
 #: 2: seeds are committed, then revealed; statements carry the action's index.
 #: 3: statements and reveals sign the commitments' digest; restart rounds;
 #: receipts for submitted actions.
-PROTOCOL_VERSION = 3
+#: 4: one commitments per room (a withheld reveal voids the room; no restart
+#: rounds); rejoining signs the connection's nonce (no seat keys); receipts
+#: for reveals too.
+PROTOCOL_VERSION = 4
+
+#: Every field of a commitments body, and nothing else.
+COMMITMENTS_FIELDS = (
+    "type",
+    "room_id",
+    "config",
+    "seats",
+    "seed_commitment",
+    "reveal_timeout_ms",
+)
 
 GAME_MESSAGES = ("before", "decide", "step", "after")
 
@@ -77,7 +92,6 @@ def playable_json(game: Game) -> list:
 def commitments_body(
     room_id: str,
     *,
-    round: int,
     config: dict,
     seats: list,
     seed_commitment: str,
@@ -86,33 +100,10 @@ def commitments_body(
     return {
         "type": "commitments",
         "room_id": room_id,
-        "round": round,
         "config": config,
         "seats": seats,
         "seed_commitment": seed_commitment,
         "reveal_timeout_ms": reveal_timeout_ms,
-    }
-
-
-def restart_body(
-    room_id: str,
-    *,
-    round: int,
-    reason: str,
-    blame: list,
-    server_seed: str,
-    seed_commitment: str,
-    room: dict,
-) -> dict:
-    return {
-        "type": "restart",
-        "room_id": room_id,
-        "round": round,
-        "reason": reason,
-        "blame": blame,
-        "server_seed": server_seed,  # the old one, revealed
-        "seed_commitment": seed_commitment,  # the new one
-        "room": room,
     }
 
 

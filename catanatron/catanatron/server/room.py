@@ -2,16 +2,16 @@
 
 Each recipient (a seat, or one connection) has an :class:`Outbox`: the hash
 chain of every message the server ever sent it. A seat's outbox outlives its
-connections, so a client that reconnects with its seat key gets whatever it
-missed and its chain carries on unbroken.
+connections, so a client that takes its seat back on a new connection (it
+signs that connection's nonce with the seat's key) gets whatever it missed
+and its chain carries on unbroken.
 
 A room goes ``waiting`` (seats fill; each remote seat commits to a seed) ->
-``revealing`` (seats are locked and every commitment is published; seats
-reveal their seeds) -> ``playing`` -> ``finished``. A seat that does not
-reveal (or, after a restart, commit) in time is removed and blamed, its key
-and address are barred from the room, the server's seed is revealed and
-replaced, every revealed seed is thrown away, and the room goes back to
-``waiting`` for a fresh round; after a few rounds it is ``aborted``.
+``revealing`` (seats are locked and every commitment is published, once;
+seats reveal their seeds) -> ``playing`` -> ``finished``. A room whose seats
+do not all reveal in time is void (``aborted``, naming them): there is no
+second round of commitments, ever, so nobody can be asked to reveal twice.
+See PROTOCOL.md for the whole state machine and its invariants.
 
 The game itself is stock Catanatron, seated with inert
 :class:`~catanatron.server.config.ServerSeat` players: nothing in the server
@@ -23,7 +23,6 @@ messages a remote client gets.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import time
@@ -37,7 +36,7 @@ from catanatron.models.enums import Action, ActionRecord
 from catanatron.models.player import Color
 from catanatron.registry import REGISTRY, parse_spec
 from catanatron.serialization import action_to_json, state_to_json
-from catanatron.server.bot import SERVER_PARAM_LIMITS, check_spec
+from catanatron.server.bot import SERVER_PARAM_LIMITS, PaceBook, check_spec, move_kind
 from catanatron.server.botproc import BotWorker, recipe_for
 from catanatron.server.config import (
     GameConfig,
@@ -59,6 +58,7 @@ from catanatron.server.crypto import (
     join_statement,
     master_seed,
     random_hex,
+    rejoin_statement,
     reveal_statement,
     seal,
     seed_commitment,
@@ -74,7 +74,6 @@ from catanatron.server.messages import (
     commitments_body,
     decide_body,
     receipt_body,
-    restart_body,
     step_body,
 )
 from catanatron.server.table import Table
@@ -83,25 +82,39 @@ logger = logging.getLogger(__name__)
 
 MAX_NAME = 32
 
+#: How long server bots take over their real decisions, by bot and kind of
+#: move. Kept in the server process (shared by every room), so that neither
+#: a worker restart nor a new game starts a bot's pace from nothing.
+PACE = PaceBook()
+
+#: Client requests a room knows, named in the errors that answer them (the
+#: request's own text is never echoed).
+REQUESTS = ("join", "rejoin", "spectate", "seat_bot", "reveal", "action", "ping")
+
 
 @dataclass(frozen=True)
 class RoomLimits:
     #: Spectators per room.
     max_spectators: int = 32
     #: How long a seat taken before the start stays held for a client that
-    #: disconnected (it may rejoin with its seat key meanwhile).
+    #: disconnected (it may take it back meanwhile).
     seat_grace_s: float = 30.0
-    #: How long seats have to reveal their seeds once the room is full (and,
-    #: after a restart, to commit afresh).
+    #: How long seats have to reveal their seeds once the room is full; a
+    #: room whose seats do not all reveal in time is void.
     reveal_timeout_ms: int = 30_000
-    #: Seed rounds before a room whose seats keep withholding is called off.
-    max_rounds: int = 3
     #: Messages a connection may fall behind before it is dropped (it can
     #: rejoin and catch up).
     max_queue: int = 20_000
-    #: Answers to requests (errors and receipts) one recipient may be sent;
-    #: past it, bad requests close the connection instead.
+    #: Errors one recipient may be sent; past it, a bad request closes the
+    #: connection instead.
     max_answers: int = 500
+    #: Submissions (reveals and actions) a seat may make, each answered by a
+    #: signed receipt: this many per decision it was asked, plus the margin.
+    #: Past that the connection is closed instead (an honest client answers
+    #: each decision once and resends only after a reconnect, so it never
+    #: gets there).
+    receipts_per_decision: int = 8
+    receipt_margin: int = 64
 
 
 class Peer:
@@ -158,8 +171,12 @@ class Outbox:
         self.envelopes: list = []
         self.head = GENESIS
         self.peer = peer
-        #: Errors and receipts sent so far (bounded: see RoomLimits.max_answers).
+        #: The nonce of the hello that opened this chain (a rejoin signs it).
+        self.nonce = random_hex(16)
+        #: Errors sent so far (bounded: see RoomLimits.max_answers).
         self.answers = 0
+        #: Whether this chain holds the room's commitments (once at most).
+        self.has_commitments = False
 
     def push(self, body: dict, commit: Optional[dict] = None) -> dict:
         envelope = seal(
@@ -193,7 +210,6 @@ class Pending:
     playable: list  # the server's own Action objects
     playable_json: list
     future: asyncio.Future
-    receipts: int = 0
 
 
 @dataclass
@@ -210,12 +226,16 @@ class Seat:
     pop: Optional[str] = None
     client_seed: Optional[str] = None
     reveal_sig: Optional[str] = None
-    seat_key: Optional[str] = None
     address: Optional[str] = None
     outbox: Optional[Outbox] = None
     recipe: Optional[tuple] = None
     table: Optional[Table] = None
     pending: Optional[Pending] = None
+    #: Decisions this seat was asked, and receipts it was given.
+    decisions: int = 0
+    receipts: int = 0
+    #: Receipts held back until the step that closes their decision is out.
+    held: list = field(default_factory=list)
     grace: Optional[asyncio.TimerHandle] = field(default=None, repr=False)
 
     @property
@@ -241,15 +261,11 @@ class Seat:
     def describe(self) -> dict:
         return {**self.public(), "connected": self.connected}
 
-    def forget_seed(self) -> None:
-        self.client_commitment = self.pop = self.client_seed = self.reveal_sig = None
-        self.requested_seat = self.index
-
     def free(self) -> None:
         self.kind, self.name, self.spec = "open", "", None
         self.public_key = self.requested_seat = self.address = None
         self.client_commitment = self.pop = self.client_seed = self.reveal_sig = None
-        self.seat_key = self.outbox = self.recipe = self.table = None
+        self.outbox = self.recipe = self.table = None
 
 
 class RoomError(Exception):
@@ -283,8 +299,8 @@ class Room:
         name: str = "",
         on_finish=None,
         limits: RoomLimits = RoomLimits(),
-        on_blame: Optional[Callable[[Optional[str]], None]] = None,
-        is_banned: Optional[Callable[[Optional[str]], bool]] = None,
+        on_blame: Optional[Callable[[Optional[str], Optional[str]], None]] = None,
+        is_banned: Optional[Callable[[Optional[str], Optional[str]], bool]] = None,
     ):
         self.id = room_id
         self.config = config
@@ -295,7 +311,6 @@ class Room:
         self.created = self.last_seen = time.time()
         self.ended: Optional[float] = None
         self.status = "waiting"
-        self.round = 0
         self.game_id = str(uuid.uuid4())
         self.server_seed = random_hex()
         self.seed_commitment = seed_commitment(self.server_seed)
@@ -303,11 +318,10 @@ class Room:
         self.spectators: list = []
         #: Outboxes of connections that have not joined or spectated yet.
         self.lobby: set = set()
-        self.banned_keys: set = set()
-        self.banned_addresses: set = set()
+        #: Told (address, key) of every seat blamed for a withheld reveal,
+        #: and asked whether an (address, key) may take a seat.
         self.on_blame = on_blame
         self.is_banned = is_banned
-        self.locked: Optional[list] = None
         self.commitments: Optional[dict] = None
         self.commitments_digest: Optional[str] = None
         self.game: Optional[Game] = None
@@ -329,7 +343,6 @@ class Room:
             "id": self.id,
             "name": self.name,
             "status": self.status,
-            "round": self.round,
             "config": self.config.to_json(),
             "seed_commitment": self.seed_commitment,
             "seats": [seat.describe() for seat in self.seats],
@@ -337,11 +350,12 @@ class Room:
             "game_id": self.game_id if self.status in ("playing", "finished") else None,
         }
 
-    def hello_body(self) -> dict:
+    def hello_body(self, nonce: str) -> dict:
         return {
             "type": "hello",
             "protocol_version": PROTOCOL_VERSION,
             "server_key": self.key.public_hex,
+            "nonce": nonce,
             "room": self.describe(),
         }
 
@@ -380,7 +394,7 @@ class Room:
         """A new connection: its outbox, opened with a hello."""
         self.last_seen = time.time()
         outbox = Outbox(self.key, peer)
-        outbox.push(self.hello_body(), self._commit())
+        outbox.push(self.hello_body(outbox.nonce), self._commit())
         self.lobby.add(outbox)
         return outbox
 
@@ -411,26 +425,20 @@ class Room:
     def join(self, outbox: Outbox, peer: Peer, request: dict) -> Seat:
         """A join request on a connection whose outbox is ``outbox``.
 
-        Returns the seat, whose outbox the connection now feeds."""
+        Returns the seat, whose outbox the connection now feeds (its own
+        chain: everything this connection got so far is the seat's too)."""
         if request.get("protocol_version") != PROTOCOL_VERSION:
             raise RoomError(
                 "bad_join", f"this server speaks protocol {PROTOCOL_VERSION}"
             )
+        if self.status != "waiting":
+            raise RoomError("game_started", "the seats are taken; spectate instead")
         public_key = request.get("public_key")
         if not is_hex(public_key, 32):
             raise RoomError("bad_join", "public_key must be 32 bytes of hex (Ed25519)")
-        if request.get("seat_key") is not None:
-            return self._rejoin(outbox, peer, request)
-
-        if self.status != "waiting":
-            raise RoomError("game_started", "the seats are taken; spectate instead")
-        if (
-            public_key in self.banned_keys
-            or peer.address in self.banned_addresses
-            or (self.is_banned is not None and self.is_banned(peer.address))
-        ):
+        if self.is_banned is not None and self.is_banned(peer.address, public_key):
             raise RoomError(
-                "banned", "you withheld a seed here (or too often elsewhere)"
+                "banned", "a seat of yours withheld its seed; try again later"
             )
         commitment = request.get("client_commitment")
         if not is_hex(commitment, 32):
@@ -442,7 +450,9 @@ class Room:
         if not verify_signature(public_key, statement, request.get("pop")):
             raise RoomError("bad_join", "pop must sign the join statement with the key")
         if any(s.public_key == public_key for s in self.seats):
-            raise RoomError("duplicate_key", "that key already holds a seat here")
+            raise RoomError(
+                "duplicate_key", "that key already holds a seat here (rejoin instead)"
+            )
         seat = self._open_seat(wanted)
         seat.kind = "remote"
         seat.name = clean_name(request.get("name"), seat.color.value)
@@ -450,7 +460,6 @@ class Room:
         seat.requested_seat = wanted
         seat.client_commitment = commitment
         seat.pop = request["pop"]
-        seat.seat_key = random_hex(16)
         seat.address = peer.address
         seat.outbox = outbox
         self.lobby.discard(outbox)
@@ -464,24 +473,36 @@ class Room:
                 "color": seat.color.value,
                 "public_key": public_key,
                 "client_commitment": commitment,
-                "seat_key": seat.seat_key,
                 "room": self.describe(),
             }
         )
         self._seats_changed()
         return seat
 
-    def _rejoin(self, outbox: Outbox, peer: Peer, request: dict) -> Seat:
-        index = request.get("seat")
-        if type(index) is not int or not 0 <= index < len(self.seats):
-            raise RoomError("bad_join", "a rejoin names its seat")
-        seat = self.seats[index]
-        if (
-            seat.kind != "remote"
-            or not hmac.compare_digest(str(seat.seat_key), str(request.get("seat_key")))
-            or seat.public_key != request.get("public_key")
+    def rejoin(self, outbox: Outbox, peer: Peer, request: dict) -> Seat:
+        """Take a seat's chain back on a new connection: the seat's key signs
+        this connection's nonce. Its chain is resent after ``last_seq``."""
+        if request.get("protocol_version") != PROTOCOL_VERSION:
+            raise RoomError(
+                "bad_join", f"this server speaks protocol {PROTOCOL_VERSION}"
+            )
+        public_key = request.get("public_key")
+        seat = next(
+            (
+                s
+                for s in self.seats
+                if s.kind == "remote" and s.public_key == public_key
+            ),
+            None,
+        )
+        if seat is None or not is_hex(public_key, 32):
+            raise RoomError("not_seated", "no seat here is held by that key")
+        if not verify_signature(
+            public_key, rejoin_statement(self.id, outbox.nonce), request.get("sig")
         ):
-            raise RoomError("bad_join", "wrong seat key or public key for that seat")
+            raise RoomError(
+                "bad_join", "sig must sign this connection's nonce with the seat's key"
+            )
         last_seq = request.get("last_seq", -1)
         if type(last_seq) is not int:
             raise RoomError("bad_join", "last_seq must be an integer")
@@ -501,6 +522,11 @@ class Room:
         return seat
 
     def spectate(self, outbox: Outbox, request: dict) -> None:
+        """Watch: this connection's chain gets what every spectator gets
+        (nothing twice: a connection the lock already made a spectator just
+        carries on)."""
+        if outbox in self.spectators:
+            return
         if len(self.spectators) >= self.limits.max_spectators:
             raise RoomError("room_full", "too many spectators")
         self.lobby.discard(outbox)
@@ -508,7 +534,7 @@ class Room:
         if self.status == "waiting":
             outbox.push({"type": "room", "room": self.describe()})
         elif self.status == "revealing":
-            outbox.push(self.commitments)
+            self._push_commitments(outbox)
         elif self.game is not None and self.doc is not None:
             outbox.push(self._before(None), self._commit())
             if self.status == "finished":
@@ -527,8 +553,14 @@ class Room:
         if index is not None and type(index) is not int:
             raise RoomError("bad_bot", "seat must be an integer")
         seat = self._open_seat(index)
+        limits = {
+            **SERVER_PARAM_LIMITS,
+            # An exec bot may not wait on its program longer than the room
+            # waits on it (its worker would be killed first, every time).
+            "timeout_ms": self.config.decision_timeout_ms,
+        }
         try:
-            check_spec(spec, SERVER_PARAM_LIMITS)
+            check_spec(spec, limits)
             key = parse_spec(spec)[0]
             recipe = recipe_for(key, REGISTRY.lookup(key))
         except Exception as error:  # SpecError, or a bot that fails to build
@@ -545,7 +577,7 @@ class Room:
                     return seat
             raise RoomError("room_full", "no open seat")
         if not 0 <= index < len(self.seats):
-            raise RoomError("bad_join", f"no seat {index!r}")
+            raise RoomError("bad_join", "no such seat")
         if self.seats[index].kind != "open":
             raise RoomError("seat_taken", f"seat {index} is taken")
         return self.seats[index]
@@ -555,152 +587,95 @@ class Room:
         self._broadcast_room()
         self._maybe_lock()
 
-    # ===== seeds: commit, then reveal =====
-    def _uncommitted(self) -> list:
-        return [
-            s for s in self.seats if s.kind == "remote" and s.client_commitment is None
-        ]
-
+    # ===== seeds: commit, then reveal, once =====
     def _maybe_lock(self) -> None:
         if self.status != "waiting" or any(s.kind == "open" for s in self.seats):
             return
-        if self._uncommitted():
-            # A restart left seats to commit afresh: they get the usual time.
-            if self.timer is None:
-                loop = asyncio.get_running_loop()
-                self.timer = loop.call_later(
-                    self.limits.reveal_timeout_ms / 1000, self._withheld, "commit"
-                )
-            return
-        self._cancel_timer()
         self.status = "revealing"
-        self.locked = [seat.public() for seat in self.seats]
         self.commitments = commitments_body(
             self.id,
-            round=self.round,
             config=self.config.to_json(),
-            seats=self.locked,
+            seats=[seat.public() for seat in self.seats],
             seed_commitment=self.seed_commitment,
             reveal_timeout_ms=self.limits.reveal_timeout_ms,
         )
         self.commitments_digest = digest(self.commitments)
+        # Connections still looking at the room watch it from here on: the
+        # game is all there is left to see.
+        for outbox in list(self.lobby):
+            if outbox.peer is not None:
+                if len(self.spectators) >= self.limits.max_spectators:
+                    break
+                self.lobby.discard(outbox)
+                self.spectators.append(outbox)
         for outbox in self._outboxes(lobby=True):
-            outbox.push(self.commitments)
+            self._push_commitments(outbox)
         if all(s.kind != "remote" for s in self.seats):
             self._start()
         else:
             loop = asyncio.get_running_loop()
             self.timer = loop.call_later(
-                self.limits.reveal_timeout_ms / 1000, self._withheld, "reveal"
+                self.limits.reveal_timeout_ms / 1000, self._reveal_timeout
             )
+
+    def _push_commitments(self, outbox: Outbox) -> None:
+        if not outbox.has_commitments and self.commitments is not None:
+            outbox.has_commitments = True
+            outbox.push(self.commitments)
 
     def _cancel_timer(self) -> None:
         if self.timer is not None:
             self.timer.cancel()
             self.timer = None
 
-    def on_commit(self, seat: Seat, peer: Peer, request: dict) -> None:
-        """A seated client's fresh commitment after a restart."""
-        if self.status != "waiting" or seat.client_commitment is not None:
-            raise RoomError("not_committing", "no fresh commitment is due now")
-        if seat.outbox is None or seat.outbox.peer is not peer:
-            raise RoomError(
-                "stale_connection", "this connection no longer holds the seat"
-            )
-        commitment = request.get("client_commitment")
-        if not is_hex(commitment, 32):
-            raise RoomError("bad_commit", "client_commitment must be 32 bytes of hex")
-        statement = join_statement(
-            self.id, self.seed_commitment, seat.index, commitment
-        )
-        if not verify_signature(seat.public_key, statement, request.get("pop")):
-            raise RoomError(
-                "bad_commit", "pop must sign the join statement for this seat"
-            )
-        seat.client_commitment, seat.pop = commitment, request["pop"]
-        seat.requested_seat = seat.index
-        self._seats_changed()
-
     def on_reveal(self, seat: Seat, peer: Peer, request: dict) -> None:
+        """A seat's reveal. Answered by a receipt either way, so that a seat
+        blamed for withholding after the server acknowledged its reveal can
+        show it."""
         if self.status != "revealing":
             raise RoomError("not_revealing", "seeds are not being revealed now")
-        if seat.outbox is None or seat.outbox.peer is not peer:
-            raise RoomError(
-                "stale_connection", "this connection no longer holds the seat"
-            )
-        if seat.client_seed is not None:
-            return  # a resend after a reconnect
+        self._check_connection(seat, peer)
+        if not self._allow_receipt(seat, peer):
+            return
+        signature = request.get("sig")
+        statement = reveal_statement(self.commitments_digest)
+        submission = submission_digest(statement, signature)
         client_seed = request.get("client_seed")
-        if (
+        if seat.client_seed is not None:
+            accepted = seat.reveal_sig == signature and seat.client_seed == client_seed
+            reason = "accepted" if accepted else "refused: this seat has revealed"
+        elif (
             not is_hex(client_seed, 32)
             or client_seed_commitment(self.id, str(seat.public_key), client_seed)
             != seat.client_commitment
         ):
-            raise RoomError("bad_reveal", "that seed does not open your commitment")
-        signature = request.get("sig")
-        if not verify_signature(
-            seat.public_key, reveal_statement(self.commitments_digest), signature
-        ):
-            raise RoomError("bad_reveal", "sig must sign the commitments you were sent")
-        seat.client_seed, seat.reveal_sig = client_seed, signature
+            accepted, reason = False, "refused: that seed does not open your commitment"
+        elif not verify_signature(seat.public_key, statement, signature):
+            accepted, reason = False, "refused: sig must sign these commitments"
+        else:
+            accepted, reason = True, "accepted"
+            seat.client_seed, seat.reveal_sig = client_seed, signature
+        assert seat.outbox is not None
+        seat.outbox.push(receipt_body(submission, None, accepted, reason))
         if all(s.client_seed is not None for s in self.seats if s.kind == "remote"):
             self._cancel_timer()
             self._start()
 
-    def _withheld(self, what: str) -> None:
-        """Seats did not reveal (or commit) in time: they are out, and the
-        others start a fresh round, so withholding delays a game but cannot
-        bias it (every revealed seed is discarded, the server's included)."""
+    def _reveal_timeout(self) -> None:
+        """Seats did not reveal in time: the game is void, and they are
+        blamed. There is no second round: a new game needs a new room, with
+        new commitments and new seeds from everyone."""
         self.timer = None
-        if what == "reveal" and self.status != "revealing":
+        if self.status != "revealing":
             return
-        if what == "commit" and self.status != "waiting":
-            return
-        blamed = [
-            s
-            for s in self.seats
-            if s.kind == "remote"
-            and (
-                s.client_seed is None
-                if what == "reveal"
-                else s.client_commitment is None
-            )
-        ]
-        blame = [s.index for s in blamed]
+        blamed = [s for s in self.seats if s.kind == "remote" and s.client_seed is None]
         for seat in blamed:
-            self.banned_keys.add(seat.public_key)
-            if seat.address:
-                self.banned_addresses.add(seat.address)
             if self.on_blame is not None:
-                self.on_blame(seat.address)
-        if self.round + 1 >= self.limits.max_rounds:
-            self.abort(f"seats did not {what} their seeds, round after round", blame)
-            return
-        old_seed = self.server_seed
-        self.round += 1
-        self.server_seed = random_hex()
-        self.seed_commitment = seed_commitment(self.server_seed)
-        for seat in blamed:
-            if seat.outbox is not None and seat.outbox.peer is not None:
-                seat.outbox.peer.kick(4003, "you did not reveal your seed in time")
-            seat.free()
-        for seat in self.seats:
-            if seat.kind == "remote":
-                seat.forget_seed()
-        self.status = "waiting"
-        self.locked = self.commitments = self.commitments_digest = None
-        body = restart_body(
-            self.id,
-            round=self.round,
-            reason=f"a seat did not {what} its seed in time",
-            blame=blame,
-            server_seed=old_seed,
-            seed_commitment=self.seed_commitment,
-            room=self.describe(),
+                self.on_blame(seat.address, seat.public_key)
+        self.abort(
+            "a seat did not reveal its seed in time: the game is void",
+            [s.index for s in blamed],
         )
-        for outbox in self._outboxes(lobby=True):
-            outbox.push(body)
-        self._maybe_lock()
 
     def _start(self) -> None:
         self.status = "playing"
@@ -733,6 +708,7 @@ class Room:
         for seat in self.seats:
             if seat.pending is not None and not seat.pending.future.done():
                 seat.pending.future.cancel()
+            self._flush_held(seat)
         self._aborted_body = aborted_body(
             self.id,
             reason=reason,
@@ -746,9 +722,28 @@ class Room:
         if self.on_finish is not None:
             self.on_finish(self)
 
-    # ===== actions from clients =====
+    # ===== requests from clients =====
+    def _check_connection(self, seat: Seat, peer: Peer) -> None:
+        if seat.outbox is None or seat.outbox.peer is not peer:
+            raise RoomError(
+                "stale_connection", "this connection no longer holds the seat"
+            )
+
+    def _allow_receipt(self, seat: Seat, peer: Peer) -> bool:
+        """Whether a submission gets its receipt; if not, the connection is
+        closed (so the client knows it was not answered)."""
+        allowance = (
+            self.limits.receipt_margin
+            + self.limits.receipts_per_decision * seat.decisions
+        )
+        if seat.receipts >= allowance:
+            peer.kick(4009, "too many submissions")
+            return False
+        seat.receipts += 1
+        return True
+
     def answer(self, outbox: Outbox, body: dict, commit: Optional[dict] = None) -> bool:
-        """Push an error or receipt, within the recipient's allowance."""
+        """Push an error, within the recipient's allowance."""
         if outbox.answers >= self.limits.max_answers:
             if outbox.peer is not None:
                 outbox.peer.kick(4009, "too many bad requests")
@@ -760,32 +755,42 @@ class Room:
     def on_action(self, seat: Seat, peer: Peer, request: dict) -> None:
         """A submitted action. Every submission gets a signed receipt naming
         it (statement and signature together), so a client can prove that the
-        server had its answer before the move was played."""
-        if seat.outbox is None or seat.outbox.peer is not peer:
-            raise RoomError(
-                "stale_connection", "this connection no longer holds the seat"
-            )
+        server had its answer before the move was played. A receipt for a
+        decision that has closed (its deadline passed, or it was answered)
+        is held until the step that closes it is out: a receipt that comes
+        before step ``k`` always means the server had the answer in time."""
+        self._check_connection(seat, peer)
+        if self.game is None:
+            raise RoomError("no_game", "there is no move to make before the game")
+        if not self._allow_receipt(seat, peer):
+            return
         statement, signature = request.get("statement"), request.get("sig")
         submission = submission_digest(statement, signature)
+        index = statement.get("index") if isinstance(statement, dict) else None
+        index = index if type(index) is int else None
         pending = seat.pending
-        accepted, reason = False, "accepted"
-        if pending is None or pending.future.done():
-            reason = "stale: no decision is pending for this seat"
-        elif not isinstance(statement, dict) or statement.get("index") != pending.index:
-            reason = "stale: not the pending decision"
-        else:
-            pending.receipts += 1
-            if pending.receipts > 8:
-                return  # the decision has had its answers' worth of receipts
+        if pending is not None and index == pending.index:
+            if pending.future.done():
+                seat.held.append(
+                    receipt_body(
+                        submission, index, False, "stale: the decision has closed"
+                    )
+                )
+                return
             reason = self._accept(seat, pending, statement, signature)
-            accepted = reason == "accepted"
-        self.answer(
-            seat.outbox,
-            receipt_body(
-                submission, pending.index if pending else None, accepted, reason
-            ),
-            self._commit(),
-        )
+            body = receipt_body(submission, index, reason == "accepted", reason)
+        else:
+            body = receipt_body(
+                submission, index, False, "stale: not the pending decision"
+            )
+        assert seat.outbox is not None
+        seat.outbox.push(body, self._commit())
+
+    def _flush_held(self, seat: Seat) -> None:
+        held, seat.held = seat.held, []
+        if seat.outbox is not None:
+            for body in held:
+                seat.outbox.push(body, self._commit())
 
     def _accept(
         self, seat: Seat, pending: Pending, statement: dict, signature: Any
@@ -945,6 +950,7 @@ class Room:
         self.actions.append(entry)
         self._record_state()
         self._send_all(lambda c: step_body(game, self.doc, c, forced=forced))
+        self._flush_held(seat)
 
     def _autoplay(self, game: Game) -> bool:
         """Whether to play the move without asking (when everyone can see
@@ -971,6 +977,14 @@ class Room:
             timeout_ms=self.config.decision_timeout_ms,
         )
         seat.table.update(body)
+        if len(playable) == 1:
+            # One move, but nobody else can know it (it depends on the seat's
+            # hidden cards): answered as slowly as this bot's real decisions
+            # that end in this kind of move, from a book no worker restart
+            # empties.
+            kind = move_kind(body["playable_actions"][0])
+            await asyncio.sleep(min(PACE.draw(seat.spec, kind), self._timeout()))
+            return playable[0], None, None
         message = (
             "decide",
             seat.index,
@@ -997,10 +1011,14 @@ class Room:
         wanted = canonical(reply[1])
         for action, offered in zip(playable, body["playable_actions"]):
             if canonical(offered) == wanted:
+                PACE.record(seat.spec, move_kind(offered), self.worker.last_call_s)
                 return action, None, None
         return "bot_error"
 
     async def _remote_decision(self, seat: Seat, playable: list):
+        """Ask the seat and wait for its answer or the deadline. The
+        deadline closes the decision in one step (no receipt for this index
+        can slip in before the step: see :meth:`on_action`)."""
         assert seat.outbox is not None and self.doc is not None
         body = decide_body(
             self.game,
@@ -1009,7 +1027,9 @@ class Room:
             timeout_ms=self.config.decision_timeout_ms,
         )
         envelope = seat.outbox.push(body, self._commit())
-        future = asyncio.get_running_loop().create_future()
+        seat.decisions += 1
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
         seat.pending = Pending(
             index=len(self.actions),
             seq=envelope["seq"],
@@ -1018,11 +1038,18 @@ class Room:
             playable_json=body["playable_actions"],
             future=future,
         )
+
+        def deadline() -> None:
+            if not future.done():
+                future.set_result("timeout")
+
+        timer = loop.call_later(self._timeout(), deadline)
         try:
-            return await asyncio.wait_for(future, self._timeout())
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return await future
+        except asyncio.CancelledError:
             return "timeout"
         finally:
+            timer.cancel()
             seat.pending = None
 
     def _stop_bots(self) -> None:
@@ -1051,8 +1078,16 @@ class Room:
     def error(
         self, outbox: Outbox, code: str, message: str, request: Optional[dict] = None
     ) -> None:
+        """Refuse a request: which kind of request this answers (if it is
+        one this room knows), never what it said."""
+        kind = request.get("type") if isinstance(request, dict) else None
         self.answer(
             outbox,
-            {"type": "error", "code": code, "message": message[:200]},
+            {
+                "type": "error",
+                "code": code,
+                "message": message[:200],
+                "answers": kind if kind in REQUESTS else None,
+            },
             self._commit(),
         )

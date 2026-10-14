@@ -9,6 +9,7 @@ import asyncio
 import gzip
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -21,7 +22,7 @@ from catanatron.models.player import Color
 from catanatron.registry import REGISTRY
 from catanatron.serialization import action_to_json
 from catanatron.server.app import GameServer, ServerLimits, run_server
-from catanatron.server.bot import ViewBot
+from catanatron.server.bot import PaceBook, ViewBot
 from catanatron.server.client import GameClient, create_room
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import SigningKey, random_hex, seed_commitment
@@ -216,8 +217,7 @@ class ErrorInsteadRoom(Room):
     "room_class,message",
     [
         (RefusingRoom, "had this client's legal, signed move"),
-        (SilentRoom, "never acknowledged"),
-        (ErrorInsteadRoom, "never acknowledged"),
+        (ErrorInsteadRoom, "an action answered with an error"),
     ],
 )
 def test_a_legal_move_the_server_overrules_is_reported(room_class, message):
@@ -233,6 +233,25 @@ def test_a_legal_move_the_server_overrules_is_reported(room_class, message):
     client, room = run(scenario())
     assert room.coerced
     assert any_error(errors_of(client), message), errors_of(client)
+
+
+def test_an_unacknowledged_move_is_the_clients_word_only():
+    """A server that ignores an answer cannot be proven to have had it (the
+    client could list an answer it never sent): a warning, not an error."""
+    config = {**CONFIG, "decision_timeout_ms": 1500}
+
+    async def scenario():
+        async with serving(room_class=SilentRoom) as (server, base):
+            room = await create_room(base, config, [None, "F"])
+            client, decide = bot_client(f"{base}/room/{room['id']}", "F", verify=False)
+            await client.play(decide)
+            return client, server.rooms[room["id"]]
+
+    client, room = run(scenario())
+    assert room.coerced
+    report = report_of(client)
+    assert report.ok, report.errors
+    assert any("never acknowledged" in w for w in report.warnings), report.warnings
 
 
 class DroppingClient(GameClient):
@@ -339,7 +358,7 @@ def test_an_honest_server_is_not_accused(client_class, timeout, warned):
         assert any("late" in w for w in report.warnings), report.warnings
 
 
-# ===== 3. withheld reveals: see test_review.py (restart rounds, bans) =====
+# ===== 3. withheld reveals: see test_review.py and test_protocol4.py =====
 
 
 # ===== 4. forced moves =====
@@ -380,24 +399,63 @@ def test_forced_moves_follow_what_the_table_can_see(room_class, message):
     assert any_error(errors_of(client), message), errors_of(client)
 
 
-def test_a_bot_answers_a_forced_move_as_slowly_as_a_real_one():
+def test_a_bot_answers_a_forced_move_as_slowly_as_real_ones_of_its_kind():
     from catanatron.game import Game
     from catanatron.models.decks import BASE_SUPPLY
     from catanatron.models.player import RandomPlayer
     from catanatron.serialization import client_view, state_to_json
+
+    book = PaceBook(random.Random(0))
+    book.record("AB", "END_TURN", 0.02)
+    book.record("AB", "MOVE_ROBBER", 0.5)
+    # Paced from decisions that ended in the same kind of move, not from
+    # the bot's decisions of every kind (which a table could tell apart).
+    assert {book.draw("AB", "END_TURN") for _ in range(20)} == {0.02}
+    assert book.draw("AB", "ROLL") in (0.02, 0.5)  # no ROLL yet: any kind
+    low, high = PaceBook.DEFAULT_S
+    assert low <= book.draw("F", "ROLL") <= high  # nothing yet: still paced
 
     game = Game([RandomPlayer(Color.RED), RandomPlayer(Color.BLUE)], seed=1)
     color = game.state.current_color()
     view = client_view(state_to_json(game), color)
     bot = ViewBot("R", color)
     only = [action_to_json(game.playable_actions[0])]
-    began = time.monotonic()
-    bot.decide(view, only, BASE_SUPPLY)
-    assert time.monotonic() - began < 0.05, "no history yet: no pace to keep"
-    bot.timings.extend([0.25] * 5)
+    bot.pace.record(None, only[0][1], 0.25)
     began = time.monotonic()
     bot.decide(view, only, BASE_SUPPLY)
     assert time.monotonic() - began >= 0.25
+
+
+def test_server_bots_hidden_single_moves_are_paced_by_the_room(monkeypatch):
+    """The room answers a server bot's one-move decisions itself, from a
+    pace book in the server process: a worker restart cannot empty it."""
+    from catanatron.server import room as room_module
+    from catanatron.server.botproc import BotWorker
+
+    book = PaceBook()
+    monkeypatch.setattr(room_module, "PACE", book)
+    asked = []
+    real_call = BotWorker.call
+
+    async def call(self, message, timeout):
+        if message[0] == "decide":
+            asked.append(len(message[3]))
+            if len(asked) == 5:
+                self.kill()  # a restart midway changes nothing
+        return await real_call(self, message, timeout)
+
+    monkeypatch.setattr(BotWorker, "call", call)
+
+    async def scenario():
+        async with serving() as (server, base):
+            room = await create_room(
+                base, {"num_players": 2, "vps_to_win": 4}, ["F", "F"]
+            )
+            await asyncio.wait_for(server.rooms[room["id"]].finished.wait(), 120)
+
+    run(scenario())
+    assert asked and min(asked) > 1, "the worker never gets a one-move decision"
+    assert book.durations.get(("F", None)), "real decisions fill the book"
 
 
 # ===== 5. bots =====
@@ -527,7 +585,8 @@ def test_a_room_whose_bot_worker_cannot_start_plays_on(monkeypatch):
             assert room_obj.status == "playing"
             assert len(room_obj.actions) >= 10
             forced = {entry["forced"] for entry in room_obj.actions}
-            assert forced <= {"bot_error", "only"} and "bot_error" in forced
+            # (one-move decisions the room answers itself, without the worker)
+            assert forced <= {"bot_error", "only", None} and "bot_error" in forced
 
     run(scenario())
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -78,7 +79,8 @@ class ServerLimits:
     max_bot_rooms: int = 32
     bot_seats_per_ip: int = 12
     #: An address blamed this often within an hour (for withholding seeds)
-    #: may not take seats anywhere for that hour.
+    #: may not take seats anywhere for that hour; a blamed key may not take
+    #: a seat for that hour at all.
     blames_per_ip: int = 3
     #: Messages per second a connection may send (and its burst).
     messages_per_s: float = 30.0
@@ -119,6 +121,7 @@ class GameServer:
         archive_dir: Optional[str] = None,
         limits: ServerLimits = ServerLimits(),
         room_class: type = Room,
+        trusted_proxies: Sequence[str] = (),
     ):
         from catanatron.players import register_builtins
 
@@ -127,8 +130,15 @@ class GameServer:
         self.archive_dir = archive_dir
         self.limits = limits
         self.room_class = room_class
+        #: Peers (a reverse proxy) whose X-Forwarded-For is believed: behind
+        #: one, every per-address limit and ban would otherwise apply to the
+        #: proxy, so to everyone at once.
+        self.trusted_proxies = frozenset(
+            _normalize(address) for address in trusted_proxies
+        )
         self.rooms: dict = {}
         self.blames: dict = defaultdict(deque)
+        self.banned_keys: dict = {}
         self.connections = 0
         self.by_ip: dict = defaultdict(int)
         self.by_room: dict = defaultdict(int)
@@ -215,15 +225,21 @@ class GameServer:
             if mine + count > self.limits.bot_seats_per_ip:
                 raise TooMuch("you have too many server bots seated")
 
-    def _blame(self, address: Optional[str]) -> None:
+    def _blame(self, address: Optional[str], key: Optional[str] = None) -> None:
+        now = time.time()
         if address:
-            self.blames[address].append(time.time())
+            self.blames[address].append(now)
+        if key:
+            self.banned_keys[key] = now
 
-    def _banned(self, address: Optional[str]) -> bool:
+    def _banned(self, address: Optional[str], key: Optional[str] = None) -> bool:
+        now = time.time()
+        if key and now - self.banned_keys.get(key, -1e18) < 3600:
+            return True
         recent = self.blames.get(address) if address else None
         if not recent:
             return False
-        while recent and recent[0] < time.time() - 3600:
+        while recent and recent[0] < now - 3600:
             recent.popleft()
         return len(recent) >= self.limits.blames_per_ip
 
@@ -342,9 +358,23 @@ class GameServer:
         return _json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     # ===== WebSocket =====
+    def address_of(self, websocket: ServerConnection) -> str:
+        """Who is on the other end, for per-address limits and bans: the
+        peer, or (when the peer is a trusted proxy) the last address it says
+        it forwarded for. IPv6 addresses count by /64 (one host's share)."""
+        peer = _normalize(_address(websocket))
+        if peer in self.trusted_proxies and websocket.request is not None:
+            forwarded = websocket.request.headers.get_all("X-Forwarded-For")
+            hops = [h.strip() for value in forwarded for h in value.split(",")]
+            for hop in reversed(hops):
+                address = _normalize(hop)
+                if address not in self.trusted_proxies:
+                    return address
+        return peer
+
     async def handler(self, websocket: ServerConnection) -> None:
         path = websocket.request.path.split("?", 1)[0] if websocket.request else ""
-        address = _address(websocket)
+        address = self.address_of(websocket)
         room = None
         if path.startswith("/room/"):
             room = self.rooms.get(path[len("/room/") :].strip("/"))
@@ -373,7 +403,7 @@ class GameServer:
             if room is None:
                 await self._lobby(websocket, address)
             else:
-                await self._room(websocket, room)
+                await self._room(websocket, room, address)
         finally:
             self.connections -= 1
             self.by_ip[address] -= 1
@@ -405,13 +435,17 @@ class GameServer:
                 elif kind == "players":
                     reply = {"type": "players", "players": _players()}
                 else:
-                    reply = {"type": "error", "message": f"unknown request {kind!r}"}
+                    reply = {"type": "error", "message": "unknown request type"}
             except (ValueError, AttributeError, RoomError, TooMuch) as error:
-                reply = {"type": "error", "message": str(error)}
+                # Messages say what was wrong, not what was sent (and are
+                # short whatever they say).
+                reply = {"type": "error", "message": str(error)[:200]}
             await websocket.send(json.dumps(reply))
 
-    async def _room(self, websocket: ServerConnection, room: Room) -> None:
-        peer = Peer(websocket, room.limits.max_queue, _address(websocket))
+    async def _room(
+        self, websocket: ServerConnection, room: Room, address: str
+    ) -> None:
+        peer = Peer(websocket, room.limits.max_queue, address)
         outbox: Outbox = room.connect(peer)
         seat, watching = None, False
         tokens, last = float(self.limits.message_burst), time.monotonic()
@@ -434,8 +468,11 @@ class GameServer:
                 try:
                     request = parse_request(text)
                     kind = request.get("type")
-                    if kind == "join" and seat is None and not watching:
-                        seat = room.join(outbox, peer, request)
+                    if kind in ("join", "rejoin") and seat is None and not watching:
+                        if kind == "join":
+                            seat = room.join(outbox, peer, request)
+                        else:
+                            seat = room.rejoin(outbox, peer, request)
                         assert seat.outbox is not None
                         outbox = seat.outbox
                     elif kind == "spectate" and seat is None and not watching:
@@ -443,8 +480,6 @@ class GameServer:
                         watching = True
                     elif kind == "reveal" and seat is not None:
                         room.on_reveal(seat, peer, request)
-                    elif kind == "commit" and seat is not None:
-                        room.on_commit(seat, peer, request)
                     elif kind == "action" and seat is not None:
                         room.on_action(seat, peer, request)
                     elif kind == "seat_bot":
@@ -480,6 +515,19 @@ def _address(websocket: ServerConnection) -> str:
     if isinstance(remote, (tuple, list)) and remote:
         return str(remote[0])
     return str(remote)
+
+
+def _normalize(address: str) -> str:
+    """An address as limits count it: IPv4 as is, IPv6 by its /64."""
+    try:
+        ip = ipaddress.ip_address(address.strip().strip("[]"))
+    except ValueError:
+        return address.strip()[:64]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((ip, 64), strict=False))
+    return str(ip)
 
 
 def _players() -> list:
@@ -562,6 +610,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         metavar="[NAME=]SOURCE",
         help="register a bot class for seats, as in catanatron-play",
     )
+    parser.add_argument(
+        "--trusted-proxy",
+        action="append",
+        default=[],
+        metavar="ADDRESS",
+        help="a reverse proxy in front of the server: take client addresses "
+        "from its X-Forwarded-For (otherwise every per-address limit and ban "
+        "applies to the proxy, so to everyone behind it)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -569,7 +626,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    server = GameServer(SigningKey.load_or_create(args.key), archive_dir=args.archive)
+    server = GameServer(
+        SigningKey.load_or_create(args.key),
+        archive_dir=args.archive,
+        trusted_proxies=args.trusted_proxy,
+    )
     for declaration in args.bot:
         name, _, source = declaration.rpartition("=")
         REGISTRY.register_source(source, name or None)

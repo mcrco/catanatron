@@ -2,18 +2,19 @@
 
 A transcript is what one client received (every signed message, in order)
 plus what it knows of itself (its public key, its seed, what it signed).
-:func:`verify_transcript` checks, for that client:
+:func:`verify_transcript` checks the invariants of PROTOCOL.md (next to this
+module) that one recipient's transcript can show:
 
 1. every message is signed by the server's key, numbered in order, chained
    to the previous one by hash, and (once seated) addressed to this client;
 2. the seeds: the server committed to its seed in the ``hello``; this client
-   joined with a commitment to its own seed; the ``commitments`` message
-   fixed every seat, key and seed commitment and the config (the ones the
-   ``hello`` advertised) before any seed was revealed; every revealed seed
-   opens its commitment, this client's included; the revealed server seed
-   opens the server's;
-3. the game is the committed one: ``before`` has exactly the committed
-   config and seats, and the master seed is derived from all of it;
+   joined with a commitment to its own seed; one ``commitments`` message (and
+   only one) fixed every seat, key and seed commitment and the config (the
+   ones the ``hello`` advertised) before any seed was revealed; every
+   revealed seed opens its commitment, this client's included; the revealed
+   server seed opens the server's;
+3. the game is the committed one: ``before`` carries exactly the commitments
+   this client received, and the master seed is derived from all of it;
 4. replaying the revealed actions from that seed in stock Catanatron, every
    action is one the game offered, every state commitment opens to the
    replayed state with its revealed salt, and every message body is
@@ -22,18 +23,26 @@ plus what it knows of itself (its public key, its seed, what it signed).
 5. the schedule: one ``before``, then one ``step`` per action in order, a
    ``decide`` exactly when this seat had a move that was not publicly
    forced (and at most one per move), one ``after`` last;
-6. every move by a remote seat is signed by that seat's key over the room,
-   the game and the action's index (so a signature cannot be replayed for
+6. every move by a remote seat is signed by that seat's key over the
+   commitments and the action's index (so a signature cannot be replayed for
    another move); every move of this client answers the ``decide`` it got
    at that point; every move the server made for a seat is one it may make
    (the only legal one, when everyone could see it was; or the default
-   after a timeout); and no move of this client was refused although it
-   was legal.
+   after a timeout); and no legal move of this client that the server had
+   acknowledged in time (or at all, as accepted) was replaced.
+
+A void room (``aborted``) is not a game: the report says so (``void``) and
+checks only what the void itself claims (the revealed seed opens the
+commitment; a seat whose reveal the server acknowledged is not blamed).
+
+Errors are what the server's own signatures prove against it, to anyone;
+warnings are what only this client knows (that it sent an answer the server
+never acknowledged, or acknowledged late).
 
 ``catanatron-verify T1.json [T2.json ...]`` runs it from the shell; given
-several transcripts of one game it also checks that every recipient got the
-same game: the same ``before`` seats, config and seeds, the same reveal, and
-the same state commitment at each point (no equivocation).
+several transcripts of one room (under one server key) it also checks every
+pair of them against each other: the same commitments, game, seeds, reveal
+or void, and the same state commitment at each point (no equivocation).
 """
 
 from __future__ import annotations
@@ -72,6 +81,7 @@ from catanatron.server.crypto import (
     verify_signature,
 )
 from catanatron.server.messages import (
+    COMMITMENTS_FIELDS,
     PROTOCOL_VERSION,
     after_body,
     before_body,
@@ -91,12 +101,15 @@ class Report:
     game_id: Optional[str] = None
     color: Optional[str] = None
     commitments: dict = field(default_factory=dict)
-    #: What every recipient of this game must have been told alike.
+    #: What every recipient of this room must have been told alike, by name.
     shared: Optional[dict] = None
+    #: The ``aborted`` body if the room is void (no game to verify).
+    void: Optional[dict] = None
 
     @property
     def ok(self) -> bool:
-        return not self.errors
+        """A finished game, every check passed."""
+        return not self.errors and self.void is None
 
     def fail(self, message: str) -> None:
         if len(self.errors) < MAX_ERRORS:
@@ -108,6 +121,7 @@ class Report:
     def summary(self) -> dict:
         return {
             "ok": self.ok,
+            "void": self.void,
             "game_id": self.game_id,
             "color": self.color,
             "errors": self.errors,
@@ -221,11 +235,15 @@ class _Verifier:
         self.room_id = room.get("id")
         self.config_json = room.get("config")
         self.require(isinstance(self.room_id, str), "the room has no id")
-        self.require(
-            is_hex(room.get("seed_commitment"), 32), "the room has no seed commitment"
-        )
+        commitment = room.get("seed_commitment")
+        self.require(is_hex(commitment, 32), "the room has no seed commitment")
+        self.server_commitment = commitment
         if self.transcript.get("room_id") not in (None, self.room_id):
             self.fail("the transcript is for another room than its messages")
+        self.report.shared = {
+            "group": [self.server_key, self.room_id],
+            "seed_commitment": commitment,
+        }
         try:
             self.config = GameConfig.from_json(self.config_json)
         except ConfigError as error:
@@ -244,14 +262,17 @@ class _Verifier:
             len(befores) <= 1, f"{len(befores)} before messages (one is honest)"
         )
         self.before_at = befores[0] if befores else len(self.bodies)
+        aborted_at = positions.get("aborted", [len(self.bodies)])[0]
+        if len(positions.get("aborted", [])) > 1:
+            self.fail("the room was called off twice")
 
-        # Before the game, the server's commitment moves on only through
-        # restarts, each of which opens the commitment it replaces.
-        commitment = room["seed_commitment"]
-        self.committed = None  # (position, body) of this round's commitments
+        # Before the game: the room as it fills, this client's seat, and the
+        # one commitments message (every seat, fixed before any reveal).
+        self.committed = None  # (position, body)
         self.joined: dict = {}
         joined_at = None
-        for position in range(1, self.before_at):
+        self.reveal_receipts: list = []  # (position, body) before the game
+        for position in range(1, min(self.before_at, aborted_at)):
             body = self.bodies[position]
             kind = body.get("type")
             if kind == "room":
@@ -268,52 +289,66 @@ class _Verifier:
                 if joined_at is not None:
                     self.fail("this client was seated twice")
                 joined_at, self.joined = position, body
-            elif kind == "restart":
-                old = body.get("server_seed")
-                if (
-                    body.get("room_id") != self.room_id
-                    or not is_hex(old, 32)
-                    or seed_commitment(old) != commitment
-                    or not is_hex(body.get("seed_commitment"), 32)
-                ):
-                    self.fail(
-                        f"message {position}: a restart that does not open the server's commitment"
-                    )
-                    raise _Abort()
-                commitment = body["seed_commitment"]
-                self.committed = None  # that round's commitments are void
-                if self.seated and self.joined.get("seat") in (body.get("blame") or []):
-                    self.fail(
-                        f"message {position}: this client was blamed for withholding its seed"
-                    )
             elif kind == "commitments":
+                if self.committed is not None:
+                    self.fail(
+                        f"message {position}: a second commitments message (a room "
+                        "has one: there is no second round)"
+                    )
+                    continue
                 if (
-                    body.get("room_id") != self.room_id
+                    sorted(body) != sorted(COMMITMENTS_FIELDS)
+                    or body.get("room_id") != self.room_id
                     or body.get("seed_commitment") != commitment
                     or not _same(body.get("config"), self.config_json)
+                    or type(body.get("reveal_timeout_ms")) is not int
                 ):
                     self.fail(
                         f"message {position}: the commitments change the room, its rules or its seed commitment"
                     )
                 self.committed = (position, body)
-            elif kind in ("decide", "step", "after", "received"):
+            elif kind == "received":
+                self.reveal_receipts.append((position, body))
+            elif kind == "error":
+                pass
+            elif kind in ("decide", "step", "after"):
                 self.fail(f"message {position}: a {kind} message before the game")
-        self.server_commitment = commitment
-
-        aborted = [b for b in self.bodies if b.get("type") == "aborted"]
-        if aborted:
-            body = aborted[0]
-            revealed = body.get("server_seed")
-            if revealed is not None and (
-                not is_hex(revealed, 32) or seed_commitment(revealed) != commitment
+            else:
+                self.fail(f"message {position}: unexpected {kind!r} before the game")
+        if self.committed is not None:
+            self.report.shared["commitments"] = self.committed[1]
+            #: What every statement and reveal of this game signs.
+            self.C = digest(self.committed[1])
+        if self.seated:
+            self.require(joined_at is not None, "this client was not seated")
+            if (
+                self.joined.get("room_id") != self.room_id
+                or self.joined.get("public_key") != self.me
+                or self.joined.get("client_commitment")
+                != client_seed_commitment(self.room_id, self.me, self.my_seed)
             ):
                 self.fail(
-                    "the aborted message reveals a seed that does not open the commitment"
+                    "the server acknowledged another key or seed than this client's"
                 )
-            self.fail(
-                f"the game was aborted: {body.get('reason')!r}"
-                + (f" (blamed seats: {body.get('blame')})" if body.get("blame") else "")
-            )
+            if self.committed is not None and self.committed[0] < joined_at:
+                self.fail("the commitments came before this client was seated")
+            self.my_seat = self.joined.get("seat")
+
+        if befores:
+            started = self.bodies[self.before_at]
+            self.report.shared["game_id"] = started.get("game_id")
+            self.report.shared["before"] = {
+                k: started.get(k)
+                for k in (
+                    "room_id",
+                    "game_id",
+                    "commitments",
+                    "client_seeds",
+                    "reveals",
+                )
+            }
+        if aborted_at < len(self.bodies):
+            self.check_void(aborted_at)
             raise _Abort()
 
         afters = positions.get("after", [])
@@ -329,23 +364,17 @@ class _Verifier:
             isinstance(commitments, dict), "the before message carries no commitments"
         )
         if self.seated:
-            self.require(joined_at is not None, "this client was not seated")
-            if (
-                self.joined.get("room_id") != self.room_id
-                or self.joined.get("public_key") != self.me
-            ):
-                self.fail("the server acknowledged another key than this client's")
             self.require(
-                self.committed is not None and joined_at < self.committed[0],
+                self.committed is not None,
                 "the seats' seed commitments were not published between joining and the game",
             )
-            self.my_seat = self.joined.get("seat")
         if self.committed is not None and not _same(self.committed[1], commitments):
             self.fail(
                 "the game's commitments are not the ones published before the seeds were revealed"
             )
         if (
-            commitments.get("type") != "commitments"
+            sorted(commitments) != sorted(COMMITMENTS_FIELDS)
+            or commitments.get("type") != "commitments"
             or commitments.get("room_id") != self.room_id
             or commitments.get("seed_commitment") != commitment
             or not _same(commitments.get("config"), self.config_json)
@@ -353,6 +382,7 @@ class _Verifier:
             self.fail(
                 "the game's commitments change the room, its rules or its seed commitment"
             )
+        self.report.shared.setdefault("commitments", commitments)
         #: What every statement and reveal of this game signs: fresh for this
         #: game, because it names every seat's fresh seed commitment.
         self.C = digest(commitments)
@@ -440,21 +470,51 @@ class _Verifier:
             and all(is_hex(salt, 16) for salt in self.salts),
             f"{len(self.salts)} salts revealed for {len(self.actions)} actions",
         )
-        self.report.shared = {
-            "group": [self.server_key, self.room_id, commitment],
-            "game_id": before["game_id"],
-            "before": {
-                k: before.get(k)
-                for k in (
-                    "room_id",
-                    "game_id",
-                    "commitments",
-                    "client_seeds",
-                    "reveals",
-                )
-            },
-            "reveal": reveal,
-        }
+        self.report.shared["reveal"] = reveal
+
+    def check_void(self, position: int) -> None:
+        """The room was called off: what the void itself claims must hold."""
+        body = self.bodies[position]
+        self.report.void = body
+        self.report.shared["aborted"] = body
+        if self.before_at < position:
+            self.report.game_id = self.bodies[self.before_at].get("game_id")
+        revealed = body.get("server_seed")
+        if (
+            not is_hex(revealed, 32)
+            or seed_commitment(revealed) != self.server_commitment
+        ):
+            self.fail("the void does not reveal the seed the server committed to")
+        if not isinstance(body.get("blame"), list):
+            self.fail("the void names no list of seats to blame")
+            return
+        if not self.seated or self.my_seat not in body["blame"]:
+            return
+        signature = self.transcript.get("reveal_sig")
+        if self.committed is None or not verify_signature(
+            self.me, reveal_statement(self.C), signature
+        ):
+            self.report.warnings.append(
+                "the server blamed this seat for withholding its seed (this "
+                "transcript holds no reveal of it to show otherwise)"
+            )
+            return
+        mine = submission_digest(reveal_statement(self.C), signature)
+        acknowledged = [
+            p
+            for p, receipt in self.reveal_receipts
+            if receipt.get("submission") == mine and receipt.get("accepted") is True
+        ]
+        if acknowledged:
+            self.fail(
+                f"the server blamed this seat for withholding its seed after "
+                f"acknowledging its reveal (receipt in message {acknowledged[0]})"
+            )
+        else:
+            self.report.warnings.append(
+                "the server blamed this seat for withholding its seed; this client "
+                "says it revealed, which the server never acknowledged (not provable)"
+            )
 
     def check_seats(self, seats: Any, where: str) -> None:
         colors = [c.value for c in self.config.colors]
@@ -516,7 +576,7 @@ class _Verifier:
             envelope, body = self.messages[position], self.bodies[position]
             kind, commit = body.get("type"), envelope.get("commit")
             if (
-                kind in ("hello", "joined", "room", "commitments", "restart", "before")
+                kind in ("hello", "joined", "room", "commitments", "before")
                 and position != self.before_at
             ):
                 self.fail(f"message {position}: a {kind} message during the game")
@@ -593,6 +653,13 @@ class _Verifier:
                 self.receipts.append((position, body))
                 continue
             elif kind == "error":
+                if body.get("answers") == "action" and position < self.after_at:
+                    # During the game every action gets a receipt (one that
+                    # names it), never an error that names nothing.
+                    self.fail(
+                        f"message {position}: an action answered with an error, "
+                        "not a receipt"
+                    )
                 continue
             else:
                 self.fail(f"message {position}: unexpected {kind!r} during the game")
@@ -713,16 +780,18 @@ class _Verifier:
         """This client's moves against what it signed and what the server
         acknowledged.
 
-        Provable: the server signs a receipt for every submission it gets,
-        and its messages to a recipient are in order. A receipt for a legal,
-        correctly signed answer to decide k that comes before the step for
-        move k proves the server had that answer before it played the move;
-        playing anything else then is the server's doing. Not provable: when
-        an answer was sent relative to the server's deadline. An honest
-        client resends unacknowledged answers after a reconnect and an honest
-        server acknowledges every submission, so an answer that never got a
-        receipt counts against the server; one acknowledged only after the
-        move was played was late (a warning).
+        Provable to anyone: the server signs a receipt for every submission
+        it answers, and its messages to a recipient are in order. A receipt
+        for a legal, correctly signed answer to decide k that comes before
+        the step for move k proves the server had that answer before it
+        played the move (the server never signs one between the deadline and
+        that step); so does a receipt that says the answer was accepted,
+        wherever it is. Playing anything else then is the server's doing.
+
+        Not provable (warnings): that this client sent an answer the server
+        never acknowledged (``sent`` is only the client's word), and when an
+        answer arrived relative to the deadline (one acknowledged only after
+        the move was played was late, or so the server says).
         """
         if not self.seated:
             return
@@ -749,7 +818,7 @@ class _Verifier:
 
         receipts: dict = {}
         for position, body in self.receipts:
-            receipts.setdefault(body.get("submission"), []).append(position)
+            receipts.setdefault(body.get("submission"), []).append((position, body))
 
         for index, entry in enumerate(self.actions):
             if entry.get("color") != self.color:
@@ -773,16 +842,21 @@ class _Verifier:
             ):
                 continue
             step_at = self.steps_at.get(index, len(self.messages))
-            seen = sorted(p for key in legal for p in receipts.get(key, []))
-            if any(p < step_at for p in seen):
+            seen = sorted(
+                (p, body) for key in legal for p, body in receipts.get(key, [])
+            )
+            in_time = [p for p, body in seen if p < step_at]
+            accepted = [p for p, body in seen if body.get("accepted") is True]
+            if in_time or accepted:
                 self.fail(
                     f"action {index}: the server had this client's legal, signed move "
-                    f"(receipt in message {seen[0]}) and played another"
+                    f"(receipt in message {(in_time or accepted)[0]}) and played another"
                 )
             elif not seen:
-                self.fail(
-                    f"action {index}: the server never acknowledged this client's "
-                    "legal, signed move, and played another"
+                self.report.warnings.append(
+                    f"action {index}: this client says it sent a legal, signed move "
+                    "the server never acknowledged, and the server played another "
+                    "(not provable: only this client's word)"
                 )
             else:
                 self.report.warnings.append(
@@ -830,39 +904,59 @@ def _short(value: Any) -> str:
 
 
 def verify_transcripts(transcripts: Sequence[Any]) -> list:
-    """Verify each transcript, then check that every recipient of one room
-    and seed commitment (under one server key) saw one game alike: the same
-    game id, commitments, seeds, reveal, and state commitment at each point.
-    Grouped by what the server committed to, not by the game id it names, so
-    that naming different games to different recipients is caught; every
-    transcript of a group that disagrees fails."""
+    """Verify each transcript, then check every pair of transcripts of one
+    room (under one server key) against each other: one room has one seed
+    commitment, one commitments message, one game (its id, seeds, reveals
+    and reveal) or one void, and one state commitment at each point. Every
+    transcript of a pair that disagrees fails, whatever the order given."""
     reports = [verify_transcript(t) for t in transcripts]
     groups: dict = {}
     for report in reports:
         if report.shared is not None:
             groups.setdefault(canonical(report.shared["group"]), []).append(report)
     for members in groups.values():
-        first = members[0]
-        for report in members[1:]:
-            problems = []
-            if report.shared["game_id"] != first.shared["game_id"]:
-                problems.append("another game id")
-            if not _same(report.shared["before"], first.shared["before"]):
-                problems.append("other commitments, seeds or reveals")
-            if not _same(report.shared["reveal"], first.shared["reveal"]):
-                problems.append("another reveal")
-            for index, digest_ in report.commitments.items():
-                if first.commitments.get(index, digest_) != digest_:
-                    problems.append(f"another state {index}")
-                    break
-            if problems:
-                message = (
-                    "equivocation: recipients of one room and commitment got "
-                    + ", ".join(problems)
-                )
-                first.fail(message)
-                report.fail(message)
+        for i, a in enumerate(members):
+            for b in members[i + 1 :]:
+                problems = _disagreements(a, b)
+                if problems:
+                    message = "equivocation: recipients of one room got " + ", ".join(
+                        problems
+                    )
+                    for report in (a, b):
+                        if message not in report.errors:
+                            report.fail(message)
     return reports
+
+
+def _disagreements(a: Report, b: Report) -> list:
+    problems = []
+    x, y = a.shared, b.shared
+    if x["seed_commitment"] != y["seed_commitment"]:
+        problems.append("other seed commitments")
+    if "commitments" in x and "commitments" in y:
+        if not _same(x["commitments"], y["commitments"]):
+            problems.append("other commitments")
+    if "game_id" in x and "game_id" in y:
+        if x["game_id"] != y["game_id"]:
+            problems.append("another game id")
+        if not _same(x["before"], y["before"]):
+            problems.append("other seeds or reveals")
+    if "reveal" in x and "reveal" in y and not _same(x["reveal"], y["reveal"]):
+        problems.append("another reveal")
+    if "aborted" in x and "aborted" in y and not _same(x["aborted"], y["aborted"]):
+        problems.append("another void")
+    for one, other in ((x, y), (y, x)):
+        if "aborted" in one and "game_id" not in one and "game_id" in other:
+            problems.append("a void before the game and a game")
+            break
+        if "aborted" in one and "reveal" in other:
+            problems.append("a void and a finished game")
+            break
+    for index, digest_ in a.commitments.items():
+        if b.commitments.get(index, digest_) != digest_:
+            problems.append(f"another state {index}")
+            break
+    return problems
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -890,7 +984,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps([r.summary() for r in reports], indent=2))
     else:
         for path, report in zip(args.transcripts, reports):
-            verdict = "OK" if report.ok else "FAILED"
+            verdict = (
+                "OK"
+                if report.ok
+                else (
+                    "VOID"
+                    if report.void is not None and not report.errors
+                    else "FAILED"
+                )
+            )
             print(
                 f"{path}: {verdict} (game {report.game_id}, {report.color or 'spectator'})"
             )
@@ -898,6 +1000,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(
                     "  checked: "
                     + ", ".join(f"{v} {k}" for k, v in report.counts.items())
+                )
+            if report.void is not None:
+                print(
+                    f"  void: {report.void.get('reason')!r}"
+                    + (
+                        f" (blamed seats: {report.void.get('blame')})"
+                        if report.void.get("blame")
+                        else ""
+                    )
                 )
             for error in report.errors:
                 print(f"  error: {error}")

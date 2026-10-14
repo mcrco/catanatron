@@ -167,6 +167,10 @@ class RemoteSession(Session):
         self.report = await asyncio.to_thread(verify_transcript, transcript)
         if self.report.ok:
             self.note(f"transcript verified: {_counts(self.report)}")
+        elif self.report.void is not None and not self.report.errors:
+            void = self.report.void
+            blame = f" (blamed seats: {void.get('blame')})" if void.get("blame") else ""
+            self.note(f"the game is void: {void.get('reason')}{blame}", error=True)
         else:
             self.note(
                 "transcript verification FAILED: " + "; ".join(self.report.errors[:3]),

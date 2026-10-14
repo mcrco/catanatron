@@ -27,6 +27,7 @@ import importlib
 import logging
 import multiprocessing
 import os
+import signal
 import sys
 from multiprocessing import forkserver, resource_tracker
 import threading
@@ -153,6 +154,12 @@ def worker_main(conn) -> None:
     from catanatron.server.config import SUPPLIES
 
     playouts.USE_MULTIPROCESSING = False  # no process pools inside a worker
+    try:
+        # A process group of its own: killing the worker kills whatever its
+        # bots started (an exec bot's program) with it.
+        os.setsid()
+    except OSError:
+        pass
     bots: dict = {}
     while True:
         try:
@@ -205,6 +212,7 @@ class BotWorker:
         self.conn = None
         self.seats: dict = {}  # index -> the "seat" message, replayed on restart
         self.stopped = False  # by stop(): the game is over, no worker restarts
+        self.last_call_s = 0.0
         self._waiting = None  # (future, fd) while a call waits on the pipe
 
     @property
@@ -276,7 +284,11 @@ class BotWorker:
                 raise RuntimeError(f"the bot worker did not start: {error}") from error
             # Seats are declared; the pong says the worker has them ready.
             await self._exchange(("ping",), self.STARTUP_S)
-        return await self._exchange(message, timeout)
+        began = time.monotonic()
+        reply = await self._exchange(message, timeout)
+        #: How long the last call took, the worker's start excluded.
+        self.last_call_s = time.monotonic() - began
+        return reply
 
     async def _exchange(self, message, timeout: float):
         if not self._send(message):
@@ -328,8 +340,8 @@ class BotWorker:
                 conn.close()
             except OSError:
                 pass
-        if process is not None and process.is_alive():
-            process.kill()
+        if process is not None:
+            _kill_group(process)
             # Reap it off the event loop.
             threading.Thread(target=process.join, daemon=True).start()
 
@@ -362,12 +374,22 @@ def _wind_down(process, conn, grace: float) -> None:
             pass
     if process is not None:
         process.join(grace)
-        if process.is_alive():
-            process.kill()
-            process.join(0.5)
+        # Whatever is left of its group too (an exec bot that did not exit).
+        _kill_group(process)
+        process.join(0.5)
 
 
-def pace(timings, rng) -> None:
-    """Sleep as long as a typical real decision took (see ViewBot)."""
-    if timings:
-        time.sleep(rng.choice(list(timings)))
+def _kill_group(process) -> None:
+    """Kill a worker and its process group: the programs its bots started
+    die with it, even though the worker gets no chance to stop them."""
+    pid = process.pid
+    if pid is None:
+        return
+    try:
+        # The group's id is the worker's pid (it called setsid); if it did
+        # not get that far, there is no such group and this does nothing.
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:  # ProcessLookupError, PermissionError
+        pass
+    if process.is_alive():
+        process.kill()

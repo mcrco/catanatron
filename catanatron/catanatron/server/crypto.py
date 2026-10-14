@@ -18,7 +18,9 @@ The scheme (see the server README for the threat model):
   the previous message to that recipient, the state commitment and the
   body, signed with the server's Ed25519 key.
 * :func:`reveal_statement` -- what a seat signs when it reveals its seed:
-  the digest of the commitments it saw.
+  the digest of the commitments it saw (once per room, ever).
+* :func:`rejoin_statement` -- what a seat signs to take its chain back on a
+  new connection.
 * :func:`action_statement` -- what a client signs to make a move, bound to
   the game's commitments and the move's index.
 """
@@ -156,6 +158,13 @@ def join_statement(
     }
 
 
+def rejoin_statement(room_id: str, nonce: str) -> dict:
+    """What a seated client signs to take its seat's chain back on a new
+    connection: the nonce of that connection's hello, so a signature cannot
+    be replayed on another connection."""
+    return {"domain": "catanatron-rejoin/1", "room_id": room_id, "nonce": nonce}
+
+
 def reveal_statement(commitments: str) -> dict:
     """What a seat signs when it reveals its seed: that it saw this round's
     commitments (``commitments`` is their digest), which name every seat's
@@ -183,7 +192,7 @@ def action_statement(
 
 
 def submission_digest(statement: Any, signature: Any) -> str:
-    """How the server's receipt names a submitted action: statement and
-    signature together, so a receipt for a badly signed copy is not a
-    receipt for the real one."""
+    """How the server's receipt names a submission (an action, or a reveal:
+    its :func:`reveal_statement`): statement and signature together, so a
+    receipt for a badly signed copy is not a receipt for the real one."""
     return digest({"statement": statement, "sig": signature})

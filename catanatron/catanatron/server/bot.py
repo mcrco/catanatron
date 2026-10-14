@@ -29,7 +29,6 @@ from catanatron.models.player import Color
 from catanatron.registry import REGISTRY, SpecError
 from catanatron.observer import GameObserver
 from catanatron.serialization import action_from_json, action_to_json
-from catanatron.server.botproc import pace
 from catanatron.server.sampling import sample_game
 
 logger = logging.getLogger(__name__)
@@ -46,26 +45,66 @@ def _registry():
     return REGISTRY
 
 
+class PaceBook:
+    """How long a bot takes over its real decisions, by the kind of move it
+    made (the action type).
+
+    A seat with one legal move whose singleness depends on its hidden cards
+    (a roll from a hand of victory point cards only, an end of turn with
+    cards it cannot use, a discard from a one-resource hand) answers it as
+    slowly as the same bot answers real decisions that end in the same kind
+    of move: a table that sees the move and its timing learns nothing about
+    the hand. With no real decision of that kind yet, the bot's decisions of
+    any kind stand in, and with none at all a fixed range (a warm-up leak,
+    see the README).
+    """
+
+    #: Past decisions remembered per bot and kind.
+    HISTORY = 64
+    #: Seconds, with no history at all.
+    DEFAULT_S = (0.05, 0.4)
+
+    def __init__(self, rng: Optional[random.Random] = None):
+        self.durations: dict = {}
+        self.rng = rng or random.SystemRandom()
+
+    def record(self, bot, kind: Optional[str], seconds: float) -> None:
+        for key in ((bot, kind), (bot, None)):
+            history = self.durations.get(key)
+            if history is None:
+                history = self.durations[key] = deque(maxlen=self.HISTORY)
+            history.append(seconds)
+
+    def draw(self, bot, kind: Optional[str]) -> float:
+        for key in ((bot, kind), (bot, None)):
+            history = self.durations.get(key)
+            if history:
+                return self.rng.choice(list(history))
+        return self.rng.uniform(*self.DEFAULT_S)
+
+
+def move_kind(action: list) -> Optional[str]:
+    """What the table sees of a move before its details: its action type."""
+    return action[1] if isinstance(action, list) and len(action) > 1 else None
+
+
 class ViewBot:
     """A registry player deciding on games sampled from a seat's view.
 
     A seat with only one legal move answers it as slowly as it answers real
-    decisions (a duration drawn from its own past ones): otherwise the speed
-    of the answer would tell the table that the seat's options were few,
-    which can depend on its hidden cards (a roll from a hand of victory point
-    cards only, a discard from a one-resource hand).
+    decisions ending in the same kind of move (see :class:`PaceBook`):
+    otherwise the speed of the answer would tell the table that the seat's
+    options were few, which can depend on its hidden cards. (Server seats
+    are paced by the room itself, from a book that outlives worker
+    processes; this pace is for bots playing as remote clients.)
     """
-
-    #: How many past decision durations a bot draws its pace from.
-    PACE_HISTORY = 64
 
     def __init__(self, spec: str, color: Color, seed: Optional[int] = None):
         self.spec = spec
         self.color = color
         self.player = _registry().build(spec, color)
         self.rng = random.Random(seed)
-        self.pace_rng = random.Random()
-        self.timings: deque = deque(maxlen=self.PACE_HISTORY)
+        self.pace = PaceBook()
         self.started = False
 
     def start(self, view: dict, supply: Supply) -> None:
@@ -78,7 +117,7 @@ class ViewBot:
     def decide(self, view: dict, playable_actions: list, supply: Supply) -> list:
         """One of ``playable_actions`` (as JSON) for ``view``."""
         if len(playable_actions) == 1:
-            pace(self.timings, self.pace_rng)
+            time.sleep(self.pace.draw(None, move_kind(playable_actions[0])))
             return playable_actions[0]
         began = time.monotonic()
         self.start(view, supply)
@@ -93,7 +132,7 @@ class ViewBot:
             logger.warning("%s: no offered action in the sampled world", self.spec)
             return playable_actions[0]
         choice = action_to_json(self.player.decide(game, options))
-        self.timings.append(time.monotonic() - began)
+        self.pace.record(None, move_kind(choice), time.monotonic() - began)
         if json.dumps(choice) not in offered:
             logger.warning("%s chose %s, which was not offered", self.spec, choice)
             return playable_actions[0]

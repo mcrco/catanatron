@@ -85,14 +85,14 @@ def _tiles_document(spec: Any) -> dict:
                     raise MapError(f"{where}: number must be one of {NUMBERS}")
                 entry.update(type="LAND", resource=resource, number=number)
             else:
-                raise MapError(f"{where}: unknown resource {resource!r}")
+                raise MapError(f"{where}: unknown resource")
             land.add(coordinate)
         elif kind == "water":
             entry.update(type="WATER")
         elif kind == "port":
             resource = tile.get("port_resource", tile.get("resource"))
             if resource is not None and resource not in RESOURCES:
-                raise MapError(f"{where}: unknown port resource {resource!r}")
+                raise MapError(f"{where}: unknown port resource")
             try:
                 direction = Direction(str(tile.get("direction")).upper())
             except ValueError:
