@@ -29,6 +29,7 @@ web = [
     "psycopg2-binary",
 ]
 server = ["websockets>=13", "cryptography>=42"]
+tui = ["textual>=1.0"]
 dev = [
     "black==25.11.0",
     "pytest",
@@ -47,12 +48,14 @@ catanatron-play = "catanatron.cli.play:simulate"
 catanatron-server = "catanatron.server.app:main"
 catanatron-play-bot = "catanatron.server.bot:main"
 catanatron-verify = "catanatron.server.verify:main"
+catanatron-tui = "catanatron.tui.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["catanatron"]
 
 [tool.setuptools.package-data]
 "catanatron.server" = ["static/*", "README.md"]
+"catanatron.tui" = ["README.md"]
 
 [tool.black]
 target-version = ["py311"]
