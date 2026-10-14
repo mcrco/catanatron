@@ -11,9 +11,9 @@ import random
 
 import pytest
 
-from catanatron import Color, Game, Player
+from catanatron import Game, Player
 from catanatron.models.enums import ActionRecord
-from catanatron.models.player import RandomPlayer
+from catanatron.models.player import BASE_COLORS, RandomPlayer
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.serialization import action_from_json, state_from_json, state_to_json
 
@@ -38,7 +38,7 @@ class UnpredictablePlayer(Player):
 
 
 def seats():
-    return [RandomPlayer(color) for color in Color]
+    return [RandomPlayer(color) for color in BASE_COLORS]
 
 
 def played_game(players=None, ticks=200, seed=7):
@@ -105,13 +105,13 @@ def test_a_deck_in_another_order_still_draws_the_right_cards():
 def test_replay_does_not_depend_on_the_players():
     """The log records decisions, so who made them is irrelevant on the way
     back -- including players the game cannot reproduce."""
-    game, opening = played_game([UnpredictablePlayer(c) for c in Color], ticks=60)
+    game, opening = played_game([UnpredictablePlayer(c) for c in BASE_COLORS], ticks=60)
     log = state_to_json(game)["action_records"]
 
     for players in (
-        [UnpredictablePlayer(c) for c in Color],
-        [RandomPlayer(c) for c in Color],
-        [AlphaBetaPlayer(c) for c in Color],
+        [UnpredictablePlayer(c) for c in BASE_COLORS],
+        [RandomPlayer(c) for c in BASE_COLORS],
+        [AlphaBetaPlayer(c) for c in BASE_COLORS],
     ):
         original, rebuilt = documents_of(game, replay(opening, log, players))
         assert rebuilt == original
@@ -119,8 +119,8 @@ def test_replay_does_not_depend_on_the_players():
 
 def test_the_same_seed_does_not_reproduce_an_unpredictable_game():
     """The control for the test above: without the log there is no way back."""
-    first, _ = played_game([UnpredictablePlayer(c) for c in Color], ticks=60)
-    second, _ = played_game([UnpredictablePlayer(c) for c in Color], ticks=60)
+    first, _ = played_game([UnpredictablePlayer(c) for c in BASE_COLORS], ticks=60)
+    second, _ = played_game([UnpredictablePlayer(c) for c in BASE_COLORS], ticks=60)
     assert [str(r.action) for r in first.state.action_records] != [
         str(r.action) for r in second.state.action_records
     ]

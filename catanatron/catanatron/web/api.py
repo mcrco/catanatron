@@ -6,7 +6,7 @@ from flask import Response, Blueprint, jsonify, abort, request
 
 from catanatron.web.models import upsert_game_state, get_game_state
 from catanatron.serialization import action_from_json, web_view
-from catanatron.models.player import Color
+from catanatron.models.player import BASE_COLORS
 from catanatron.game import Game
 from catanatron.models.map import build_map
 from catanatron.players.minimax import AlphaBetaPlayer
@@ -120,8 +120,7 @@ def post_action_endpoint(game_id):
 def stress_test_endpoint():
     params = AlphaBetaPlayer.Params(depth=2, prunning=True)
     # The web UI draws the base game's four colors.
-    colors = [Color.RED, Color.BLUE, Color.ORANGE, Color.WHITE]
-    players = [AlphaBetaPlayer(color, params) for color in colors]
+    players = [AlphaBetaPlayer(color, params) for color in BASE_COLORS]
     game = Game(players=players)
     game.play_tick()
     return Response(

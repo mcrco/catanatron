@@ -11,7 +11,7 @@ import textwrap
 import pytest
 
 from catanatron import Color, Game
-from catanatron.models.player import RandomPlayer
+from catanatron.models.player import BASE_COLORS, RandomPlayer
 from catanatron.protocol import (
     PROTOCOL_VERSION,
     ProtocolError,
@@ -187,7 +187,7 @@ def test_empty_command_is_rejected():
 # ===== protocol shape =====
 def test_decide_message_omits_the_static_map():
     random.seed(2)
-    game = Game([RandomPlayer(color) for color in Color])
+    game = Game([RandomPlayer(color) for color in BASE_COLORS])
     for _ in range(20):
         game.play_tick()
     message = decide_message(game, Color.RED)
@@ -197,7 +197,7 @@ def test_decide_message_omits_the_static_map():
 
 def test_decide_message_hides_the_deck_order():
     random.seed(2)
-    game = Game([RandomPlayer(color) for color in Color])
+    game = Game([RandomPlayer(color) for color in BASE_COLORS])
     message = decide_message(game, Color.RED)
     assert isinstance(message["state"]["development_listdeck"], dict)
     assert "seed" not in message["state"]["game"]
@@ -206,7 +206,7 @@ def test_decide_message_hides_the_deck_order():
 def test_decide_message_hides_the_other_hands():
     """A bot on the wire gets the honest view, always. There is no flag."""
     random.seed(2)
-    game = Game([RandomPlayer(color) for color in Color])
+    game = Game([RandomPlayer(color) for color in BASE_COLORS])
     for _ in range(40):
         game.play_tick()
     state = decide_message(game, Color.RED)["state"]
@@ -220,7 +220,7 @@ def test_decide_message_hides_the_other_hands():
 
 def test_reply_must_name_a_playable_action():
     random.seed(2)
-    game = Game([RandomPlayer(color) for color in Color])
+    game = Game([RandomPlayer(color) for color in BASE_COLORS])
     legal = game.playable_actions[0]
     assert (
         parse_decide_reply({"action": action_to_json(legal)}, game.playable_actions)

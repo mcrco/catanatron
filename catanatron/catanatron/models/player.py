@@ -24,6 +24,11 @@ class Color(Enum):
         return f"C.{self.name}"
 
 
+#: The base game's four colors. Iterating Color also yields the 5-6 player
+#: extension's GREEN and BROWN.
+BASE_COLORS = (Color.RED, Color.BLUE, Color.ORANGE, Color.WHITE)
+
+
 class Player(GameObserver):
     """Interface to represent a player's decision logic.
 

@@ -5,7 +5,7 @@ import random
 import pytest
 
 from catanatron import Color, Game, GameAccumulator
-from catanatron.models.player import Player, RandomPlayer
+from catanatron.models.player import BASE_COLORS, Player, RandomPlayer
 from catanatron.observer import GameObserver
 from catanatron.players.minimax import AlphaBetaPlayer
 
@@ -43,7 +43,7 @@ def test_player_is_a_game_observer():
 
 def test_before_fires_at_construction_with_the_board_visible():
     """Replaces reset_state(), which never got to see the game."""
-    players = [Watcher(color) for color in Color]
+    players = [Watcher(color) for color in BASE_COLORS]
     Game(players)
     for player in players:
         assert player.tiles_at_start > 0
@@ -51,7 +51,7 @@ def test_before_fires_at_construction_with_the_board_visible():
 
 
 def test_before_fires_once_per_game():
-    players = [Watcher(color) for color in Color]
+    players = [Watcher(color) for color in BASE_COLORS]
     Game(players)
     first = players[0].tiles_at_start
     Game(players)  # a second game re-fires before(), resetting per-game state
@@ -61,7 +61,7 @@ def test_before_fires_once_per_game():
 
 def test_step_sees_every_action_including_opponents():
     random.seed(3)
-    players = [Watcher(color) for color in Color]
+    players = [Watcher(color) for color in BASE_COLORS]
     game = Game(players)
     game.play()
     for player in players:
@@ -72,7 +72,7 @@ def test_step_sees_every_action_including_opponents():
 
 def test_after_fires_with_the_result():
     random.seed(3)
-    players = [Watcher(color) for color in Color]
+    players = [Watcher(color) for color in BASE_COLORS]
     game = Game(players)
     winner = game.play()
     assert all(player.finished_as == winner for player in players)
@@ -80,7 +80,7 @@ def test_after_fires_with_the_result():
 
 def test_players_that_do_not_override_step_are_skipped():
     """Keeps the per-tick cost off bots that don't observe."""
-    assert Game([Quiet(color) for color in Color])._steppers == []
+    assert Game([Quiet(color) for color in BASE_COLORS])._steppers == []
     game = Game([Watcher(Color.RED), Quiet(Color.BLUE)])
     assert [type(p).__name__ for p in game._steppers] == ["Watcher"]
 

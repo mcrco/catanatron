@@ -12,7 +12,7 @@ import pytest
 
 from catanatron import Game
 from catanatron.models.map import build_map
-from catanatron.models.player import Color, RandomPlayer
+from catanatron.models.player import BASE_COLORS, Color, RandomPlayer
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players import register_builtins
 from catanatron.registry import REGISTRY
@@ -62,7 +62,7 @@ BOARD_FIELDS = ["buildings", "roads", "robber_coordinate", "road_color", "road_l
 
 def played_game(ticks=120, seed=7, map_type="BASE", players=None):
     random.seed(seed)  # callers restore global RNG state via the autouse fixture
-    players = players or [RandomPlayer(color) for color in Color]
+    players = players or [RandomPlayer(color) for color in BASE_COLORS]
     game = Game(players, catan_map=build_map(map_type))
     for _ in range(ticks):
         if game.winning_color() is not None:
@@ -132,7 +132,7 @@ def test_round_trip_preserves_playable_actions():
 
 def test_round_trip_preserves_game_config():
     random.seed(1)
-    players = [RandomPlayer(color) for color in Color]
+    players = [RandomPlayer(color) for color in BASE_COLORS]
     game = Game(players, discard_limit=5, vps_to_win=8, friendly_robber=True)
     for _ in range(30):
         game.play_tick()
@@ -242,7 +242,7 @@ def test_a_reloaded_game_keeps_its_random_stream():
     game, _ = played_game(ticks=30)
     twin, _ = played_game(ticks=30)
 
-    rebuilt = state_from_json(state_to_json(game), [RandomPlayer(c) for c in Color])
+    rebuilt = state_from_json(state_to_json(game), [RandomPlayer(c) for c in BASE_COLORS])
     assert rebuilt.random is rebuilt.state.random, "game and state share one stream"
     assert rebuilt.state.random.getstate() == twin.state.random.getstate()
 
