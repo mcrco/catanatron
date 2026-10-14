@@ -16,7 +16,8 @@ from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY, Supply
 from catanatron.models.enums import Action, ActionType
 from catanatron.models.map import CatanMap, build_map
 from catanatron.models.player import Color, Player
-from catanatron.server.crypto import derive_seed
+from catanatron.serialization import action_to_json
+from catanatron.server.crypto import canonical, derive_seed
 from catanatron.server.maps import MapError, normalize_map, parse_map
 
 MAP_TYPES = ("BASE", "MINI", "TOURNAMENT")
@@ -167,16 +168,29 @@ def is_over(game: Game) -> bool:
     )
 
 
+def ordered(actions: Sequence[Action]) -> list:
+    """``actions`` in a canonical order.
+
+    Catanatron generates some actions from sets of strings (port resources,
+    robbery victims), whose order changes with Python's hash seed. Whatever
+    has to be the same in the server and in a verifier running in another
+    process uses this order instead.
+    """
+    return sorted(actions, key=lambda action: canonical(action_to_json(action)))
+
+
 #: What a seat that ran out of time plays, in order of preference: the moves
 #: that keep the game going without committing the seat to anything.
 DEFAULT_PREFERENCE = (ActionType.ROLL, ActionType.END_TURN)
 
 
 def default_action(playable_actions: Sequence[Action]) -> Action:
-    """The move the server plays for a seat that timed out. Deterministic, so
-    a verifier can check the server did not pick a convenient one."""
+    """The move the server plays for a seat that timed out: the first
+    preferred kind of move, else the first in canonical order. Deterministic,
+    so a verifier can check the server did not pick a convenient one."""
+    candidates = ordered(playable_actions)
     for action_type in DEFAULT_PREFERENCE:
-        for action in playable_actions:
+        for action in candidates:
             if action.action_type == action_type:
                 return action
-    return playable_actions[0]
+    return candidates[0]

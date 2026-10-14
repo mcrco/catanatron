@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -70,6 +73,19 @@ def test_remote_bots_play_and_every_transcript_verifies(tmp_path):
     assert all(r.ok for r in reports), [r.errors for r in reports]
     seeds = {t["client_seed"] for t in transcripts}
     assert len(seeds) == 3, "every client contributed its own seed"
+
+    # And from the shell, in a process whose string hashing differs from the
+    # server's (Catanatron builds some actions from sets of strings).
+    for hash_seed in ("0", "1"):
+        verified = subprocess.run(
+            [sys.executable, "-m", "catanatron.server.verify"]
+            + [r.transcript_path for r in results],
+            env={**os.environ, "PYTHONHASHSEED": hash_seed},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert verified.returncode == 0, verified.stdout + verified.stderr
 
 
 def test_a_client_that_reconnects_keeps_its_seat_and_its_chain():

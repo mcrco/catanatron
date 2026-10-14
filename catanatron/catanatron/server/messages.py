@@ -32,6 +32,7 @@ from typing import Optional
 
 from catanatron.game import Game
 from catanatron.serialization import action_to_json, client_view, public_view
+from catanatron.server.config import ordered
 from catanatron.server.maps import board_geometry
 
 #: Bumped when a change would break clients written against the old shape.
@@ -99,7 +100,7 @@ def decide_body(game: Game, doc: dict, color: str, *, timeout_ms: int) -> dict:
         "state": state,
         "log_start": len(records),
         "log": [],
-        "playable_actions": [action_to_json(a) for a in game.playable_actions],
+        "playable_actions": [action_to_json(a) for a in ordered(game.playable_actions)],
         "timeout_ms": timeout_ms,
         **_status(game),
     }
