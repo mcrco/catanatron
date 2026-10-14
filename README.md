@@ -136,6 +136,22 @@ env.close()
 
 See more at: https://docs.catanatron.com
 
+## Game Server
+
+`catanatron-server` hosts games over WebSocket for people (a browser client is
+served at `/`), remote bots and server-side bots, with verifiable fairness:
+committed randomness, signed and hash-chained messages, signed moves, and a
+`catanatron-verify` that replays a transcript in stock Catanatron.
+
+```bash
+pip install -e .[server]
+catanatron-server --port 8765
+catanatron-play-bot --spec AB:2 --new --players 4 --fill F ws://localhost:8765
+```
+
+See [catanatron/catanatron/server/README.md](catanatron/catanatron/server/README.md)
+for the protocol, the fairness scheme and its threat model.
+
 ## Documentation
 
 Full documentation here: https://docs.catanatron.com
