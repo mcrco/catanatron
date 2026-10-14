@@ -24,12 +24,9 @@ from catanatron.server.client import (
 )
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import (
-    GENESIS,
     SigningKey,
-    envelope_hash,
     random_hex,
     rejoin_statement,
-    seal,
     submission_digest,
 )
 from catanatron.server.messages import PROTOCOL_VERSION, aborted_body, receipt_body
@@ -37,6 +34,7 @@ from catanatron.server.room import Outbox, Room, RoomError, RoomLimits
 from catanatron.server.verify import verify_transcript, verify_transcripts
 
 from tests.server.helpers import (
+    resign,
     LaxClient,
     bot_client,
     join_request,
@@ -55,24 +53,6 @@ def report_of(transcript):
 
 def any_error(errors, *fragments):
     return any(all(f in e for f in fragments) for e in errors)
-
-
-def resign(key, messages):
-    """The same envelopes (bodies, commits, recipients), signed and chained
-    anew with ``key``: what a dishonest server holding it can send."""
-    out, head = [], GENESIS
-    for seq, envelope in enumerate(messages):
-        sealed = seal(
-            key,
-            to=envelope["to"],
-            seq=seq,
-            prev=head,
-            commit=envelope["commit"],
-            body=envelope["body"],
-        )
-        out.append(sealed)
-        head = envelope_hash(sealed)
-    return out
 
 
 def play_honest(key, room_class=Room, spectate=True, config=CONFIG, limits=None):
@@ -199,7 +179,7 @@ def test_a_void_after_the_start_checks_the_start():
     for transcript in (red.transcript(), watcher.transcript()):
         report = report_of(transcript)
         assert report.void is not None
-        assert any_error(report.errors, "the game's start"), report.errors
+        assert any_error(report.errors, "the game as it started"), report.errors
 
 
 class CheatThenVoidRoom(Room):
@@ -390,7 +370,7 @@ def test_blaming_a_seat_never_asked_for_its_seed_is_caught():
             return client
 
     report = report_of(run(scenario()).transcript())
-    assert any_error(report.errors, "never asked to reveal"), report.errors
+    assert any_error(report.errors, "nobody was asked to reveal"), report.errors
 
 
 class CoercingRoom(Room):

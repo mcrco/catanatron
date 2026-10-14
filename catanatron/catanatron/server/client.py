@@ -41,6 +41,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from catanatron.models.enums import Action
 from catanatron.serialization import action_to_json
+from catanatron.server.config import GameConfig
 from catanatron.server.crypto import (
     GENESIS,
     SigningKey,
@@ -202,6 +203,7 @@ class GameClient:
         self.table = Table()
         self.room: Optional[dict] = None
         self.seat: Optional[int] = None
+        self._color: Optional[str] = None
         self.server_commitment: Optional[str] = None
         self.config: Optional[dict] = None
         #: The room's commitments: the first ever received, the only ones.
@@ -228,6 +230,8 @@ class GameClient:
         self._ending_deadline = 0.0
         self._attempts = 0
         self._start_overs = 0
+        #: The last move this client was asked to decide.
+        self._last_decided = -1
         self._saved_path: Optional[str] = None
         #: Called with every body once the client has taken it in.
         self.on_message: Optional[Callable[[dict], None]] = None
@@ -530,6 +534,7 @@ class GameClient:
                 )
             self._check_room(body.get("room"), "the join")
             self.seat = body["seat"]
+            self._color = body.get("color")
             self.room = body["room"]
         elif kind == "room":
             self._check_room(body.get("room"), "a room message")
@@ -575,7 +580,18 @@ class GameClient:
             return {"aborted": body}
         elif kind in GAME_MESSAGES:
             if kind == "before":
+                if self.table.state is not None:
+                    raise ServerMisbehaved("a second before")
                 self._check_before(body)
+            elif self.table.state is None:
+                raise ServerMisbehaved(f"a {kind} message before the game")
+            if kind == "decide":
+                index = body.get("index")
+                if type(index) is not int or index <= self._last_decided:
+                    # A second decide for a move would make a second answer
+                    # (and let the server choose between them).
+                    raise ServerMisbehaved(f"a second decide for move {index}")
+                self._last_decided = index
             self.table.update(body)
             # Any newer game message supersedes an open decision.
             self._close_decision()
@@ -585,6 +601,8 @@ class GameClient:
                 self._start_decision(decide)
             elif kind == "after":
                 return {"aborted": None}
+        elif kind not in ("hello",):
+            raise ServerMisbehaved(f"a message of unknown type {str(kind)[:40]!r}")
         return None
 
     def _close_decision(self) -> None:
@@ -636,6 +654,7 @@ class GameClient:
                 len(mine) != 1
                 or mine[0].get("kind") != "remote"
                 or mine[0].get("seat") != self.seat
+                or mine[0].get("color") != self._color
                 or mine[0].get("requested_seat") != self.wanted_seat
                 or mine[0].get("client_commitment") != self.client_commitment
                 or mine[0].get("nonce") != self._join_nonce
@@ -657,7 +676,14 @@ class GameClient:
                 )
 
     def _seat_ok(self, index: int, seat: dict) -> bool:
-        if sorted(seat) != sorted(SEAT_FIELDS) or seat.get("seat") != index:
+        colors = [c.value for c in GameConfig.from_json(self.config).colors]
+        if (
+            sorted(seat) != sorted(SEAT_FIELDS)
+            or type(seat.get("seat")) is not int
+            or seat["seat"] != index
+            or index >= len(colors)
+            or seat.get("color") != colors[index]
+        ):
             return False
         if seat.get("kind") == "bot":
             return all(
@@ -698,6 +724,7 @@ class GameClient:
             seeds = body.get("client_seeds") or []
             if (
                 self.commitments is None
+                or self._reveal is None
                 or self.seat is None
                 or self.seat >= len(seeds)
                 or seeds[self.seat] != self.client_seed
@@ -705,6 +732,10 @@ class GameClient:
                 raise ServerMisbehaved(
                     "the game was not seeded with this client's seed"
                 )
+            if body.get("color") != self._color:
+                raise ServerMisbehaved("the game seats this client in another color")
+        elif body.get("color") is not None:
+            raise ServerMisbehaved("a spectator was sent a seat's view")
 
     def _start_decision(self, decide: Optional[Decide]) -> None:
         if decide is None:
@@ -735,6 +766,11 @@ class GameClient:
             action = action_to_json(action)
         pending = self._pending
         assert pending is not None
+        if self.commitments is None or self._reveal is None:
+            # (Never sign outside the game this client revealed for; the
+            # reader refuses such a decide before this can run.)
+            logger.error("asked to move in a game this client never revealed for")
+            return
         body = pending["body"]
         statement = action_statement(
             digest(self.commitments),

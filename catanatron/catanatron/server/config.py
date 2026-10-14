@@ -85,6 +85,9 @@ class GameConfig:
     def validate(self) -> None:
         if _int(self.num_players) not in range(2, 7):
             raise ConfigError("num_players must be 2 to 6")
+        for name in ("map_type", "number_placement", "supply"):
+            if not isinstance(getattr(self, name), str):
+                raise ConfigError(f"{name} must be a string")
         if self.map_type not in MAP_TYPES:
             raise ConfigError(f"map_type must be one of {MAP_TYPES}")
         if self.number_placement not in NUMBER_PLACEMENTS:

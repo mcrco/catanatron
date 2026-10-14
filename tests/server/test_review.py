@@ -372,8 +372,13 @@ class StrayDecideRoom(Room):
     ],
 )
 def test_the_message_schedule_is_checked(room_class, message):
-    clients, _, _ = play(room_class)
+    # (Only RED is remote: a client that refuses the game live, as it does a
+    # second decide, leaves no other client waiting on its timeouts.)
+    remote = 1 if room_class is ResolicitRoom else 2
+    clients, results, _ = play(room_class, remote=remote)
     assert any_error(errors_of(clients[0]), message), errors_of(clients[0])
+    if room_class is ResolicitRoom:
+        assert isinstance(results[0], ServerMisbehaved)
 
 
 def test_two_different_signed_moves_for_one_index_are_reported():

@@ -210,6 +210,7 @@ function download(name, text) {
 // ===== lobby =====
 let players = [];
 async function showLobby() {
+  compactSeats();
   $("#room").hidden = true;
   $("#lobby").hidden = false;
   if (session) session.close();
@@ -335,11 +336,45 @@ function seatStorageKey(serverKey, roomId) { return `catanatron-seat-${serverKey
 function loadSeat(key) {
   try { return JSON.parse(localStorage.getItem(key) || "null"); } catch (error) { return null; }
 }
+// True only if the record is stored (read back): the page sends what a
+// record holds (a join, a reveal, a move) only once it is kept, so a reload
+// can never make it sign again what it signed before.
 function storeSeat(key, saved) {
   try {
-    if (saved) localStorage.setItem(key, JSON.stringify(saved));
-    else localStorage.removeItem(key);
-  } catch (error) { console.warn("could not store the seat", error); }
+    if (saved) {
+      const text = JSON.stringify(saved);
+      localStorage.setItem(key, text);
+      return localStorage.getItem(key) === text;
+    }
+    localStorage.removeItem(key);
+    return true;
+  } catch (error) {
+    console.warn("could not store the seat", error);
+    return false;
+  }
+}
+// Seat records of ended games keep only what stops the page from sitting
+// in them again: the transcripts are in IndexedDB, and the store must not
+// fill up.
+function compactSeats() {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith("catanatron-seat-")) continue;
+      const record = loadSeat(key);
+      if (record && record.closed && record.identity) {
+        localStorage.setItem(key, JSON.stringify({ closed: true, seedCommitment: record.seedCommitment }));
+      }
+    }
+  } catch (error) { /* a store we cannot read: nothing to compact */ }
+}
+const COLORS = Object.keys(PLAYER_COLORS); // seat i plays COLORS[i]
+// Lone surrogates: Python cannot encode them, so no honest server signs one.
+function stringsOk(value) {
+  if (typeof value === "string") return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
+  if (Array.isArray(value)) return value.every(stringsOk);
+  if (value && typeof value === "object") return Object.entries(value).every(([k, v]) => stringsOk(k) && stringsOk(v));
+  return true;
 }
 const COMMITMENTS_FIELDS = ["config", "reveal_timeout_ms", "room_id", "seats", "seed_commitment", "server_key", "type"];
 const SEAT_FIELDS = ["client_commitment", "color", "kind", "name", "nonce", "pop", "public_key", "requested_seat", "seat", "spec"];
@@ -377,6 +412,8 @@ class Session {
     this.aborted = null;
     this.finishTimer = null;
     this.lateReconnects = 0;
+    this.lastDecided = -1; // the last move this page was asked to decide
+    this.halted = false; // a seat record could not be stored: sign nothing more
   }
   resetTranscript() {
     this.messages = []; // raw text, exactly as received
@@ -391,8 +428,13 @@ class Session {
   get seated() { return Boolean(this.saved && this.saved.joined); }
   get sent() { return this.saved ? this.saved.sent : []; }
   get unreceipted() { return this.saved && !this.saved.closed ? this.saved.unreceipted : []; }
-  persist() { if (this.storageKey) storeSeat(this.storageKey, this.saved); }
-  remember(changes) { this.saved = { ...this.saved, ...changes }; this.persist(); }
+  persist() {
+    if (!this.storageKey || storeSeat(this.storageKey, this.saved)) return true;
+    this.problems.push("this browser could not store the seat (its storage is full?): nothing more is signed or sent");
+    this.halted = true;
+    return false;
+  }
+  remember(changes) { this.saved = { ...this.saved, ...changes }; return this.persist(); }
 
   connect() {
     this.ws = new WebSocket(wsUrl("/room/" + this.roomId));
@@ -428,6 +470,7 @@ class Session {
   async receive(text) {
     if (!numbersOk(text)) throw new Error("a message with a number the protocol does not allow (a float, or beyond 2**53)");
     const env = JSON.parse(text);
+    if (!stringsOk(env)) throw new Error("a message with text no honest server signs (a lone surrogate)");
     if (this.first) {
       this.first = false;
       const body = env.body;
@@ -516,8 +559,8 @@ class Session {
   checkRoom(room, where, first) {
     if (!room || room.id !== this.roomId) throw new Error(`${where} names another room`);
     if (first) return;
-    if (room.seed_commitment !== this.serverCommitment ||
-        (this.room && canonical(room.config) !== canonical(this.room.config))) {
+    const rules = this.saved && this.saved.config ? this.saved.config : (this.room ? canonical(this.room.config) : null);
+    if (room.seed_commitment !== this.serverCommitment || (rules !== null && canonical(room.config) !== rules)) {
       throw new Error(`${where} changes the room's seed commitment or rules`);
     }
   }
@@ -579,7 +622,9 @@ class Session {
         this.onReceipt(body);
         break;
       case "error":
-        if (body.code !== "not_revealing") this.problems.push(body.message);
+        // (A reveal resent after the game started is answered not_revealing:
+        // harmless then; while seeds are revealed, it is the server refusing.)
+        if (body.code !== "not_revealing" || (this.commitments && !this.game)) this.problems.push(body.message);
         // Only an answer to the join itself ends the wait for it.
         if (this.joining && body.answers === "join" && JOIN_REFUSALS.has(body.code)) {
           this.joining = false;
@@ -608,9 +653,20 @@ class Session {
           this.problems.push(`a ${body.type} message before the game`);
           break;
         }
+        if (body.type === "decide" && !(Number.isInteger(body.index) && body.index > this.lastDecided)) {
+          // A second decide for a move would make a second answer (and let
+          // the server choose between them).
+          this.problems.push(`a second decide for move ${body.index}`);
+          break;
+        }
         this.update(body);
         this.closePending();
-        if (body.type === "decide") this.pending = { env, hash: env.hash, body, received: Date.now() };
+        if (body.type === "decide") {
+          this.lastDecided = body.index;
+          this.pending = { env, hash: env.hash, body, received: Date.now() };
+          // Replayed after a reload: answered already, if the record says so.
+          if (this.seated && this.sent.some((s) => s.statement && s.statement.seq === env.seq)) this.answered = true;
+        }
         if (body.type === "after") {
           this.ended = "game";
           if (this.saved) this.remember({ closed: true });
@@ -644,6 +700,13 @@ class Session {
         this.problems.push("the game was not seeded with this page's seed");
         return false;
       }
+      if (body.color !== this.saved.color) {
+        this.problems.push("the game seats this page in another color");
+        return false;
+      }
+    } else if (body.color !== null) {
+      this.problems.push("a spectator was sent a seat's view");
+      return false;
     }
     return true;
   }
@@ -651,9 +714,10 @@ class Session {
   closePending() {
     // A newer message closed the open decision: if this page had not
     // answered it, keep a record (the server timed it out, or so it says).
-    if (this.pending && !this.answered && this.seated) {
+    const notes = this.saved ? this.saved.unanswered || [] : [];
+    if (this.pending && !this.answered && this.seated && !notes.some((n) => n.index === this.pending.body.index)) {
       const note = { index: this.pending.body.index, seq: this.pending.env.seq, ms: Date.now() - this.pending.received };
-      this.remember({ unanswered: [...(this.saved.unanswered || []), note] });
+      this.remember({ unanswered: [...notes, note] });
     }
     this.pending = null;
     this.answered = false;
@@ -699,7 +763,7 @@ class Session {
     }
     const sig = await signHex(this.identity.privateKey, { domain: "catanatron-reveal/1", commitments: C });
     const digest = await sha256Hex(canonical({ statement: { domain: "catanatron-reveal/1", commitments: C }, sig }));
-    this.remember({ reveal: { commitments: C, sig, digest } });
+    if (this.halted || !this.remember({ reveal: { commitments: C, sig, digest } })) return;
     this.send(this.revealRequest());
   }
   async mySeatProblem(body) {
@@ -707,7 +771,8 @@ class Session {
     if (new Set(keys).size !== keys.length) return "the commitments seat one key twice";
     // Every seat, not just ours: a reveal signs them all.
     for (const [index, seat] of body.seats.entries()) {
-      if (!seat || Object.keys(seat).sort().join(",") !== SEAT_FIELDS.join(",") || seat.seat !== index) {
+      if (!seat || Object.keys(seat).sort().join(",") !== SEAT_FIELDS.join(",") || seat.seat !== index ||
+          seat.color !== COLORS[index]) {
         return `the commitments' seat ${index} is malformed`;
       }
       if (seat.kind === "bot") {
@@ -730,7 +795,8 @@ class Session {
     const mine = body.seats.filter((s) => s && s.public_key === this.saved.identity.publicHex);
     const seat = mine[0];
     if (mine.length !== 1 || Object.keys(seat).sort().join(",") !== SEAT_FIELDS.join(",") ||
-        seat.kind !== "remote" || seat.seat !== this.saved.seat || seat.requested_seat !== this.saved.requested ||
+        seat.kind !== "remote" || seat.seat !== this.saved.seat || seat.color !== this.saved.color ||
+        seat.requested_seat !== this.saved.requested ||
         seat.client_commitment !== this.saved.clientCommitment || seat.nonce !== this.saved.nonce) {
       return "the commitments do not seat this page as it joined";
     }
@@ -765,6 +831,7 @@ class Session {
   }
 
   resume() {
+    if (this.halted) return;
     // After a rejoin: finish what the drop interrupted, by resending exactly
     // what was signed and has no receipt yet. Resending is harmless (the
     // server's receipt says "stale" for what it already had).
@@ -808,9 +875,15 @@ class Session {
     this.saved = {
       identity: { publicHex: this.identity.publicHex, privatePkcs8: this.identity.privatePkcs8 },
       clientSeed, clientCommitment, pop, nonce: this.helloNonce, requested: index,
-      seedCommitment: this.serverCommitment, joined: false, sent: [], unreceipted: [], unanswered: [],
+      seedCommitment: this.serverCommitment, config: canonical(this.room.config),
+      joined: false, sent: [], unreceipted: [], unanswered: [],
     };
-    this.persist();
+    if (!this.persist()) {
+      this.saved = null;
+      this.joining = false;
+      render();
+      return;
+    }
     this.send({
       type: "join", protocol_version: PROTOCOL_VERSION, name: $("#my-name") ? $("#my-name").value : "",
       seat: index, public_key: this.identity.publicHex, client_commitment: clientCommitment, pop,
@@ -826,7 +899,7 @@ class Session {
   }
 
   async act(action) {
-    if (!this.pending || this.answered || this.ended) return;
+    if (!this.pending || this.answered || this.ended || this.halted) return;
     // Only under the commitments this page revealed for.
     if (!this.saved || !this.saved.reveal || this.C !== this.saved.reveal.commitments) return;
     this.answered = true;
@@ -840,10 +913,11 @@ class Session {
     this.answerDigest = await sha256Hex(canonical({ statement, sig }));
     // Kept with the seat (a reload keeps them): what was sent, for the
     // verifier, and what is owed a receipt, resent until it gets one.
-    this.remember({
+    const kept = this.remember({
       sent: [...this.saved.sent, { statement, sig, sent_after: this.messages.length - 1 }],
       unreceipted: [...this.saved.unreceipted, { digest: this.answerDigest, answer: this.answer }],
     });
+    if (!kept) return;
     this.send(this.answer);
     render();
   }

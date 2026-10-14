@@ -119,7 +119,25 @@ def parse_request(text: Any) -> dict:
         raise RoomError("bad_request", f"not JSON: {error}")
     if not isinstance(request, dict):
         raise RoomError("bad_request", "expected a JSON object")
+    if not _strings_ok(request):
+        raise RoomError("bad_request", "strings must be valid Unicode text")
     return request
+
+
+def _strings_ok(value: Any) -> bool:
+    """No lone surrogates anywhere (they cannot be encoded, so nothing that
+    holds one could ever be signed, or read alike by every client)."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return True
+    if isinstance(value, list):
+        return all(_strings_ok(v) for v in value)
+    if isinstance(value, dict):
+        return all(_strings_ok(k) and _strings_ok(v) for k, v in value.items())
+    return True
 
 
 class GameServer:
@@ -181,7 +199,11 @@ class GameServer:
             self._admit_creation(address)
         self.admit_bots(address, sum(1 for spec in seats if spec is not None))
         self._evict()
-        room_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+        # 128 random bits, and never one in use: verifiers compare every
+        # transcript of a room id under one key, so two rooms must not share one.
+        room_id = secrets.token_urlsafe(16).replace("-", "x").replace("_", "y")
+        while room_id in self.rooms:
+            room_id = secrets.token_urlsafe(16).replace("-", "x").replace("_", "y")
         room = self.room_class(
             room_id,
             game_config,

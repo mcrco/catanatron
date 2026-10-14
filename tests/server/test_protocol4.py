@@ -162,7 +162,8 @@ def test_a_restart_message_fails():
         async with serving(room_class=RestartRoom) as (server, base):
             room = await create_room(base, CONFIG, [None, "F"])
             client, decide = bot_client(f"{base}/room/{room['id']}", verify=False)
-            await client.play(decide)
+            with pytest.raises(ServerMisbehaved, match="unknown type"):
+                await client.play(decide)  # the live client refuses it
             return client
 
     errors = report_of(run(scenario())).errors

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from typing import Any, Optional
 
@@ -64,14 +65,18 @@ def random_hex(num_bytes: int = SEED_BYTES) -> str:
     return secrets.token_hex(num_bytes)
 
 
+_HEX = re.compile(r"(?:[0-9a-f]{2})*")
+
+
 def is_hex(value: Any, num_bytes: Optional[int] = None) -> bool:
-    if not isinstance(value, str) or len(value) % 2 or value != value.lower():
-        return False
-    try:
-        raw = bytes.fromhex(value)
-    except ValueError:
-        return False
-    return num_bytes is None or len(raw) == num_bytes
+    """Lowercase hex digits and nothing else (``bytes.fromhex`` alone would
+    take spaces too, which a browser's check does not: every client must
+    read every value alike)."""
+    return (
+        isinstance(value, str)
+        and _HEX.fullmatch(value) is not None
+        and (num_bytes is None or len(value) == 2 * num_bytes)
+    )
 
 
 def seed_commitment(server_seed: str) -> str:

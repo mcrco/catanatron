@@ -800,9 +800,10 @@ const store = new Map();
 globalThis.window = { crypto: globalThis.crypto, addEventListener() {} };
 globalThis.document = { querySelector() { return null; } };
 globalThis.location = { hash: "", protocol: "http:", host: "fake" };
+globalThis.storeFull = false;
 globalThis.localStorage = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),
-  setItem: (k, v) => store.set(k, String(v)),
+  setItem: (k, v) => { if (storeFull) throw new Error("QuotaExceededError"); store.set(k, String(v)); },
   removeItem: (k) => store.delete(k),
 };
 globalThis.harnessSends = [];
@@ -822,6 +823,7 @@ vm.runInThisContext(`
     }
     if (cmd.op === "sit") await session.takeSeat(cmd.seat);
     if (cmd.op === "act" && session.pending) await session.act(session.pending.body.playable_actions[0]);
+    if (cmd.op === "full") storeFull = true;
     const sends = harnessSends.splice(0);
     const saved = session.saved;
     return { problems: session.problems, sends, C: session.C, seated: session.seated,

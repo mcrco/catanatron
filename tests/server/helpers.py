@@ -109,3 +109,23 @@ async def next_body(ws, *kinds, timeout=10):
         body = json.loads(await asyncio.wait_for(ws.recv(), timeout))["body"]
         if not kinds or body.get("type") in kinds:
             return body
+
+
+def resign(key, messages):
+    """The same envelopes (bodies, commits, recipients), signed and chained
+    anew with ``key``: what a dishonest server holding it can send."""
+    from catanatron.server.crypto import GENESIS, envelope_hash, seal
+
+    out, head = [], GENESIS
+    for seq, envelope in enumerate(messages):
+        sealed = seal(
+            key,
+            to=envelope["to"],
+            seq=seq,
+            prev=head,
+            commit=envelope["commit"],
+            body=envelope["body"],
+        )
+        out.append(sealed)
+        head = envelope_hash(sealed)
+    return out
