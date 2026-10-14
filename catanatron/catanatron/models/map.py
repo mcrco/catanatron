@@ -1,8 +1,11 @@
+import functools
 import random
 import typing
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Literal, Mapping, Set, Tuple, Type, Union
+
+import networkx as nx  # type: ignore
 
 from catanatron.models.coordinate_system import UNIT_VECTORS, Coordinate, Direction, add
 from catanatron.models.enums import (
@@ -18,6 +21,8 @@ from catanatron.models.enums import (
 from catanatron.models.spiral import spiral_land_coordinates
 from catanatron.models.tiles import EdgeId, LandTile, NodeId, Port, Tile, Water
 
+# Sizes of the BASE map. Other maps have their own: len(catan_map.land_nodes),
+# len(catan_map.land_edges), len(catan_map.land_tiles).
 NUM_NODES = 54
 NUM_EDGES = 72
 NUM_TILES = 19
@@ -180,6 +185,34 @@ BASE_MAP_TEMPLATE = MapTemplate(
 )
 
 
+#: Per land tile, in order: its coordinate, its node ids and its edges. It
+#: fixes the map's node graph; maps that differ only in resources, numbers,
+#: ports or water share one layout (and one graph).
+Layout = Tuple[Tuple[Coordinate, Tuple[NodeId, ...], Tuple[EdgeId, ...]], ...]
+
+
+def land_layout(tiles: Dict[Coordinate, Tile]) -> Layout:
+    return tuple(
+        (coordinate, tuple(tile.nodes.values()), tuple(tile.edges.values()))
+        for coordinate, tile in tiles.items()
+        if isinstance(tile, LandTile)
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def layout_graph(layout: Layout) -> nx.Graph:
+    """The node graph of a layout: the nodes and edges of its land tiles,
+    added tile by tile in order (so neighbors iterate alike for every map of
+    the layout). Water carries no edges: two land nodes that only meet
+    across water are not neighbors, so no road joins them and the distance
+    rule does not apply between them. Shared between maps; do not mutate."""
+    graph = nx.Graph()
+    for _, nodes, edges in layout:
+        graph.add_nodes_from(nodes)
+        graph.add_edges_from(edges)
+    return graph
+
+
 class CatanMap:
     """Represents a randomly initialized map."""
 
@@ -202,6 +235,9 @@ class CatanMap:
         self.node_production = node_production
         self.tiles_by_id = tiles_by_id
         self.ports_by_id = ports_by_id
+        self.layout: Layout = land_layout(tiles)
+        #: The land nodes and the edges between them (see layout_graph).
+        self.graph: nx.Graph = layout_graph(self.layout)
 
     @staticmethod
     def from_template(
@@ -238,7 +274,44 @@ class CatanMap:
         }
         self.ports_by_id = {p.id: p for p in self.tiles.values() if isinstance(p, Port)}
 
+        self.layout = land_layout(self.tiles)
+        self.graph = layout_graph(self.layout)
         return self
+
+    @property
+    def land_edges(self) -> List[EdgeId]:
+        """The edges between land nodes: where roads can go."""
+        return land_edges(self.layout)
+
+    @property
+    def node_distances(self) -> Dict[NodeId, Dict[NodeId, float]]:
+        """Road distances between land nodes (computed once per layout;
+        infinite between islands)."""
+        return node_distances(self.layout)
+
+    def is_base_layout(self) -> bool:
+        """Whether the node ids mean what they mean on the BASE map (BASE,
+        TOURNAMENT and MINI do), which fixed-size encodings rely on."""
+        return self.layout == BASE_LAYOUT[: len(self.layout)]
+
+
+@functools.lru_cache(maxsize=256)
+def land_edges(layout: Layout) -> List[EdgeId]:
+    return list(layout_graph(layout).edges())
+
+
+@functools.lru_cache(maxsize=16)
+def node_distances(layout: Layout) -> Dict[NodeId, Dict[NodeId, float]]:
+    return nx.floyd_warshall(layout_graph(layout))
+
+
+def require_base_layout(catan_map: CatanMap, what: str) -> None:
+    """Raise unless ``catan_map`` numbers its nodes as the BASE map does."""
+    if not catan_map.is_base_layout():
+        raise ValueError(
+            f"{what} assumes the BASE board's node ids (BASE, TOURNAMENT or MINI "
+            "maps); this map has another layout"
+        )
 
 
 def init_port_nodes_cache(
@@ -548,3 +621,9 @@ def build_map(
         return CatanMap.from_template(
             BASE_MAP_TEMPLATE, number_placement=number_placement, rng=rng
         )
+
+
+#: The BASE map's layout, which MINI's is a prefix of.
+BASE_LAYOUT: Layout = land_layout(
+    initialize_tiles(BASE_MAP_TEMPLATE, rng=random.Random(0))
+)

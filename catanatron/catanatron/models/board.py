@@ -15,9 +15,14 @@ from catanatron.models.map import (
 from catanatron.models.enums import FastBuildingType, SETTLEMENT, CITY
 
 
-# Used to find relationships between nodes and edges
+# Every map carries its own node graph (CatanMap.graph: land nodes, and the
+# edges between them), which is what the board walks. The module-level names
+# below are the BASE board's, as they were when every board was the BASE
+# board; they keep their old meaning (water nodes included).
 base_map = CatanMap.from_template(BASE_MAP_TEMPLATE)
 mini_map = CatanMap.from_template(MINI_MAP_TEMPLATE)
+#: Deprecated: every node and edge of the BASE map, water included. Use
+#: ``catan_map.graph``.
 STATIC_GRAPH = nx.Graph()
 for tile in base_map.tiles.values():
     STATIC_GRAPH.add_nodes_from(tile.nodes.values())
@@ -26,11 +31,14 @@ for tile in base_map.tiles.values():
 
 @functools.lru_cache(1)
 def get_node_distances():
+    """Deprecated: distances on STATIC_GRAPH. Use ``catan_map.node_distances``."""
     return nx.floyd_warshall(STATIC_GRAPH)
 
 
 @functools.lru_cache(3)  # None, range(54), range(24)
 def get_edges(land_nodes=None):
+    """Deprecated: edges of STATIC_GRAPH between ``land_nodes`` (all 54 BASE
+    land nodes by default). Use ``catan_map.land_edges``."""
     return list(STATIC_GRAPH.subgraph(land_nodes or range(NUM_NODES)).edges())
 
 
@@ -78,8 +86,8 @@ class Board:
                 self.map.land_tiles.keys(),
             ).__next__()
 
-            # Cache buildable subgraph
-            self.buildable_subgraph = STATIC_GRAPH.subgraph(self.map.land_nodes)
+            # Where roads can go: the map's graph is land only.
+            self.buildable_subgraph = self.map.graph
 
     def build_settlement(self, color, node_id, initial_build_phase=False):
         """Adds a settlement, and ensures is a valid place to build.
@@ -113,7 +121,7 @@ class Board:
             # instead of incrementally editing it: previous cuts and cycles can
             # leave the cache with overlapping or missing nodes.
             edges_by_color = defaultdict(list)
-            for edge in STATIC_GRAPH.edges(node_id):
+            for edge in self.map.graph.edges(node_id):
                 edges_by_color[self.roads.get(edge, None)].append(edge)
 
             for edge_color, edges in edges_by_color.items():
@@ -139,7 +147,7 @@ class Board:
                 # expand from enemy nodes.
 
         self.board_buildable_ids.discard(node_id)
-        for n in STATIC_GRAPH.neighbors(node_id):
+        for n in self.map.graph.neighbors(node_id):
             self.board_buildable_ids.discard(n)
 
         self.buildable_edges_cache = {}  # Reset buildable_edges
@@ -159,6 +167,7 @@ class Board:
         """
         agenda = [node_id]  # assuming node_id is owned.
         visited = set()
+        graph = self.map.graph
 
         while len(agenda) != 0:
             n = agenda.pop()
@@ -167,7 +176,7 @@ class Board:
             if self.is_enemy_node(n, color):
                 continue  # end of the road
 
-            neighbors = [v for v in STATIC_GRAPH.neighbors(n) if v not in visited]
+            neighbors = [v for v in graph.neighbors(n) if v not in visited]
             expandable = [v for v in neighbors if self.roads.get((n, v), None) == color]
             agenda.extend(expandable)
 
@@ -186,6 +195,7 @@ class Board:
             if edge_color == color
         }
         components = []
+        graph = self.map.graph
 
         while unvisited_edges:
             first_edge = unvisited_edges.pop()
@@ -197,7 +207,7 @@ class Board:
                 for node_id in edge:
                     if self.is_enemy_node(node_id, color):
                         continue
-                    for neighbor in STATIC_GRAPH.neighbors(node_id):
+                    for neighbor in graph.neighbors(node_id):
                         next_edge = tuple(sorted((node_id, neighbor)))
                         if next_edge in unvisited_edges:
                             unvisited_edges.remove(next_edge)
@@ -396,6 +406,7 @@ class Board:
 
 def longest_acyclic_path(board: Board, node_set: Set[int], color: Color):
     paths = []
+    graph = board.map.graph
     for start_node in node_set:
         # do DFS when reach leaf node, stop and add to paths
         paths_from_this_node = []
@@ -404,7 +415,7 @@ def longest_acyclic_path(board: Board, node_set: Set[int], color: Color):
             node, path_thus_far = agenda.pop()
 
             able_to_navigate = False
-            for neighbor_node in STATIC_GRAPH.neighbors(node):
+            for neighbor_node in graph.neighbors(node):
                 edge = tuple(sorted((node, neighbor_node)))
 
                 # Must travel on a friendly road.

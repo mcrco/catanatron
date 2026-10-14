@@ -24,7 +24,7 @@ from collections import Counter, defaultdict
 
 from catanatron.game import Game
 from catanatron.models.actions import generate_playable_actions
-from catanatron.models.board import STATIC_GRAPH, Board
+from catanatron.models.board import Board
 from catanatron.models.enums import (
     DEVELOPMENT_CARDS,
     RESOURCES,
@@ -187,7 +187,7 @@ def board_from_json(doc, catan_map: CatanMap) -> Board:
     )
     board.road_color = Color[doc["road_color"]] if doc["road_color"] else None
     board.road_length = doc["road_length"]
-    board.buildable_subgraph = STATIC_GRAPH.subgraph(catan_map.land_nodes)
+    board.buildable_subgraph = catan_map.graph
     board.buildable_edges_cache = {}
     board.player_port_resources_cache = {}
     return board

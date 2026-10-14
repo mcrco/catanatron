@@ -12,7 +12,7 @@ from catanatron.models.enums import (
 )
 from catanatron.models.coordinate_system import offset_to_cube
 from catanatron.models.board import STATIC_GRAPH
-from catanatron.models.map import number_probability
+from catanatron.models.map import number_probability, require_base_layout
 from catanatron.features import get_feature_ordering, iter_players
 
 # These assume 4 players
@@ -134,6 +134,8 @@ def create_board_tensor(game: Game, p0_color: Color, channels_first=False):
         - To see WHEAT plane: tf.transpose(board_tensor[:,:,3])
     """
     # add n hot-encoded color multiplier planes (nodes), and n edge planes. 2*n planes
+    # The planes are laid out on the BASE board's fixed grid of node ids.
+    require_base_layout(game.state.board.map, "create_board_tensor")
     n = len(game.state.colors)
     channels = 2 * n + 5 + 1 + 6
     # NumPy zero-init (C-level) instead of a channels*WIDTH*HEIGHT nested list

@@ -11,8 +11,13 @@ from catanatron.state_functions import (
     player_num_dev_cards,
     player_num_resource_cards,
 )
-from catanatron.models.board import STATIC_GRAPH, get_edges, get_node_distances
-from catanatron.models.map import NUM_TILES, CatanMap, build_map, number_probability
+from catanatron.models.map import (
+    NUM_TILES,
+    CatanMap,
+    build_map,
+    number_probability,
+    require_base_layout,
+)
 from catanatron.models.player import Color, SimplePlayer
 from catanatron.models.enums import (
     DEVELOPMENT_CARDS,
@@ -178,10 +183,11 @@ def port_features(game, p0_color):
 def initialize_graph_features_template(num_players, catan_map: CatanMap):
     features = {}
     for i in range(num_players):
-        for node_id in range(len(catan_map.land_nodes)):
+        # (The land nodes are 0..n-1 on template maps, not on every map.)
+        for node_id in sorted(catan_map.land_nodes):
             for building in [SETTLEMENT, CITY]:
                 features[f"NODE{node_id}_P{i}_{building}"] = False
-        for edge in get_edges(catan_map.land_nodes):
+        for edge in catan_map.land_edges:
             features[f"EDGE{edge}_P{i}_ROAD"] = False
     return features
 
@@ -290,10 +296,11 @@ def get_zero_nodes(game, color):
 
 
 @functools.lru_cache(maxsize=2000)
-def iter_level_nodes(enemy_nodes, enemy_roads, num_roads, zero_nodes):
+def iter_level_nodes(graph, enemy_nodes, enemy_roads, num_roads, zero_nodes):
     """Iterates over possible expansion paths.
 
     Args:
+        graph (nx.Graph): the map's node graph (``catan_map.graph``)
         enemy_nodes (frozenset[NodeId]): node_ids owned by enemy colors
         enemy_roads (frozenset[EdgeId]): edge_ids owned by enemy colors
         num_roads (int): Max-depth of BFS (inclusive). e.g. 2 will yield
@@ -318,7 +325,7 @@ def iter_level_nodes(enemy_nodes, enemy_roads, num_roads, zero_nodes):
 
             # here we can assume node is empty or owned
             expandable = []
-            for neighbor_id in STATIC_GRAPH.neighbors(node_id):
+            for neighbor_id in graph.neighbors(node_id):
                 edge = (node_id, neighbor_id)
                 can_follow_edge = edge not in enemy_roads
                 if can_follow_edge:
@@ -369,7 +376,11 @@ def reachability_features(game: Game, p0_color: Color, levels=REACHABLE_FEATURES
             k for k, v in game.state.board.roads.items() if v is not None and v != color
         )
         for level, level_nodes, paths in iter_level_nodes(
-            enemy_nodes, enemy_roads, levels, frozenset(zero_nodes)
+            game.state.board.map.graph,
+            enemy_nodes,
+            enemy_roads,
+            levels,
+            frozenset(zero_nodes),
         ):
             production = count_production(
                 frozenset(owned_or_buildable.intersection(level_nodes)),
@@ -397,10 +408,10 @@ def expansion_features(game: Game, p0_color: Color):
     features = {}
 
     # For each connected component node, bfs_edges (skipping enemy edges and nodes nodes)
-    empty_edges = set(get_edges(game.state.board.map.land_nodes))
+    empty_edges = set(game.state.board.map.land_edges)
     for i, color in iter_players(game.state.colors, p0_color):
         empty_edges.difference_update(get_player_buildings(game.state, color, ROAD))
-    searchable_subgraph = STATIC_GRAPH.edge_subgraph(empty_edges)
+    searchable_subgraph = game.state.board.map.graph.edge_subgraph(empty_edges)
 
     board_buildable_node_ids = game.state.board.buildable_node_ids(
         p0_color, True
@@ -468,7 +479,7 @@ def port_distance_features(game: Game, p0_color: Color):
     # P0_HAS_WHEAT_PORT, P0_WHEAT_PORT_DISTANCE, ..., P1_HAS_WHEAT_PORT,
     features = {}
     ports = game.state.board.map.port_nodes
-    distances = get_node_distances()
+    distances = game.state.board.map.node_distances
     resources_and_none: List[Any] = RESOURCES.copy()
     resources_and_none += [None]
     for resource_or_none in resources_and_none:
@@ -479,12 +490,14 @@ def port_distance_features(game: Game, p0_color: Color):
                 features[f"P{i}_HAS_{port_name}_PORT"] = False
                 features[f"P{i}_{port_name}_PORT_DISTANCE"] = float("inf")
             else:
+                # (A map need not have every kind of port.)
                 min_distance = min(
                     [
                         distances[port_node_id][my_node]
                         for my_node in expandable_node_ids
                         for port_node_id in ports[resource_or_none]
-                    ]
+                    ],
+                    default=float("inf"),
                 )
                 features[f"P{i}_HAS_{port_name}_PORT"] = min_distance == 0
                 features[f"P{i}_{port_name}_PORT_DISTANCE"] = min_distance
@@ -585,6 +598,9 @@ def create_sample(game, p0_color):
 
 
 def create_sample_vector(game, p0_color, features=None):
+    if features is None:
+        # The default ordering names the BASE board's tiles, nodes and edges.
+        require_base_layout(game.state.board.map, "the default feature ordering")
     features = features or get_feature_ordering(len(game.state.colors))
     sample_dict = create_sample(game, p0_color)
     return [float(sample_dict[i]) for i in features if i in sample_dict]

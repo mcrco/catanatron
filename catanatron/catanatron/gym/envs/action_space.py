@@ -2,7 +2,6 @@ from functools import lru_cache
 from typing import Tuple, Literal
 
 from catanatron.models.actions import Action
-from catanatron.models.board import get_edges
 from catanatron.models.enums import RESOURCES, ActionType
 from catanatron.models.player import Color
 from catanatron.models.map import build_map
@@ -23,7 +22,7 @@ def get_action_array(
             *[(ActionType.DISCARD_RESOURCE, resource) for resource in RESOURCES],
             *[
                 (ActionType.BUILD_ROAD, tuple(sorted(edge)))
-                for edge in get_edges(catan_map.land_nodes)
+                for edge in catan_map.land_edges
             ],
             *[(ActionType.BUILD_SETTLEMENT, node_id) for node_id in range(num_nodes)],
             *[(ActionType.BUILD_CITY, node_id) for node_id in range(num_nodes)],
