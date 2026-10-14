@@ -242,7 +242,9 @@ def test_a_reloaded_game_keeps_its_random_stream():
     game, _ = played_game(ticks=30)
     twin, _ = played_game(ticks=30)
 
-    rebuilt = state_from_json(state_to_json(game), [RandomPlayer(c) for c in BASE_COLORS])
+    rebuilt = state_from_json(
+        state_to_json(game), [RandomPlayer(c) for c in BASE_COLORS]
+    )
     assert rebuilt.random is rebuilt.state.random, "game and state share one stream"
     assert rebuilt.state.random.getstate() == twin.state.random.getstate()
 
@@ -345,7 +347,8 @@ def test_what_the_robber_stole_is_hidden_but_where_it_went_is_not():
     moves = [
         (action, result)
         for action, result in view["action_records"]
-        if action[1] == "MOVE_ROBBER" and action[0] != Color.RED.value
+        if action[1] == "MOVE_ROBBER"
+        and Color.RED.value not in (action[0], action[2][1])
     ]
     assert moves, "the fixture should have moved the robber"
     for action, result in moves:
@@ -353,6 +356,40 @@ def test_what_the_robber_stole_is_hidden_but_where_it_went_is_not():
         assert isinstance(coordinate, list), "the tile is public"
         assert victim is None or isinstance(victim, str), "who was robbed is public"
         assert result is None, "which resource is not"
+
+
+def test_the_victim_of_a_steal_sees_what_was_stolen():
+    game, _ = played_game(ticks=400)
+    doc = state_to_json(game)
+    steals = [
+        (action, result)
+        for action, result in doc["action_records"]
+        if action[1] == "MOVE_ROBBER" and action[2][1] is not None
+    ]
+    assert steals, "the fixture should have stolen something"
+    for action, result in steals:
+        victim = action[2][1]
+        victims_log = client_view(doc, victim)["action_records"]
+        assert [action, result] in victims_log
+
+
+def test_a_seat_sees_the_unseen_pool_not_the_deck():
+    """With two players, the deck's composition, the starting deck, the
+    played cards and my own hand would add up to the opponent's hand."""
+    game, _ = played_game(
+        ticks=400, players=[RandomPlayer(Color.RED), RandomPlayer(Color.BLUE)]
+    )
+    doc = state_to_json(game)
+    view = client_view(doc, Color.RED)
+    assert "development_listdeck" not in view
+    assert view["development_deck_size"] == len(doc["development_listdeck"])
+    blue = doc["colors"].index("BLUE")
+    for card in DEVCARDS:
+        assert (
+            view["unseen_development_cards"][card]
+            == doc["development_listdeck"].count(card)
+            + doc["player_state"][f"P{blue}_{card}_IN_HAND"]
+        )
 
 
 def test_a_spectator_still_sees_everything():

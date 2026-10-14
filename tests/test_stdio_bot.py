@@ -199,7 +199,8 @@ def test_decide_message_hides_the_deck_order():
     random.seed(2)
     game = Game([RandomPlayer(color) for color in BASE_COLORS])
     message = decide_message(game, Color.RED)
-    assert isinstance(message["state"]["development_listdeck"], dict)
+    assert "development_listdeck" not in message["state"]
+    assert message["state"]["development_deck_size"] == 25
     assert "seed" not in message["state"]["game"]
 
 

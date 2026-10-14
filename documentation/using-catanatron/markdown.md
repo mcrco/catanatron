@@ -46,11 +46,12 @@ An accumulator holds the live `game`, so it sees everything. To serialize what
 it sees, pick the flavor the job needs:
 
 ```python
-from catanatron.serialization import client_view, state_to_json
+from catanatron.serialization import client_view, public_view, state_to_json
 
 doc = state_to_json(game)
-client_view(doc)                 # a spectator: every hand face up
+client_view(doc)                 # every hand face up
 client_view(doc, game.state.current_color())   # only what that seat knows
+public_view(doc)                 # only what an onlooker knows
 ```
 
 Collecting training data usually wants the first; recording what a player

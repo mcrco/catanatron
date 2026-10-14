@@ -10,12 +10,10 @@ Two documents, deliberately different:
   hidden information: the order of the development card deck, and the state of
   the game's random stream, which is every roll and draw still to come.
 - ``client_view(doc)`` is the redacted projection handed to a browser or to an
-  out-of-process bot. It replaces the ordered deck with its composition
-  (how many of each card remain), which is what a player legitimately knows
-  and all that the builtin bots use; see
-  ``catanatron.players.tree_search_utils.execute_spectrum``.
-  Given a ``perspective`` it also hides what only the other seats know, so a
-  bot on the wire sees exactly what a person across the table would.
+  out-of-process bot. It drops the seed, the random stream and the deck's
+  order. Given a ``perspective`` it also hides what only the other seats
+  know, so a bot on the wire sees exactly what a person across the table
+  would; ``public_view(doc)`` is what an onlooker sees.
 
 None of this is on the path of an in-process bot, which reads ``game.state``
 directly; a self-play run never serializes anything.
@@ -274,7 +272,7 @@ def state_from_json(doc, players) -> Game:
     """
     if doc["schema_version"] != SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version {doc['schema_version']}")
-    if not isinstance(doc["development_listdeck"], list):
+    if not isinstance(doc.get("development_listdeck"), list):
         # The ordered deck is the tell: client_view() turns it into a count.
         raise ValueError(
             "this is a client_view, not the authoritative document; a redacted "
@@ -345,7 +343,7 @@ def state_from_json(doc, players) -> Game:
 #: playable four have the flag.
 HAND_FLAGS = tuple(k for k in PLAYER_INITIAL_STATE if k.endswith("_OWNED_AT_START"))
 #: Which card you drew is yours alone. Where the robber went is public; what
-#: it stole is not.
+#: it stole is known only to the thief and the victim.
 SECRET_VALUE = {"BUY_DEVELOPMENT_CARD"}
 SECRET_RESULT = {"BUY_DEVELOPMENT_CARD", "MOVE_ROBBER"}
 
@@ -353,56 +351,94 @@ SECRET_RESULT = {"BUY_DEVELOPMENT_CARD", "MOVE_ROBBER"}
 def client_view(doc, perspective=None):
     """Redacted projection of a document, safe to send to a browser or a bot.
 
-    Always removes what nobody at the table knows: the seed, and the order of
-    the development deck. The deck's *composition* survives, because a player
-    legitimately reasons about the odds of drawing a knight; only its order,
-    which would reveal future draws, is removed.
+    Always removes what nobody at the table knows: the seed, the random
+    stream, and the order of the development deck.
 
     ``perspective`` additionally removes what only the *other* seats know --
     their hands, and the private half of what they did. Pass it for anyone
     who is playing (a bot on the wire always gets it); leave it out for a
-    spectator, a replay, or an accumulator collecting training data.
+    replay or an accumulator collecting training data, which see every hand
+    face up. :func:`public_view` is the table as an onlooker sees it.
+
+    Without a perspective the deck's composition survives (with every hand
+    face up it gives nothing away). With one it is replaced by the *unseen
+    pool*, ``unseen_development_cards``: the deck plus the other seats'
+    hidden cards, along with ``development_deck_size``. The composition
+    itself would leak: the starting deck, the cards played and your own hand
+    pin down what the others hold.
     """
-    view = dict(doc)
-    view["development_listdeck"] = dict(
-        sorted(Counter(doc["development_listdeck"]).items())
-    )
-    view["game"] = {k: v for k, v in doc["game"].items() if k != "seed"}
-    view.pop("random_state", None)
+    view = _without_the_future(doc)
     if perspective is None:
+        view["development_listdeck"] = dict(
+            sorted(Counter(doc["development_listdeck"]).items())
+        )
         return view
 
     color = getattr(perspective, "value", perspective)
     if color not in doc["colors"]:
         raise ValueError(f"{color!r} is not seated in this game: {doc['colors']}")
-    seat = doc["colors"].index(color)
+    return _redact_seats(doc, view, doc["colors"].index(color))
 
+
+def public_view(doc):
+    """What an onlooker who is not seated knows: :func:`client_view` from no
+    seat at all. Every hand is a count and every draw and steal is hidden."""
+    return _redact_seats(doc, _without_the_future(doc), None)
+
+
+def _without_the_future(doc):
+    view = dict(doc)
+    view["game"] = {k: v for k, v in doc["game"].items() if k != "seed"}
+    view.pop("random_state", None)
+    return view
+
+
+def _redact_seats(doc, view, seat):
+    """Hide every hand but ``seat``'s (every hand, if ``seat`` is None)."""
+    colors = doc["colors"]
     state = dict(doc["player_state"])
-    for index in range(len(doc["colors"])):
+    unseen = Counter(doc["development_listdeck"])
+    for index in range(len(colors)):
         if index == seat:
             continue
         prefix = f"P{index}_"
         state[prefix + "NUM_RESOURCES_IN_HAND"] = sum(
             state.pop(f"{prefix}{resource}_IN_HAND") for resource in RESOURCES
         )
-        state[prefix + "NUM_DEVELOPMENT_CARDS_IN_HAND"] = sum(
-            state.pop(f"{prefix}{card}_IN_HAND") for card in DEVELOPMENT_CARDS
-        )
+        cards = {
+            card: state.pop(f"{prefix}{card}_IN_HAND") for card in DEVELOPMENT_CARDS
+        }
+        unseen.update(cards)
+        state[prefix + "NUM_DEVELOPMENT_CARDS_IN_HAND"] = sum(cards.values())
         for flag in HAND_FLAGS:
             state.pop(prefix + flag)
         # Counts the victory-point cards still in hand.
         state.pop(prefix + "ACTUAL_VICTORY_POINTS")
     view["player_state"] = state
 
+    del view["development_listdeck"]
+    view["development_deck_size"] = len(doc["development_listdeck"])
+    view["unseen_development_cards"] = {
+        card: unseen[card] for card in DEVELOPMENT_CARDS
+    }
+
+    color = None if seat is None else colors[seat]
     view["action_records"] = [
         (
-            [[a[0], a[1], None if a[1] in SECRET_VALUE else a[2]], None]
-            if a[0] != color and a[1] in SECRET_RESULT
-            else [a, result]
+            [a, result]
+            if a[1] not in SECRET_RESULT or color in _parties(a)
+            else [[a[0], a[1], None if a[1] in SECRET_VALUE else a[2]], None]
         )
         for a, result in doc["action_records"]
     ]
     return view
+
+
+def _parties(action):
+    """The seats entitled to an action's secret half."""
+    if action[1] == "MOVE_ROBBER":
+        return (action[0], action[2][1])
+    return (action[0],)
 
 
 # ===== what a browser needs on top of the document =====
