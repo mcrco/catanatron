@@ -14,7 +14,7 @@ from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual.geometry import Region
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -42,26 +42,31 @@ DIRECTIONS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
 
 KEYS_HELP = """\
 Keys
-  up/down, enter     choose an action from the list (grouped by kind)
-  b                  pick on the board: arrows move between targets, enter
-                     picks, escape goes back; clicking a node, road or tile
-                     picks it too (and shows what is there)
-  :                  type a command (help lists them)      /TEXT filters the list
-  z                  board size: auto, small, medium, large
-  i                  node ids on/off                       ?   this help
-  q, ctrl+q          quit
-Local games only
-  space              pause / resume the bots               n   one bot move
-  + / -              bots faster / slower
-  u / r              undo / redo one action                U   undo to your last choice
-  g                  god view (every hand)                 v   cycle whose view is shown
-  d, c, t            set the next dice, development card, steal
-  s, l               save, load (JSON: position + history)
-Remote games only
-  V                  verify the transcript
+  up/down, enter   choose a move from the list (grouped by kind)
+  /                filter the list (escape clears)
+  b                pick on the board: arrows move between targets, enter
+                   picks, escape goes back. Clicking a node, road or tile
+                   picks it too; elsewhere it says what is there
+  :                type a command (below)
+  z                board size: auto, small, medium, large
+  i                node ids on/off
+  ?                this help
+  q, ctrl+q        quit
+Local games
+  space            pause / resume the bots
+  n                one bot move
+  + / -            bots faster / slower
+  u / r            undo / redo one action
+  U                undo to your last choice
+  g                god view (every hand)
+  v                cycle whose view is shown
+  d, c, t          set the next dice, development card, steal
+  s, l             save, load (JSON: the position and its history)
+Remote games
+  V                verify the transcript
 
-App commands: step [N], auto on|off, speed SECONDS, zoom SIZE, ids on|off,
-filter TEXT (or /TEXT), help, quit."""
+App commands: step [N], auto on|off, speed SECONDS, zoom SIZE,
+ids on|off, filter TEXT (or /TEXT), help, quit."""
 
 
 class BoardView(Widget, can_focus=True):
@@ -151,8 +156,8 @@ class HelpScreen(ModalScreen):
     ]
     DEFAULT_CSS = """
     HelpScreen { align: center middle; }
-    #help { width: auto; max-width: 96; height: auto; max-height: 90%;
-            border: round $accent; padding: 1 2; background: $panel; }
+    #help { width: 90; max-width: 100%; height: auto; max-height: 90%;
+            border: round $accent; padding: 0 1; background: $panel; }
     """
 
     def __init__(self, text: str) -> None:
@@ -160,8 +165,9 @@ class HelpScreen(ModalScreen):
         self.text = text
 
     def compose(self) -> ComposeResult:
-        with ScrollableContainer(id="help"):
-            yield Static(self.text)
+        with VerticalScroll(id="help") as scroll:
+            scroll.border_title = "catanatron-tui (escape closes)"
+            yield Static(Text(self.text))
 
 
 class CatanApp(App):
