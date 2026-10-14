@@ -42,6 +42,7 @@ from catanatron.models.map import (
     Water,
     get_nodes_and_edges,
 )
+from catanatron.models.coordinate_system import Direction
 from catanatron.models.player import Color
 from catanatron.state import PLAYER_INITIAL_STATE, State
 from catanatron.state_functions import get_longest_road_length
@@ -55,23 +56,39 @@ MAP_TEMPLATES = {"BASE": BASE_MAP_TEMPLATE, "MINI": MINI_MAP_TEMPLATE}
 
 
 # ===== map =====
+#: Not a template: a map laid out tile by tile. Its document lists every tile
+#: in the order the map numbered their nodes, with each port's direction.
+TILES = "TILES"
+
+
 def detect_template(catan_map: CatanMap) -> str:
     """Infer which template a map was built from, by its topology.
 
     A TOURNAMENT map is a BASE topology with a fixed tile assignment, so it
-    round-trips correctly as BASE plus the assignment stored below.
+    round-trips correctly as BASE plus the assignment stored below. The
+    tiles must come in the template's order (that order numbers the nodes)
+    and the ports must face the template's way.
     """
-    coordinates = set(catan_map.tiles)
+    coordinates = list(catan_map.tiles)
     for name, template in MAP_TEMPLATES.items():
-        if coordinates == set(template.topology):
+        if coordinates == list(template.topology) and all(
+            tile.direction == template.topology[coordinate][1]
+            for coordinate, tile in catan_map.tiles.items()
+            if isinstance(tile, Port)
+        ):
             return name
     raise ValueError("map does not match any known template topology")
 
 
 def map_to_json(catan_map: CatanMap, template_name=None):
     """Store the tile ASSIGNMENT only; node/edge geometry is derived from the
-    template topology, which is deterministic."""
-    template_name = template_name or detect_template(catan_map)
+    template topology, which is deterministic. A map that matches no
+    template is stored as TILES, which also keeps each port's direction."""
+    if template_name is None:
+        try:
+            template_name = detect_template(catan_map)
+        except ValueError:
+            template_name = TILES
     tiles = []
     for coord, tile in catan_map.tiles.items():
         if isinstance(tile, LandTile):
@@ -86,30 +103,42 @@ def map_to_json(catan_map: CatanMap, template_name=None):
             )
         elif isinstance(tile, Port):
             # direction is static per template topology -> not stored
-            tiles.append(
-                {
-                    "coordinate": list(coord),
-                    "type": "PORT",
-                    "id": tile.id,
-                    "resource": tile.resource,
-                }
-            )
+            entry = {
+                "coordinate": list(coord),
+                "type": "PORT",
+                "id": tile.id,
+                "resource": tile.resource,
+            }
+            if template_name == TILES:
+                entry["direction"] = tile.direction.value
+            tiles.append(entry)
         else:
             tiles.append({"coordinate": list(coord), "type": "WATER"})
     return {"template": template_name, "tiles": tiles}
 
 
 def map_from_json(doc) -> CatanMap:
-    template = MAP_TEMPLATES[doc["template"]]
+    if doc["template"] == TILES:
+        layout = [
+            (
+                tuple(t["coordinate"]),
+                Direction(t["direction"]) if t["type"] == "PORT" else None,
+            )
+            for t in doc["tiles"]
+        ]
+    else:
+        layout = [
+            (coordinate, tile_type[1] if isinstance(tile_type, tuple) else None)
+            for coordinate, tile_type in MAP_TEMPLATES[doc["template"]].topology.items()
+        ]
     by_coord = {tuple(t["coordinate"]): t for t in doc["tiles"]}
     all_tiles, node_autoinc = {}, 0
-    for coordinate, tile_type in template.topology.items():
+    for coordinate, direction in layout:
         nodes, edges, node_autoinc = get_nodes_and_edges(
             all_tiles, coordinate, node_autoinc
         )
         stored = by_coord[coordinate]
         if stored["type"] == "PORT":
-            _, direction = tile_type  # from the template topology
             all_tiles[coordinate] = Port(
                 stored["id"], stored["resource"], direction, nodes, edges
             )

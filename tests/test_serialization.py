@@ -18,6 +18,9 @@ from catanatron.players import register_builtins
 from catanatron.registry import REGISTRY
 from catanatron.serialization import (
     SCHEMA_VERSION,
+    TILES,
+    map_from_json,
+    map_to_json,
     client_view,
     detect_template,
     state_from_json,
@@ -164,6 +167,36 @@ def test_round_trip_preserves_map(map_type):
 def test_tournament_map_round_trips_as_base_topology():
     game, _ = played_game(ticks=5, map_type="TOURNAMENT")
     assert detect_template(game.state.board.map) == "BASE"
+
+
+def test_a_map_that_is_no_template_round_trips_as_tiles():
+    doc = map_to_json(build_map("BASE"))
+    port = next(t for t in doc["tiles"] if t["type"] == "PORT")
+    tiles = [
+        (
+            {**t, "direction": "EAST" if t is port else "WEST"}
+            if t["type"] == "PORT"
+            else t
+        )
+        for t in doc["tiles"]
+    ]
+    custom = map_from_json({"template": TILES, "tiles": tiles})
+    stored = map_to_json(custom)
+    assert stored["template"] == TILES
+    assert map_to_json(map_from_json(stored)) == stored
+    assert custom.port_nodes != build_map("BASE").port_nodes
+
+
+def test_a_template_map_keeps_its_compact_document():
+    doc = map_to_json(build_map("BASE"))
+    assert doc["template"] == "BASE"
+    assert not any("direction" in t for t in doc["tiles"])
+
+
+def test_build_map_draws_from_the_given_rng():
+    first = map_to_json(build_map("BASE", rng=random.Random(4)))
+    assert first == map_to_json(build_map("BASE", rng=random.Random(4)))
+    assert first != map_to_json(build_map("BASE", rng=random.Random(5)))
 
 
 def test_hydrated_game_plays_out_identically():

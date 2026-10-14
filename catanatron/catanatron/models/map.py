@@ -534,14 +534,17 @@ TOURNAMENT_MAP_TILES = initialize_tiles(
 TOURNAMENT_MAP = CatanMap.from_tiles(TOURNAMENT_MAP_TILES)
 
 
-def build_map(map_type: MapType, number_placement: NumberPlacement = "official_spiral"):
+def build_map(
+    map_type: MapType, number_placement: NumberPlacement = "official_spiral", rng=None
+):
+    """``rng`` shuffles the tiles; the global ``random`` module if None."""
     if map_type == "TOURNAMENT":
         return TOURNAMENT_MAP  # this assumes map is read-only data struct
     elif map_type == "MINI":
         return CatanMap.from_template(
-            MINI_MAP_TEMPLATE, number_placement=number_placement
+            MINI_MAP_TEMPLATE, number_placement=number_placement, rng=rng
         )
     else:
         return CatanMap.from_template(
-            BASE_MAP_TEMPLATE, number_placement=number_placement
+            BASE_MAP_TEMPLATE, number_placement=number_placement, rng=rng
         )
