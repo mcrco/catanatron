@@ -17,17 +17,14 @@ way it faces (towards the land it serves), and a null ``port_resource`` is a
 ``CatanMap.from_tiles`` numbers a template's, so the same spec builds the same
 map in any engine that follows that order.
 
-Stock Catanatron's board still takes adjacency from the BASE map's node
-graph, so a spec must lay its nodes out on that graph (BASE or MINI shapes,
-in their template order, with any tiles, numbers and ports). Other shapes are
-rejected with a clear error until the board learns per-map graphs.
+Any shape works: the board's node graph is built from the land tiles
+(``CatanMap.graph``), so land that only meets across water is not adjacent.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from catanatron.models.board import STATIC_GRAPH
 from catanatron.models.coordinate_system import UNIT_VECTORS, Direction, add
 from catanatron.models.enums import RESOURCES
 from catanatron.models.map import PORT_DIRECTION_TO_NODEREFS, CatanMap
@@ -123,24 +120,7 @@ def _tiles_document(spec: Any) -> dict:
             entry["id"], next_land_id = next_land_id, next_land_id + 1
         elif entry["type"] == "PORT":
             entry["id"], next_port_id = next_port_id, next_port_id + 1
-    document = {"template": TILES, "tiles": entries}
-    _check_board_graph(map_from_json(document))
-    return document
-
-
-def _check_board_graph(catan_map: CatanMap) -> None:
-    edges, nodes = set(), set()
-    for tile in catan_map.tiles.values():
-        nodes.update(tile.nodes.values())
-        edges.update(tuple(sorted(edge)) for edge in tile.edges.values())
-    if not nodes <= set(STATIC_GRAPH.nodes) or edges != {
-        tuple(sorted(edge)) for edge in STATIC_GRAPH.subgraph(nodes).edges()
-    }:
-        raise MapError(
-            "Catanatron's board takes adjacency from the BASE map's node graph, "
-            "so a map must use the BASE (or MINI) layout: the same coordinates "
-            "in the template's order. Tiles, numbers and ports are free."
-        )
+    return {"template": TILES, "tiles": entries}
 
 
 def map_spec(catan_map: CatanMap) -> dict:

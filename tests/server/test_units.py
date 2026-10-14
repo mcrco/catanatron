@@ -69,6 +69,15 @@ def test_a_map_spec_round_trips():
     assert rebuilt.land_nodes == catan_map.land_nodes
 
 
+def test_any_shape_is_accepted():
+    spec = _base_spec()
+    spec["tiles"].reverse()  # numbers the nodes differently: another layout
+    spec["tiles"] = [t for t in spec["tiles"] if t["type"] != "water"]
+    catan_map = parse_map(spec)
+    assert not catan_map.is_base_layout()
+    assert map_spec(catan_map) == spec
+
+
 def test_the_mini_layout_is_accepted():
     assert (
         parse_map(map_spec(build_map("MINI"))).land_nodes
@@ -83,8 +92,6 @@ def _base_spec():
 @pytest.mark.parametrize(
     "edit,message",
     [
-        (lambda s: s["tiles"].pop(0), "BASE"),
-        (lambda s: s["tiles"].reverse(), "BASE"),
         (lambda s: s["tiles"][0].update(coordinate=[1, 1, 1]), "summing to 0"),
         (lambda s: s["tiles"][1].update(coordinate=[0, 0, 0]), "twice"),
         (lambda s: s["tiles"][0].update(type="lava"), "type"),

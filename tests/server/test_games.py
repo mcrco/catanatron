@@ -16,6 +16,7 @@ from catanatron.models.map import build_map
 from tests.server.helpers import bot_client, run, serving
 
 FAST = {"vps_to_win": 6, "decision_timeout_ms": 20_000}
+MAPS_DIR = os.path.join(os.path.dirname(__file__), "..", "maps")
 
 
 @pytest.mark.parametrize("num_players", [2, 3, 4, 5, 6])
@@ -158,6 +159,28 @@ def test_a_game_on_an_explicit_map():
     assert result.verified, result.report.errors
     assert room.config.map == spec
     assert room.game.state.board.map.port_nodes.keys() == {None}
+
+
+@pytest.mark.parametrize("name", ["extension", "blob25_stringy"])
+def test_a_verified_game_on_an_irregular_map(name):
+    with open(os.path.join(MAPS_DIR, name + ".json")) as file:
+        spec = json.load(file)
+    num_players = 6 if name == "extension" else 3
+
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": num_players, "map": spec, **FAST}
+            room = await create_room(base, config, [None] + ["F"] * (num_players - 1))
+            client, decide = bot_client(f"{base}/room/{room['id']}", "F")
+            return server.rooms[room["id"]], await client.play(decide)
+
+    room, result = run(scenario())
+    assert result.verified, result.report.errors
+    assert result.report.counts["client signatures"] > 0
+    assert not room.game.state.board.map.is_base_layout()
+    assert len(room.game.state.board.map.land_tiles) == (
+        30 if name == "extension" else 25
+    )
 
 
 def test_seats_are_refused_once_taken_or_started():

@@ -97,11 +97,9 @@ An explicit map lists every tile, in the order that numbers the nodes (the order
 `resource: null` is the desert (a map needs one: the robber starts there), a
 port's `direction` is the way it faces (towards land) and `port_resource: null`
 is a 3:1 port. `catanatron.server.maps.map_spec(catan_map)` produces this for
-any map. **Limitation:** stock Catanatron's board takes node adjacency from the
-BASE map's graph, so for now a spec must use the BASE (or MINI) layout —
-the same coordinates, in the template's order — with any tiles, numbers and
-ports. Other shapes are rejected with an explicit error until the board learns
-per-map graphs.
+any map. Any shape works (hexagons, the 5–6 player board, rectangles,
+islands): the board's node graph is built from the land tiles, so land that
+only meets across water is not adjacent (no road, no distance rule there).
 
 When every seat is taken (a remote client, or a bot via the room's `seats` or
 a `seat_bot` request) the game starts. A seat that does not answer within the
