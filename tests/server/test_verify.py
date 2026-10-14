@@ -195,31 +195,43 @@ def test_a_forged_move_is_caught_by_everyone(room_class, message):
 
 # ===== the transcript itself =====
 def test_an_edited_transcript_fails_its_signatures(honest):
+    """Not evidence: anyone can write a broken transcript, so it accuses
+    nobody."""
     transcripts, _ = honest
     edited = copy.deepcopy(transcripts[0])
     step = next(m for m in edited["messages"] if m["body"]["type"] == "step")
     step["body"]["state"]["player_state"]["P0_VICTORY_POINTS"] += 1
-    assert any("bad server signature" in e for e in errors_of(edited))
+    report = verify_transcript(edited)
+    assert any("bad server signature" in e for e in report.invalid)
+    assert not report.errors and report.verdict == "INVALID"
 
 
 def test_a_transcript_claiming_another_seed_fails(honest):
+    """The header is the client's word: one that the signed chain belies
+    makes the transcript not evidence, never an accusation."""
     transcripts, _ = honest
     edited = copy.deepcopy(transcripts[0])
     edited["client_seed"] = "11" * 32
-    errors = errors_of(edited)
-    assert any("not to this client's seed" in e for e in errors)
-    assert any("seed did not go into the game" in e for e in errors)
+    report = verify_transcript(edited)
+    assert any("client_seed does not open" in e for e in report.invalid)
+    assert not report.errors
 
 
 def test_someone_elses_transcript_does_not_verify_as_mine(honest):
     transcripts, _ = honest
     edited = copy.deepcopy(transcripts[0])
     edited["public_key"] = transcripts[1]["public_key"]
-    assert any("addressed to" in e for e in errors_of(edited))
+    report = verify_transcript(edited)
+    assert any("not this client's transcript" in e for e in report.invalid)
+    assert not report.errors
 
 
 def test_an_unfinished_transcript_cannot_be_verified_yet(honest):
+    """A missing tail is not evidence: incomplete, not failed (but what the
+    prefix holds is checked)."""
     transcripts, _ = honest
     edited = copy.deepcopy(transcripts[0])
     edited["messages"] = edited["messages"][:40]
-    assert any("not ended" in e for e in errors_of(edited))
+    report = verify_transcript(edited)
+    assert report.incomplete and not report.errors and not report.ok
+    assert report.verdict == "INCOMPLETE"

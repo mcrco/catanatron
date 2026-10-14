@@ -59,16 +59,18 @@ from catanatron.server.crypto import (
     verify_envelope,
     verify_signature,
 )
+from catanatron.server.hashing import numbers_ok
 from catanatron.server.messages import (
     COMMITMENTS_FIELDS,
     GAME_MESSAGES,
     PROTOCOL_VERSION,
+    SEAT_FIELDS,
 )
 from catanatron.server.table import Table
 
 logger = logging.getLogger(__name__)
 
-TRANSCRIPT_FORMAT = "catanatron-transcript/4"
+TRANSCRIPT_FORMAT = "catanatron-transcript/5"
 
 Decide = Callable[[dict, list], Any]
 
@@ -138,8 +140,9 @@ async def list_rooms(url: str) -> list:
 
 
 class _StartOver(Exception):
-    """The server holds no seat for our key (a join that never landed, or a
-    seat freed while we were away): connect afresh and join again."""
+    """The server holds no seat for our key, before any seed was asked for
+    (a join that never landed, or a seat freed while we were away): connect
+    afresh and join again."""
 
 
 class GameClient:
@@ -149,7 +152,8 @@ class GameClient:
     it signs exactly one reveal per room, for the first ``commitments`` it
     receives (a different second one is the server misbehaving), with the
     seed it joined with and no other; it signs at most one answer per
-    decision and resends, after a reconnect, exactly what it signed.
+    decision and resends, after a reconnect, exactly what it signed and has
+    no receipt for. Whatever happens, it saves the transcript it holds.
     """
 
     #: How long to wait, once the game is over, for receipts still owed.
@@ -204,20 +208,27 @@ class GameClient:
         self.commitments: Optional[dict] = None
         self.messages: list = []
         self.sent: list = []
+        #: Decisions closed (by a newer message) before this client answered:
+        #: its record of being timed out (index, decide seq, ms it had).
+        self.unanswered: list = []
         self.head = GENESIS
         #: The decide message awaiting our answer, and the answer once made.
         self._pending: Optional[dict] = None
+        self._pending_since = 0.0
         self._answer: Optional[dict] = None
         self._decision: Optional[asyncio.Task] = None
-        #: Our join went out (we may hold a seat even if 'joined' was lost).
+        #: Our join went out (we may hold a seat even if 'joined' was lost),
+        #: on the connection whose hello carried this nonce.
         self._join_sent = False
-        #: Our one reveal, once signed; resent as is after a reconnect.
+        self._join_nonce: Optional[str] = None
+        #: Our one reveal, once signed; resent as is until it has a receipt.
         self._reveal: Optional[dict] = None
         self._unreceipted: dict = {}
         self._ending: Optional[dict] = None
         self._ending_deadline = 0.0
         self._attempts = 0
         self._start_overs = 0
+        self._saved_path: Optional[str] = None
         #: Called with every body once the client has taken it in.
         self.on_message: Optional[Callable[[dict], None]] = None
         #: The live connection, if any.
@@ -237,10 +248,11 @@ class GameClient:
             "color": self.table.color,
             "messages": self.messages,
             "sent": self.sent,
+            "unanswered": self.unanswered,
         }
 
     def save_transcript(self) -> Optional[str]:
-        if not self.transcript_dir:
+        if not self.transcript_dir or not self.messages:
             return None
         os.makedirs(self.transcript_dir, exist_ok=True)
         who = self.table.color or ("spectator" if self.spectate else "seat")
@@ -248,6 +260,7 @@ class GameClient:
         path = os.path.join(self.transcript_dir, f"{self.room_id}-{game}-{who}.json")
         with open(path, "w") as file:
             json.dump(self.transcript(), file)
+        self._saved_path = path
         return path
 
     # ----- receiving -----
@@ -262,6 +275,11 @@ class GameClient:
             self.server_key = body["server_key"]
         if not verify_envelope(self.server_key, envelope):
             raise ServerMisbehaved(f"bad signature on message {envelope.get('seq')}")
+        if not numbers_ok(envelope):
+            raise ServerMisbehaved(
+                f"message {envelope.get('seq')} holds a number the protocol does not "
+                "allow (a float, or beyond 2**53)"
+            )
         if envelope["seq"] != len(self.messages) or envelope["prev"] != self.head:
             raise ServerMisbehaved(
                 f"message {envelope['seq']} breaks the hash chain "
@@ -279,10 +297,24 @@ class GameClient:
 
     # ----- playing -----
     async def play(self, decide: Optional[Decide] = None) -> GameResult:
-        """Join, play until the game ends, save and verify the transcript."""
+        """Join, play until the game ends, save and verify the transcript.
+
+        If it raises (the server misbehaved, refused us, or the connection
+        could not be kept), the transcript received so far is saved first:
+        it may be the evidence."""
         if decide is None and not self.spectate:
             raise ValueError("a seated client needs a decide callback")
         self._attempts = 0
+        try:
+            return await self._play(decide)
+        except BaseException:
+            try:
+                self.save_transcript()
+            except Exception:
+                logger.exception("could not save the transcript")
+            raise
+
+    async def _play(self, decide: Optional[Decide]) -> GameResult:
         while True:
             try:
                 return await self._session(decide)
@@ -345,7 +377,7 @@ class GameClient:
                     self.messages, self.head, self.table = [], GENESIS, Table()
                 body = self._accept(first)
                 self._on_hello(body)
-                await ws.send(json.dumps(self._join_request()))
+                await ws.send(json.dumps(self._join_request(body)))
                 self._join_sent = not self.spectate
                 self._notify(body)
 
@@ -371,6 +403,13 @@ class GameClient:
                     resyncing = False
                 body = self._accept(envelope)
                 self._attempts = 0  # the connection works: count afresh
+                if self._ending is not None and body.get("type") not in (
+                    "received",
+                    "error",
+                ):
+                    raise ServerMisbehaved(
+                        f"a {str(body.get('type'))[:40]} message after the end"
+                    )
                 result = await self._handle(ws, body, decide)
                 self._notify(body)
                 if result is not None and self._ending is None:
@@ -379,7 +418,9 @@ class GameClient:
 
     def _resumes_chain(self, envelope: dict) -> bool:
         """While rejoining: skip (after checking) what arrives on the
-        throw-away chain until the seat's chain resumes."""
+        throw-away chain until the seat's chain resumes. A message for our
+        key that does not continue our chain means the server resent
+        another chain: that is not skipped, it is the server misbehaving."""
         if (
             envelope.get("seq") == len(self.messages)
             and envelope.get("prev") == self.head
@@ -387,22 +428,29 @@ class GameClient:
             return True
         if not verify_envelope(self.server_key, envelope):
             raise ServerMisbehaved("bad signature while rejoining")
+        if self.seat is not None and envelope.get("to") == self.key.public_hex:
+            raise ServerMisbehaved("the server resent another chain for this seat")
         body = envelope.get("body", {})
         if body.get("type") == "error":
             if body.get("code") == "not_seated":
+                if self.commitments is not None or self._reveal is not None:
+                    # Once the seats were locked, a seat is never freed.
+                    raise ServerMisbehaved(
+                        "the server forgot a seat after locking the seats"
+                    )
                 raise _StartOver()
             raise Refused(body.get("message"))
         return False
 
     async def _resume(self, ws, decide: Optional[Decide]) -> None:
         """After a rejoin: finish what the drop interrupted, by resending
-        exactly what was signed (the reveal, answers not yet acknowledged).
+        exactly what was signed and has no receipt (the reveal, answers).
         Resending is harmless: the server answers a stale submission with a
         receipt that says so, which no verifier holds against it."""
-        if self._reveal is not None and self.table.state is None:
-            await ws.send(json.dumps(self._reveal))
-        for answer in list(self._unreceipted.values()):
-            await ws.send(json.dumps(answer))
+        for request in list(self._unreceipted.values()):
+            if request["type"] == "reveal" and self.table.state is not None:
+                continue  # the game started: the reveal was taken
+            await ws.send(json.dumps(request))
         if (
             self._pending is not None
             and self._answer is None
@@ -414,30 +462,46 @@ class GameClient:
         if self.on_message is not None:
             self.on_message(body)
 
+    def _check_room(self, room: Any, where: str) -> None:
+        """Every description of the room names it, its seed commitment and
+        its rules, as the first hello did."""
+        if (
+            not isinstance(room, dict)
+            or room.get("id") != self.room_id
+            or room.get("seed_commitment") != self.server_commitment
+            or canonical(room.get("config")) != canonical(self.config)
+        ):
+            raise ServerMisbehaved(
+                f"{where} changes the room's seed commitment or rules"
+            )
+
     def _on_hello(self, body: dict) -> None:
         if body.get("protocol_version") != PROTOCOL_VERSION:
             raise Refused(f"server speaks protocol {body.get('protocol_version')}")
         room = body["room"]
         if room.get("id") != self.room_id:
             raise ServerMisbehaved("the hello is for another room")
-        if self.server_commitment is not None and (
-            room.get("seed_commitment") != self.server_commitment
-            or room.get("config") != self.config
-        ):
+        if self.server_commitment is not None:
             # Starting over after a lost join: the room is the same room.
-            raise ServerMisbehaved("the room changed its seed commitment or rules")
+            self._check_room(room, "the hello")
         self.room = room
         self.server_commitment = room["seed_commitment"]
         self.config = room["config"]
 
-    def _join_request(self) -> dict:
+    def _join_request(self, hello: dict) -> dict:
         if self.spectate:
             return {"type": "spectate", "name": self.name}
+        nonce = hello.get("nonce")
+        if not is_hex(nonce, 16):
+            raise ServerMisbehaved("the hello carries no nonce to sign")
+        self._join_nonce = nonce
         statement = join_statement(
             self.room_id,
+            self.server_key,
             self.server_commitment,
             self.wanted_seat,
             self.client_commitment,
+            nonce,
         )
         return {
             "type": "join",
@@ -453,15 +517,22 @@ class GameClient:
         kind = body.get("type")
         if kind == "joined":
             if (
-                body.get("public_key") != self.key.public_hex
+                self.spectate
+                or body.get("public_key") != self.key.public_hex
                 or body.get("client_commitment") != self.client_commitment
                 or body.get("room_id") != self.room_id
                 or self.seat is not None
+                or type(body.get("seat")) is not int
+                or (self.wanted_seat is not None and body["seat"] != self.wanted_seat)
             ):
-                raise ServerMisbehaved("the server seated another key or commitment")
+                raise ServerMisbehaved(
+                    "the server seated another key, commitment or seat"
+                )
+            self._check_room(body.get("room"), "the join")
             self.seat = body["seat"]
             self.room = body["room"]
         elif kind == "room":
+            self._check_room(body.get("room"), "a room message")
             self.room = body["room"]
         elif kind == "commitments":
             if self.commitments is not None:
@@ -475,11 +546,15 @@ class GameClient:
             self._check_commitments(body)
             self.commitments = body
             if not self.spectate and self.seat is not None:
+                statement = reveal_statement(digest(body))
                 self._reveal = {
                     "type": "reveal",
                     "client_seed": self.client_seed,
-                    "sig": self.key.sign(reveal_statement(digest(body))),
+                    "sig": self.key.sign(statement),
                 }
+                self._unreceipted[submission_digest(statement, self._reveal["sig"])] = (
+                    self._reveal
+                )
                 await ws.send(json.dumps(self._reveal))
         elif kind == "received":
             submission = body.get("submission")
@@ -492,23 +567,40 @@ class GameClient:
             await self._on_error(body)
         elif kind == "aborted":
             seed = body.get("server_seed")
-            if seed is not None and (
-                not is_hex(seed, 32) or seed_commitment(seed) != self.server_commitment
-            ):
-                raise ServerMisbehaved("the void does not open the server's commitment")
+            if not is_hex(seed, 32) or seed_commitment(seed) != self.server_commitment:
+                raise ServerMisbehaved(
+                    "the void does not reveal the seed the server committed to"
+                )
+            self._close_decision()
             return {"aborted": body}
         elif kind in GAME_MESSAGES:
             if kind == "before":
                 self._check_before(body)
             self.table.update(body)
             # Any newer game message supersedes an open decision.
-            self._pending = self._answer = None
+            self._close_decision()
             if kind == "decide":
                 self._pending = self.messages[-1]
+                self._pending_since = asyncio.get_running_loop().time()
                 self._start_decision(decide)
             elif kind == "after":
                 return {"aborted": None}
         return None
+
+    def _close_decision(self) -> None:
+        """A newer message closed the open decision: if we had not answered
+        it, keep a record (the server timed us out, or so it says)."""
+        pending = self._pending
+        if pending is not None and self._answer is None:
+            elapsed = asyncio.get_running_loop().time() - self._pending_since
+            self.unanswered.append(
+                {
+                    "index": pending["body"].get("index"),
+                    "seq": pending["seq"],
+                    "ms": int(elapsed * 1000),
+                }
+            )
+        self._pending = self._answer = None
 
     def _answer_digest(self) -> Optional[str]:
         if self._answer is None:
@@ -516,32 +608,46 @@ class GameClient:
         return submission_digest(self._answer["statement"], self._answer["sig"])
 
     def _check_commitments(self, body: dict) -> None:
+        seats = body.get("seats")
         if (
             sorted(body) != sorted(COMMITMENTS_FIELDS)
             or body.get("room_id") != self.room_id
+            or body.get("server_key") != self.server_key
             or body.get("seed_commitment") != self.server_commitment
-            or body.get("config") != self.config
+            or canonical(body.get("config")) != canonical(self.config)
             or type(body.get("reveal_timeout_ms")) is not int
-            or not isinstance(body.get("seats"), list)
+            or not isinstance(seats, list)
+            or not all(isinstance(s, dict) for s in seats)
         ):
-            raise ServerMisbehaved("the commitments change the room's rules or seed")
+            raise ServerMisbehaved(
+                "the commitments change the room's server, rules or seed"
+            )
+        keys = [s.get("public_key") for s in seats if s.get("kind") == "remote"]
+        if len(keys) != len(set(keys)):
+            raise ServerMisbehaved("the commitments seat one key twice")
+        for index, seat in enumerate(seats):
+            # Every seat, not just ours: a reveal signs them all (C), so a
+            # seat whose own join does not check would be revealed into.
+            if not self._seat_ok(index, seat):
+                raise ServerMisbehaved(f"the commitments' seat {index} is malformed")
         if not self.spectate and self.seat is not None:
-            mine = [
-                s
-                for s in body["seats"]
-                if isinstance(s, dict) and s.get("public_key") == self.key.public_hex
-            ]
+            mine = [s for s in seats if s.get("public_key") == self.key.public_hex]
             if (
                 len(mine) != 1
+                or mine[0].get("kind") != "remote"
                 or mine[0].get("seat") != self.seat
+                or mine[0].get("requested_seat") != self.wanted_seat
                 or mine[0].get("client_commitment") != self.client_commitment
+                or mine[0].get("nonce") != self._join_nonce
                 or not verify_signature(
                     self.key.public_hex,
                     join_statement(
                         self.room_id,
+                        self.server_key,
                         self.server_commitment,
                         mine[0].get("requested_seat"),
                         self.client_commitment,
+                        mine[0].get("nonce"),
                     ),
                     mine[0].get("pop"),
                 )
@@ -550,11 +656,42 @@ class GameClient:
                     "the commitments do not seat this client as it joined"
                 )
 
+    def _seat_ok(self, index: int, seat: dict) -> bool:
+        if sorted(seat) != sorted(SEAT_FIELDS) or seat.get("seat") != index:
+            return False
+        if seat.get("kind") == "bot":
+            return all(
+                seat.get(k) is None
+                for k in ("public_key", "client_commitment", "nonce", "pop")
+            )
+        requested = seat.get("requested_seat")
+        return (
+            seat.get("kind") == "remote"
+            and is_hex(seat.get("public_key"), 32)
+            and is_hex(seat.get("client_commitment"), 32)
+            and is_hex(seat.get("nonce"), 16)
+            and (requested is None or (type(requested) is int and requested == index))
+            and verify_signature(
+                seat["public_key"],
+                join_statement(
+                    self.room_id,
+                    self.server_key,
+                    self.server_commitment,
+                    requested,
+                    seat["client_commitment"],
+                    seat["nonce"],
+                ),
+                seat.get("pop"),
+            )
+        )
+
     def _check_before(self, body: dict) -> None:
+        if body.get("seed_commitment") != self.server_commitment:
+            raise ServerMisbehaved("the game names another seed commitment")
         if self.commitments is not None and (
-            body.get("commitments") != self.commitments
-            or body.get("config") != self.commitments["config"]
-            or body.get("seats") != self.commitments["seats"]
+            canonical(body.get("commitments")) != canonical(self.commitments)
+            or canonical(body.get("config")) != canonical(self.commitments["config"])
+            or canonical(body.get("seats")) != canonical(self.commitments["seats"])
         ):
             raise ServerMisbehaved("the game is not the one whose seats were committed")
         if not self.spectate:
@@ -629,7 +766,13 @@ class GameClient:
 
     async def _on_error(self, body: dict) -> None:
         logger.warning("server: %s", body.get("message"))
-        if body.get("answers") in ("join", "spectate") and body.get("code") in (
+        joining = self._join_sent and self.seat is None and not self.spectate
+        if (
+            body.get("answers") == "join"
+            and joining
+            or body.get("answers") == "spectate"
+            and self.spectate
+        ) and body.get("code") in (
             "seat_taken",
             "room_full",
             "bad_join",
@@ -646,15 +789,18 @@ class GameClient:
     def _finish(self, aborted: Optional[dict] = None) -> GameResult:
         path = self.save_transcript()
         verified, report = None, None
-        if aborted is not None:
-            verified = False
-        elif self.verify:
+        if self.verify:
             from catanatron.server.verify import verify_transcript
 
-            report = verify_transcript(self.transcript())
+            report = verify_transcript(json.loads(json.dumps(self.transcript())))
             verified = report.ok
-            if not report.ok:
-                logger.error("transcript verification failed: %s", report.errors)
+            if report.errors or report.invalid:
+                logger.error(
+                    "transcript verification failed: %s",
+                    report.errors or report.invalid,
+                )
+        elif aborted is not None:
+            verified = False
         return GameResult(
             room_id=self.room_id,
             game_id=self.table.game_id,

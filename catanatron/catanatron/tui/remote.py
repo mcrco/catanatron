@@ -165,15 +165,19 @@ class RemoteSession(Session):
             raise CommandError("not connected")
         transcript = json.loads(json.dumps(self.client.transcript()))
         self.report = await asyncio.to_thread(verify_transcript, transcript)
-        if self.report.ok:
-            self.note(f"transcript verified: {_counts(self.report)}")
-        elif self.report.void is not None and not self.report.errors:
-            void = self.report.void
+        report = self.report
+        if report.ok:
+            self.note(f"transcript verified: {_counts(report)}")
+        elif report.verdict == "VOID":
+            void = report.void
             blame = f" (blamed seats: {void.get('blame')})" if void.get("blame") else ""
             self.note(f"the game is void: {void.get('reason')}{blame}", error=True)
+        elif report.verdict == "INCOMPLETE":
+            self.note(f"transcript incomplete: {report.incomplete}", error=True)
         else:
+            problems = report.errors or report.invalid
             self.note(
-                "transcript verification FAILED: " + "; ".join(self.report.errors[:3]),
+                f"transcript verification {report.verdict}: " + "; ".join(problems[:3]),
                 error=True,
             )
         return self.report

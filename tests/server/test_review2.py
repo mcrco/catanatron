@@ -84,6 +84,7 @@ class ImpersonationRoom(Room):
             v["pop"],
         )
         seat.client_seed, seat.reveal_sig = v["seed"], v["reveal"]
+        seat.nonce = v["nonce"]
 
     async def _remote_decision(self, seat, playable):
         if seat.index != 1:
@@ -112,6 +113,7 @@ def test_a_players_signatures_cannot_be_carried_into_another_game():
                 "public_key": blue.key.public_hex,
                 "commitment": first.seats[1].client_commitment,
                 "pop": first.seats[1].pop,
+                "nonce": first.seats[1].nonce,
                 "seed": first.seats[1].client_seed,
                 "reveal": first.seats[1].reveal_sig,
                 "sent": blue.sent,

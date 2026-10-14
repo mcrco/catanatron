@@ -7,7 +7,7 @@
 // transcript, which it stores in IndexedDB for `catanatron-verify`.
 "use strict";
 
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 const GENESIS = "0".repeat(64);
 const RESOURCES = ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"];
 const DEV_CARDS = ["KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT"];
@@ -30,11 +30,43 @@ const $ = (selector) => document.querySelector(selector);
 // ===== bytes, hashes, canonical JSON =====
 // Must produce the bytes of Python's json.dumps(sort_keys=True,
 // separators=(",", ":"), ensure_ascii=False) for what the protocol signs.
+// Keys sort by code point, as Python's sort_keys does (JavaScript's own sort
+// compares UTF-16 units, which differs above U+FFFF).
+function byCodePoint(a, b) {
+  const x = Array.from(a), y = Array.from(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    const d = x[i].codePointAt(0) - y[i].codePointAt(0);
+    if (d) return d;
+  }
+  return x.length - y.length;
+}
 function canonical(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
-  return "{" + Object.keys(value).sort()
+  return "{" + Object.keys(value).sort(byCodePoint)
     .map((k) => JSON.stringify(k) + ":" + canonical(value[k])).join(",") + "}";
+}
+// The protocol's numbers are integers every client represents exactly. A
+// float or a larger integer on the wire would parse here into something
+// Python reads otherwise (5.0 is 5 here, not there), so such a message is
+// refused before it is parsed, whatever its signature says.
+function numbersOk(text) {
+  const n = text.length;
+  for (let i = 0; i < n; i++) {
+    const c = text[i];
+    if (c === '"') {
+      for (i++; i < n && text[i] !== '"'; i++) if (text[i] === "\\") i++;
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = c === "-" ? i + 1 : i;
+      while (j < n && text[j] >= "0" && text[j] <= "9") j++;
+      if (j < n && (text[j] === "." || text[j] === "e" || text[j] === "E")) return false;
+      if (!Number.isSafeInteger(Number(text.slice(i, j)))) return false;
+      i = j - 1;
+    }
+  }
+  return true;
 }
 const utf8 = (text) => new TextEncoder().encode(text);
 const toHex = (bytes) => Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -100,6 +132,16 @@ async function verifyEnvelope(serverKeyHex, env) {
 function checkedKey(key) {
   if (typeof key !== "string" || !HEX64.test(key)) throw new Error("the server's key is not an Ed25519 key");
   return key;
+}
+async function verifyHex(publicHex, obj, sigHex) {
+  if (!subtle || noEd25519) return null;
+  try {
+    if (!HEX64.test(publicHex) || typeof sigHex !== "string" || !/^[0-9a-f]{128}$/.test(sigHex)) return false;
+    const key = await subtle.importKey("raw", fromHex(publicHex), { name: "Ed25519" }, false, ["verify"]);
+    return await subtle.verify({ name: "Ed25519" }, key, fromHex(sigHex), utf8(canonical(obj)));
+  } catch (error) {
+    return false;
+  }
 }
 async function sha256OfHex(hex) { return toHex(await subtle.digest("SHA-256", fromHex(hex))); }
 async function clientSeedCommitment(roomId, publicKey, clientSeed) {
@@ -299,32 +341,34 @@ function storeSeat(key, saved) {
     else localStorage.removeItem(key);
   } catch (error) { console.warn("could not store the seat", error); }
 }
-const COMMITMENTS_FIELDS = ["config", "reveal_timeout_ms", "room_id", "seats", "seed_commitment", "type"];
+const COMMITMENTS_FIELDS = ["config", "reveal_timeout_ms", "room_id", "seats", "seed_commitment", "server_key", "type"];
+const SEAT_FIELDS = ["client_commitment", "color", "kind", "name", "nonce", "pop", "public_key", "requested_seat", "seat", "spec"];
 // How long to wait, once the game is over, for receipts still owed.
 const RECEIPT_WAIT_MS = 5000;
+const NONCE = /^[0-9a-f]{32}$/;
 
 class Session {
   // The page keeps the protocol's invariants on its own (PROTOCOL.md): it
   // signs exactly one reveal per room and server key, for the first
-  // commitments it gets and with the seed it joined with; it signs one
-  // answer per decision and resends, after a reconnect, exactly that.
+  // commitments it gets and with the seed it joined with; it plays and
+  // signs only under those commitments; it signs one answer per decision
+  // and resends, after a reconnect, exactly that. A seat record whose game
+  // ended is never used to sit again.
   constructor(roomId) {
     this.roomId = roomId;
     this.storageKey = null; // known once the server's key is (first hello)
-    this.saved = null; // { identity, clientSeed, clientCommitment, pop, seat, color, joined, reveal, sent, unreceipted }
+    this.saved = null; // the seat record (see takeSeat)
     this.identity = null;
     this.spectating = false;
     this.joining = false;
     this.started = Date.now();
     this.resetTranscript();
     this.room = null;
-    this.commitments = null;
     this.game = null; // the table: before's static parts, state, log
     this.pending = null; // { env, hash, body }
     this.answered = false;
     this.answer = null; // the signed action for the pending decide
     this.answerDigest = null;
-    this.C = null; // the digest of this game's commitments, which every move signs
     this.closed = false;
     this.verifiedCount = 0;
     this.unverified = 0;
@@ -338,13 +382,17 @@ class Session {
     this.messages = []; // raw text, exactly as received
     this.head = GENESIS;
     this.joinedAt = undefined;
+    this.commitments = null; // the commitments accepted on this chain
+    this.C = null; // their digest, which every move signs
+    this.ended = null; // "after" or "aborted": the chain's end
   }
   // A join went out from this page (it may hold a seat even if "joined" was lost).
-  get joinSent() { return Boolean(this.saved && this.saved.identity); }
+  get joinSent() { return Boolean(this.saved && this.saved.identity && !this.saved.closed); }
   get seated() { return Boolean(this.saved && this.saved.joined); }
   get sent() { return this.saved ? this.saved.sent : []; }
-  get unreceipted() { return this.saved ? this.saved.unreceipted : []; }
+  get unreceipted() { return this.saved && !this.saved.closed ? this.saved.unreceipted : []; }
   persist() { if (this.storageKey) storeSeat(this.storageKey, this.saved); }
+  remember(changes) { this.saved = { ...this.saved, ...changes }; this.persist(); }
 
   connect() {
     this.ws = new WebSocket(wsUrl("/room/" + this.roomId));
@@ -378,6 +426,7 @@ class Session {
   }
 
   async receive(text) {
+    if (!numbersOk(text)) throw new Error("a message with a number the protocol does not allow (a float, or beyond 2**53)");
     const env = JSON.parse(text);
     if (this.first) {
       this.first = false;
@@ -388,13 +437,14 @@ class Session {
         this.serverKey = key;
         this.storageKey = seatStorageKey(key, this.roomId);
         this.saved = loadSeat(this.storageKey);
+        if (this.saved && this.saved.seedCommitment) this.serverCommitment = this.saved.seedCommitment;
       }
       if (this.joinSent) {
         // Taking back our seat: this connection's hello opens a throw-away
         // chain; our key signs its nonce, and the seat's own chain resumes
         // after our last message.
         if ((await verifyEnvelope(this.serverKey, env)) === false) throw new Error("bad signature on hello");
-        if (!/^[0-9a-f]{32}$/.test(body.nonce || "")) throw new Error("the hello carries no nonce to sign");
+        if (!NONCE.test(body.nonce || "")) throw new Error("the hello carries no nonce to sign");
         if (!this.identity) this.identity = await loadIdentity(this.saved.identity);
         this.resyncing = true;
         const sig = await signHex(this.identity.privateKey, { domain: "catanatron-rejoin/1", room_id: this.roomId, nonce: body.nonce });
@@ -406,10 +456,11 @@ class Session {
         return;
       }
       // A connection of our own: a new chain (watching, or before sitting).
+      // (A seat record whose game ended is history: it is never sat in again.)
       this.resetTranscript();
+      if (this.saved && this.saved.closed) this.spectating = true;
       if (this.spectating) {
         this.game = null;
-        this.commitments = null;
         await this.accept(text, env);
         this.send({ type: "spectate" });
         return;
@@ -417,20 +468,25 @@ class Session {
       this.joining = false;
       await this.accept(text, env);
       if (body.protocol_version !== PROTOCOL_VERSION) throw new Error(`the server speaks protocol ${body.protocol_version}`);
-      if (this.serverCommitment && (body.room.seed_commitment !== this.serverCommitment ||
-          canonical(body.room.config) !== canonical(this.room.config))) {
-        throw new Error("the room changed its seed commitment or rules");
-      }
+      this.checkRoom(body.room, "the hello", !this.serverCommitment);
       this.room = body.room;
       this.serverCommitment = body.room.seed_commitment;
+      this.helloNonce = body.nonce;
       if (body.room.status !== "waiting") this.spectate(); // too late to sit
       render();
       return;
     }
     if (this.resyncing) {
       if (!(env.seq === this.messages.length && env.prev === this.head)) {
-        // Still the throw-away chain: check it, but keep it out of ours.
+        // Still the throw-away chain: check it, but keep it out of ours. A
+        // message for our key that does not continue our chain is another
+        // chain for this seat: refused.
         if ((await verifyEnvelope(this.serverKey, env)) === false) throw new Error("bad signature while rejoining");
+        if (this.seated && env.to === this.saved.identity.publicHex) {
+          this.resyncing = false;
+          this.ws.close();
+          throw new Error("the server resent another chain for this seat");
+        }
         if (env.body.type === "error") this.rejoinRefused(env.body);
         return;
       }
@@ -441,9 +497,9 @@ class Session {
   }
 
   rejoinRefused(body) {
-    if (body.code === "not_seated" && !(this.saved && this.saved.reveal)) {
+    if (body.code === "not_seated" && !(this.saved && (this.saved.reveal || this.saved.joined))) {
       // Our join never landed (or the seat was freed while we were away,
-      // before any seed was revealed): forget it and look at the room afresh.
+      // before any seed was asked for): forget it and look at the room afresh.
       this.saved = null;
       this.persist();
       this.identity = null;
@@ -453,6 +509,17 @@ class Session {
     }
     this.problems.push(body.message);
     render();
+  }
+
+  // Every description of the room names it, its seed commitment and its
+  // rules as they were when this page first saw it (or sat).
+  checkRoom(room, where, first) {
+    if (!room || room.id !== this.roomId) throw new Error(`${where} names another room`);
+    if (first) return;
+    if (room.seed_commitment !== this.serverCommitment ||
+        (this.room && canonical(room.config) !== canonical(this.room.config))) {
+      throw new Error(`${where} changes the room's seed commitment or rules`);
+    }
   }
 
   async accept(text, env) {
@@ -473,26 +540,36 @@ class Session {
 
   async handle(env) {
     const body = env.body;
+    if (this.ended && body.type !== "received" && body.type !== "error") {
+      this.problems.push(`a ${String(body.type).slice(0, 40)} message after the ${this.ended}`);
+      render();
+      return;
+    }
     switch (body.type) {
       case "joined": {
         this.joining = false;
-        const mine = this.saved && this.identity && body.public_key === this.identity.publicHex &&
-          body.client_commitment === this.saved.clientCommitment && body.room_id === this.roomId;
-        if (!mine) {
-          this.problems.push("the server seated another key or seed commitment than this page's");
+        const mine = this.saved && this.identity && !this.saved.joined && this.joinedAt === undefined &&
+          body.public_key === this.identity.publicHex && body.room_id === this.roomId &&
+          body.client_commitment === this.saved.clientCommitment &&
+          (this.saved.requested === null || body.seat === this.saved.requested);
+        if (!mine && !(this.saved && this.saved.joined && this.joinedAt === undefined &&
+            body.public_key === this.identity.publicHex && body.seat === this.saved.seat &&
+            body.client_commitment === this.saved.clientCommitment)) {
+          this.problems.push("the server seated another key, seed commitment or seat than this page's");
           break;
         }
+        this.checkRoom(body.room, "the join");
         this.joinedAt = env.seq;
-        this.saved = { ...this.saved, joined: true, seat: body.seat, color: body.color };
-        this.persist();
+        this.remember({ joined: true, seat: body.seat, color: body.color });
         this.room = body.room;
         break;
       }
       case "hello": // the seat chain's first message, resent after a reload
+        this.checkRoom(body.room, "the seat's hello");
         this.room = body.room;
-        this.serverCommitment = body.room.seed_commitment;
         break;
       case "room":
+        this.checkRoom(body.room, "a room message");
         this.room = body.room;
         break;
       case "commitments":
@@ -517,23 +594,28 @@ class Session {
           this.problems.push("the void does not reveal the seed the server committed to");
         }
         this.aborted = body;
+        this.ended = "void";
+        this.closePending();
+        if (this.saved) this.remember({ closed: true });
         this.finish();
         break;
-      case "before": case "step": case "decide": case "after":
-        if (body.type === "before" && this.commitments &&
-            canonical(body.commitments) !== canonical(this.commitments)) {
-          this.problems.push("the game is not the one whose seats were committed");
-        }
-        if (body.type === "before" && this.seated &&
-            (body.client_seeds || [])[this.saved.seat] !== this.saved.clientSeed) {
-          this.problems.push("the game was not seeded with this page's seed");
+      case "before":
+        if (!this.startGame(body)) break;
+        this.update(body);
+        break;
+      case "step": case "decide": case "after":
+        if (!this.game) {
+          this.problems.push(`a ${body.type} message before the game`);
+          break;
         }
         this.update(body);
-        this.pending = null;
-        this.answered = false;
-        this.answer = null;
+        this.closePending();
         if (body.type === "decide") this.pending = { env, hash: env.hash, body, received: Date.now() };
-        if (body.type === "after") this.finish();
+        if (body.type === "after") {
+          this.ended = "game";
+          if (this.saved) this.remember({ closed: true });
+          this.finish();
+        }
         break;
       default:
         this.problems.push(`unexpected ${String(body.type).slice(0, 40)} message`);
@@ -541,12 +623,50 @@ class Session {
     render();
   }
 
+  // A seated page plays only the game of the commitments it revealed for,
+  // received on this chain; nobody plays a game whose seed commitment or
+  // seats are not the room's.
+  startGame(body) {
+    if (body.seed_commitment !== this.serverCommitment) {
+      this.problems.push("the game names another seed commitment");
+      return false;
+    }
+    if (this.commitments && canonical(body.commitments) !== canonical(this.commitments)) {
+      this.problems.push("the game is not the one whose seats were committed");
+      return false;
+    }
+    if (this.seated) {
+      if (!this.commitments || !this.saved.reveal || this.saved.reveal.commitments !== this.C) {
+        this.problems.push("the game is not the one this page revealed its seed for");
+        return false;
+      }
+      if ((body.client_seeds || [])[this.saved.seat] !== this.saved.clientSeed) {
+        this.problems.push("the game was not seeded with this page's seed");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  closePending() {
+    // A newer message closed the open decision: if this page had not
+    // answered it, keep a record (the server timed it out, or so it says).
+    if (this.pending && !this.answered && this.seated) {
+      const note = { index: this.pending.body.index, seq: this.pending.env.seq, ms: Date.now() - this.pending.received };
+      this.remember({ unanswered: [...(this.saved.unanswered || []), note] });
+    }
+    this.pending = null;
+    this.answered = false;
+    this.answer = null;
+  }
+
   async onCommitments(body) {
     const fields = Object.keys(body).sort().join(",");
     if (fields !== COMMITMENTS_FIELDS.join(",") || body.room_id !== this.roomId ||
-        body.seed_commitment !== this.serverCommitment ||
+        body.server_key !== this.serverKey || body.seed_commitment !== this.serverCommitment ||
+        !Number.isInteger(body.reveal_timeout_ms) || !Array.isArray(body.seats) ||
         (this.room && canonical(body.config) !== canonical(this.room.config))) {
-      this.problems.push("the commitments change the room's rules or seed");
+      this.problems.push("the commitments change the room's server, rules or seed");
       return;
     }
     if (this.commitments) {
@@ -555,29 +675,75 @@ class Session {
       if (canonical(body) !== canonical(this.commitments)) this.problems.push("a second, different commitments for this room");
       return;
     }
+    const C = subtle ? await sha256Hex(canonical(body)) : null;
+    if (this.seated && this.saved.reveal && this.saved.reveal.commitments !== C) {
+      // A reload replaying the chain: this page revealed already, for other
+      // commitments. These are refused, and nothing is signed under them.
+      this.problems.push("a second, different commitments for this room");
+      return;
+    }
     this.commitments = body;
-    if (subtle) this.C = await sha256Hex(canonical(body));
+    this.C = C;
     if (!this.seated) {
       if (!this.joining) this.spectating = true; // the server made us a spectator
       return;
     }
     if (this.saved.reveal) {
-      // A reload replaying the chain: this page revealed already, for these
-      // commitments only.
-      if (this.saved.reveal.commitments !== this.C) this.problems.push("a second, different commitments for this room");
-      else if (!this.game) this.send(this.revealRequest());
+      if (!this.game) this.send(this.revealRequest());
       return;
     }
-    const mine = body.seats.find((s) => s && s.public_key === this.saved.identity.publicHex);
-    if (!mine || mine.seat !== this.saved.seat || mine.client_commitment !== this.saved.clientCommitment) {
-      this.problems.push("the commitments do not seat this page as it joined");
+    const problem = await this.mySeatProblem(body);
+    if (problem) {
+      this.problems.push(problem);
       return;
+    }
+    const sig = await signHex(this.identity.privateKey, { domain: "catanatron-reveal/1", commitments: C });
+    const digest = await sha256Hex(canonical({ statement: { domain: "catanatron-reveal/1", commitments: C }, sig }));
+    this.remember({ reveal: { commitments: C, sig, digest } });
+    this.send(this.revealRequest());
+  }
+  async mySeatProblem(body) {
+    const keys = body.seats.filter((s) => s && s.kind === "remote").map((s) => s.public_key);
+    if (new Set(keys).size !== keys.length) return "the commitments seat one key twice";
+    // Every seat, not just ours: a reveal signs them all.
+    for (const [index, seat] of body.seats.entries()) {
+      if (!seat || Object.keys(seat).sort().join(",") !== SEAT_FIELDS.join(",") || seat.seat !== index) {
+        return `the commitments' seat ${index} is malformed`;
+      }
+      if (seat.kind === "bot") {
+        if (seat.public_key !== null || seat.client_commitment !== null || seat.nonce !== null || seat.pop !== null) {
+          return `the commitments' seat ${index} is malformed`;
+        }
+        continue;
+      }
+      const requested = seat.requested_seat;
+      const statement = {
+        domain: "catanatron-join/2", room_id: this.roomId, server_key: this.serverKey,
+        seed_commitment: this.serverCommitment, seat: requested,
+        client_commitment: seat.client_commitment, nonce: seat.nonce,
+      };
+      if (seat.kind !== "remote" || !(requested === null || requested === index) ||
+          !NONCE.test(seat.nonce || "") || !(await verifyHex(seat.public_key, statement, seat.pop))) {
+        return `the commitments' seat ${index} is malformed`;
+      }
+    }
+    const mine = body.seats.filter((s) => s && s.public_key === this.saved.identity.publicHex);
+    const seat = mine[0];
+    if (mine.length !== 1 || Object.keys(seat).sort().join(",") !== SEAT_FIELDS.join(",") ||
+        seat.kind !== "remote" || seat.seat !== this.saved.seat || seat.requested_seat !== this.saved.requested ||
+        seat.client_commitment !== this.saved.clientCommitment || seat.nonce !== this.saved.nonce) {
+      return "the commitments do not seat this page as it joined";
+    }
+    const statement = {
+      domain: "catanatron-join/2", room_id: this.roomId, server_key: this.serverKey,
+      seed_commitment: this.serverCommitment, seat: seat.requested_seat,
+      client_commitment: seat.client_commitment, nonce: seat.nonce,
+    };
+    if (!(await verifyHex(this.saved.identity.publicHex, statement, seat.pop))) {
+      return "the commitments do not carry this page's own join signature";
     }
     if (!this.identity) this.identity = await loadIdentity(this.saved.identity);
-    const sig = await signHex(this.identity.privateKey, { domain: "catanatron-reveal/1", commitments: this.C });
-    this.saved = { ...this.saved, reveal: { commitments: this.C, sig } };
-    this.persist();
-    this.send(this.revealRequest());
+    return null;
   }
   revealRequest() {
     return { type: "reveal", client_seed: this.saved.clientSeed, sig: this.saved.reveal.sig };
@@ -586,9 +752,9 @@ class Session {
   onReceipt(body) {
     if (this.saved) {
       const left = this.saved.unreceipted.filter((u) => u.digest !== body.submission);
-      if (left.length !== this.saved.unreceipted.length) {
-        this.saved = { ...this.saved, unreceipted: left };
-        this.persist();
+      if (left.length !== this.saved.unreceipted.length) this.remember({ unreceipted: left });
+      if (this.saved.reveal && this.saved.reveal.digest === body.submission && body.accepted) {
+        this.remember({ reveal: { ...this.saved.reveal, receipted: true } });
       }
     }
     // A refusal of the answer we are waiting on (not of an older one resent).
@@ -600,9 +766,9 @@ class Session {
 
   resume() {
     // After a rejoin: finish what the drop interrupted, by resending exactly
-    // what was signed. Resending is harmless (the server's receipt says
-    // "stale" for what it already had).
-    if (this.saved.reveal && !this.game) this.send(this.revealRequest());
+    // what was signed and has no receipt yet. Resending is harmless (the
+    // server's receipt says "stale" for what it already had).
+    if (this.saved.reveal && !this.saved.reveal.receipted && !this.game) this.send(this.revealRequest());
     for (const owed of this.unreceipted) this.send(owed.answer);
   }
 
@@ -625,22 +791,24 @@ class Session {
 
   async takeSeat(index) {
     if (cryptoProblem) { alert(cryptoProblem); return; }
-    if (this.joining || this.joinSent || !this.storageKey) return; // one join at a time
+    if (this.joining || this.joinSent || !this.storageKey || !NONCE.test(this.helloNonce || "")) return; // one join at a time
     this.joining = true;
     render();
     this.identity = await newIdentity();
     const clientSeed = randomHex(32);
     const clientCommitment = await clientSeedCommitment(this.roomId, this.identity.publicHex, clientSeed);
     const statement = {
-      domain: "catanatron-join/1", room_id: this.roomId, seed_commitment: this.serverCommitment,
-      seat: index, client_commitment: clientCommitment,
+      domain: "catanatron-join/2", room_id: this.roomId, server_key: this.serverKey,
+      seed_commitment: this.serverCommitment, seat: index, client_commitment: clientCommitment,
+      nonce: this.helloNonce,
     };
     const pop = await signHex(this.identity.privateKey, statement);
     // Kept before the join goes out: if "joined" is lost, the key takes the
-    // seat back.
+    // seat back. A fresh key and seed for every seat, never used again.
     this.saved = {
       identity: { publicHex: this.identity.publicHex, privatePkcs8: this.identity.privatePkcs8 },
-      clientSeed, clientCommitment, pop, joined: false, sent: [], unreceipted: [],
+      clientSeed, clientCommitment, pop, nonce: this.helloNonce, requested: index,
+      seedCommitment: this.serverCommitment, joined: false, sent: [], unreceipted: [], unanswered: [],
     };
     this.persist();
     this.send({
@@ -658,7 +826,9 @@ class Session {
   }
 
   async act(action) {
-    if (!this.pending || this.answered) return;
+    if (!this.pending || this.answered || this.ended) return;
+    // Only under the commitments this page revealed for.
+    if (!this.saved || !this.saved.reveal || this.C !== this.saved.reveal.commitments) return;
     this.answered = true;
     const pending = this.pending;
     const statement = {
@@ -670,20 +840,18 @@ class Session {
     this.answerDigest = await sha256Hex(canonical({ statement, sig }));
     // Kept with the seat (a reload keeps them): what was sent, for the
     // verifier, and what is owed a receipt, resent until it gets one.
-    this.saved = {
-      ...this.saved,
+    this.remember({
       sent: [...this.saved.sent, { statement, sig, sent_after: this.messages.length - 1 }],
       unreceipted: [...this.saved.unreceipted, { digest: this.answerDigest, answer: this.answer }],
-    };
-    this.persist();
+    });
     this.send(this.answer);
     render();
   }
 
   transcript() {
-    const seated = this.seated;
+    const seated = this.seated && this.joinedAt !== undefined;
     return {
-      format: "catanatron-transcript/4",
+      format: "catanatron-transcript/5",
       url: wsUrl("/room/" + this.roomId),
       room_id: this.roomId,
       server_key: this.serverKey,
@@ -694,6 +862,7 @@ class Session {
       color: this.game ? this.game.color : null,
       messages: this.messages,
       sent: seated ? this.sent : [],
+      unanswered: seated ? this.saved.unanswered || [] : [],
     };
   }
   finish() {
@@ -703,7 +872,8 @@ class Session {
       : `spectator-${this.started}`;
     this.saveId = `${String(this.serverKey).slice(0, 16)}-${this.roomId}-${this.game ? this.game.gameId : "void"}-${who}`;
     clearTimeout(this.finishTimer);
-    if (this.unreceipted.length && !this.finishWaited) {
+    const owed = this.saved && this.saved.unreceipted ? this.saved.unreceipted.length : 0;
+    if (owed && !this.finishWaited) {
       this.finishWaited = true;
       this.finishTimer = setTimeout(() => saveTranscript(this.saveId, this.transcript()), RECEIPT_WAIT_MS);
       return;
@@ -1061,7 +1231,7 @@ function renderFairness() {
   const s = session;
   const short = (value) => String(value || "").slice(0, 16);
   const lines = [html`<h3>Fairness</h3>`];
-  if (s.room) lines.push(html`<div class="muted">Seed commitment: <code>${short(s.room.seed_commitment)}…</code></div>`);
+  if (s.serverCommitment) lines.push(html`<div class="muted">Seed commitment: <code>${short(s.serverCommitment)}…</code></div>`);
   const key = s.serverKey ? html`; server key <code>${short(s.serverKey)}…</code>` : html``;
   lines.push(html`<div>${s.messages.length} messages, ${s.verifiedCount} signatures checked here${key}</div>`);
   if (s.unverified) lines.push(html`<div class="error">${s.unverified} messages could not be checked in this browser: this session is unverified.</div>`);

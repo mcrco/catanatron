@@ -321,7 +321,7 @@ def test_a_rejoin_signature_is_good_on_one_connection_only():
     taken, replayed, copied = run(scenario())
     assert taken["type"] == "hello"
     assert replayed["code"] == "bad_join" and replayed["answers"] == "rejoin"
-    assert copied["code"] == "duplicate_key"
+    assert copied["code"] == "bad_join"  # the pop names another connection
 
 
 # ===== I13: every submission answered =====

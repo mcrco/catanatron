@@ -383,7 +383,10 @@ def test_two_different_signed_moves_for_one_index_are_reported():
     statement = dict(red.sent[0]["statement"])
     statement["action"] = ["RED", "END_TURN", None]
     red.sent.append({"statement": statement, "sig": red.key.sign(statement)})
-    assert any_error(errors_of(red), "signed 2 different moves")
+    # The client's own doing: it can no longer hold the server to that move.
+    report = verify_transcript(red.transcript())
+    assert not report.errors
+    assert any("signed different moves" in w for w in report.warnings)
 
 
 def test_numbers_must_be_integers():
@@ -929,4 +932,4 @@ def test_catanatron_verify_reports_unreadable_and_malformed_files(tmp_path):
     assert "Traceback" not in result.stderr
     assert f"{good}: OK" in result.stdout
     for path in (bad_json, deep, odd):
-        assert f"{path}: FAILED" in result.stdout
+        assert f"{path}: INVALID" in result.stdout

@@ -42,6 +42,7 @@ from websockets.http11 import Request, Response
 from catanatron.registry import REGISTRY, describe
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import SigningKey
+from catanatron.server.hashing import MAX_SAFE_INTEGER
 from catanatron.server.messages import PROTOCOL_VERSION
 from catanatron.server.room import Outbox, Peer, Room, RoomError, RoomLimits
 
@@ -97,13 +98,21 @@ class _Floats(ValueError):
 
 
 def parse_request(text: Any) -> dict:
-    """A client message: a JSON object whose numbers are all integers."""
+    """A client message: a JSON object whose numbers are all integers that
+    every client can represent exactly."""
 
     def no_float(token):
-        raise _Floats(f"numbers must be integers, got {token}")
+        raise _Floats("numbers must be integers")
+
+    def safe_int(token):
+        if len(token) > 17 or abs(int(token)) > MAX_SAFE_INTEGER:
+            raise _Floats("integers must be at most 2**53 - 1")
+        return int(token)
 
     try:
-        request = json.loads(text, parse_float=no_float, parse_constant=no_float)
+        request = json.loads(
+            text, parse_float=no_float, parse_constant=no_float, parse_int=safe_int
+        )
     except _Floats as error:
         raise RoomError("bad_request", str(error))
     except (ValueError, TypeError, RecursionError) as error:

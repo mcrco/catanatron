@@ -51,16 +51,33 @@ from catanatron.server.maps import board_geometry
 #: 4: one commitments per room (a withheld reveal voids the room; no restart
 #: rounds); rejoining signs the connection's nonce (no seat keys); receipts
 #: for reveals too.
-PROTOCOL_VERSION = 4
+#: 5: the commitments name the server's key (so C does); a join signs the
+#: server's key and its connection's nonce; a void names its game.
+PROTOCOL_VERSION = 5
 
 #: Every field of a commitments body, and nothing else.
 COMMITMENTS_FIELDS = (
     "type",
     "room_id",
+    "server_key",
     "config",
     "seats",
     "seed_commitment",
     "reveal_timeout_ms",
+)
+
+#: Every field of a seat in the commitments.
+SEAT_FIELDS = (
+    "seat",
+    "color",
+    "kind",
+    "name",
+    "spec",
+    "public_key",
+    "requested_seat",
+    "client_commitment",
+    "nonce",
+    "pop",
 )
 
 GAME_MESSAGES = ("before", "decide", "step", "after")
@@ -92,6 +109,7 @@ def playable_json(game: Game) -> list:
 def commitments_body(
     room_id: str,
     *,
+    server_key: str,
     config: dict,
     seats: list,
     seed_commitment: str,
@@ -100,6 +118,7 @@ def commitments_body(
     return {
         "type": "commitments",
         "room_id": room_id,
+        "server_key": server_key,
         "config": config,
         "seats": seats,
         "seed_commitment": seed_commitment,
@@ -200,11 +219,18 @@ def after_body(game: Game, doc: dict, color: Optional[str], *, reveal: dict) -> 
 
 
 def aborted_body(
-    room_id: str, *, reason: str, blame: list, server_seed: Optional[str]
+    room_id: str,
+    *,
+    game_id: Optional[str],
+    reason: str,
+    blame: list,
+    server_seed: Optional[str],
 ) -> dict:
+    """``game_id`` is the game's if it had started (None: void before it)."""
     return {
         "type": "aborted",
         "room_id": room_id,
+        "game_id": game_id,
         "reason": reason,
         "blame": blame,
         "server_seed": server_seed,

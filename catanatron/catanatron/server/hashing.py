@@ -33,6 +33,25 @@ def canonical(obj: Any) -> bytes:
     ).encode("utf-8")
 
 
+#: The largest integer every client represents exactly (JavaScript's
+#: Number.MAX_SAFE_INTEGER): the protocol's numbers stay within it.
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def numbers_ok(value: Any) -> bool:
+    """Whether every number in ``value`` is an integer every client reads
+    alike (no floats, nothing beyond 2**53)."""
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return True
+    if isinstance(value, int):
+        return abs(value) <= MAX_SAFE_INTEGER
+    if isinstance(value, list):
+        return all(numbers_ok(v) for v in value)
+    if isinstance(value, dict):
+        return all(numbers_ok(v) for v in value.values())
+    return False
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

@@ -695,7 +695,9 @@ def test_seat_records_belong_to_one_server():
             return await run_session(base, room["id"], "foreign-record")
 
     transcript = run(scenario())
-    assert transcript["sends"][0] == "join" and "rejoin" not in transcript["sends"]
+    # The foreign records were never used: the page joined with a key of its
+    # own (later rejoins, after a dropped connection, use that one).
+    assert transcript["sends"][0] == "join"
     assert verify_transcript(transcript).ok
 
 
@@ -786,3 +788,316 @@ def test_saved_transcripts_wait_for_receipts_and_are_never_made_poorer():
     assert out["extended"] == 4 and out["both"] == 2
     assert out["savedBeforeReceipt"] == 0
     assert out["savedAfterReceipt"] == 1 and out["withReceipt"]
+
+
+# ===== round 5: the page against scripted (dishonest) chains =====
+SCRIPT_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const readline = require("readline");
+const [roomId, appJs] = process.argv.slice(-2);
+const store = new Map();
+globalThis.window = { crypto: globalThis.crypto, addEventListener() {} };
+globalThis.document = { querySelector() { return null; } };
+globalThis.location = { hash: "", protocol: "http:", host: "fake" };
+globalThis.localStorage = {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => store.set(k, String(v)),
+  removeItem: (k) => store.delete(k),
+};
+globalThis.harnessSends = [];
+globalThis.WebSocket = class {
+  constructor(url) { this.url = url; this.readyState = 1; }
+  send(text) { harnessSends.push(JSON.parse(text)); }
+  close() { this.readyState = 3; }
+};
+vm.runInThisContext(fs.readFileSync(appJs, "utf8"));
+vm.runInThisContext(`
+  render = () => {};
+  const room = ${JSON.stringify(roomId)};
+  async function op(cmd) {
+    if (cmd.op === "open") { if (session) session.closed = true; session = new Session(room); session.connect(); }
+    if (cmd.op === "recv") {
+      try { await session.receive(cmd.text); } catch (error) { session.problems.push(String(error.message || error)); }
+    }
+    if (cmd.op === "sit") await session.takeSeat(cmd.seat);
+    if (cmd.op === "act" && session.pending) await session.act(session.pending.body.playable_actions[0]);
+    const sends = harnessSends.splice(0);
+    const saved = session.saved;
+    return { problems: session.problems, sends, C: session.C, seated: session.seated,
+             game: session.game ? session.game.gameId : null, messages: session.messages.length,
+             saved, ended: session.ended };
+  }
+  const lines = require("readline").createInterface({ input: process.stdin });
+  let chain = Promise.resolve();
+  lines.on("line", (line) => {
+    chain = chain.then(async () => process.stdout.write(JSON.stringify(await op(JSON.parse(line))) + "\\n"));
+  });
+`);
+"""
+
+
+class ScriptedPage:
+    """app.js's Session, driven message by message (no sockets)."""
+
+    def __init__(self, room_id):
+        self.room_id = room_id
+
+    async def __aenter__(self):
+        self.process = await asyncio.create_subprocess_exec(
+            "node",
+            "-e",
+            SCRIPT_HARNESS,
+            self.room_id,
+            APP_JS,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        return self
+
+    async def __aexit__(self, *exc):
+        self.process.stdin.close()
+        await self.process.wait()
+
+    async def do(self, **cmd):
+        self.process.stdin.write((json.dumps(cmd) + "\n").encode())
+        await self.process.stdin.drain()
+        line = await asyncio.wait_for(self.process.stdout.readline(), 30)
+        if not line:
+            raise AssertionError((await self.process.stderr.read()).decode()[-2000:])
+        return json.loads(line)
+
+    async def recv(self, envelope):
+        return await self.do(op="recv", text=json.dumps(envelope))
+
+
+class FakeServer:
+    """Builds signed chains for a two-seat room (seat 1 a server bot): what
+    an honest server would send, and what a dishonest one might instead."""
+
+    def __init__(self, room_id="fakeroom"):
+        from catanatron.server.config import GameConfig
+        from catanatron.server.crypto import SigningKey
+
+        self.key = SigningKey.generate()
+        self.room = Room(room_id, GameConfig.from_json({"num_players": 2}), self.key)
+        bot = self.room.seats[1]
+        bot.kind, bot.spec, bot.name = "bot", "R", "R"
+
+    def chain(self):
+        from catanatron.server.room import Outbox
+
+        return Outbox(self.key)
+
+    def hello(self, box):
+        return box.push(self.room.hello_body(box.nonce))
+
+    def joined(self, box, join, seat=0, room=None):
+        from catanatron.server.messages import COMMITMENTS_FIELDS  # noqa: F401
+
+        s = self.room.seats[seat]
+        s.kind, s.name, s.public_key = "remote", "page", join["public_key"]
+        s.requested_seat, s.client_commitment = join["seat"], join["client_commitment"]
+        s.nonce, s.pop = box.nonce, join["pop"]
+        box.to = join["public_key"]
+        return box.push(
+            {
+                "type": "joined",
+                "room_id": self.room.id,
+                "seat": seat,
+                "color": s.color.value,
+                "public_key": join["public_key"],
+                "client_commitment": join["client_commitment"],
+                "room": room or self.room.describe(),
+            }
+        )
+
+    def commitments(self, **changes):
+        from catanatron.server.messages import commitments_body
+
+        body = commitments_body(
+            self.room.id,
+            server_key=self.key.public_hex,
+            config=self.room.config.to_json(),
+            seats=[s.public() for s in self.room.seats],
+            seed_commitment=self.room.seed_commitment,
+            reveal_timeout_ms=30_000,
+        )
+        body.update(changes)
+        return body
+
+    def before(self, commitments, seed, reveal_sig, color="RED"):
+        from catanatron.server.config import new_game
+        from catanatron.server.crypto import digest, master_seed, state_commitment
+        from catanatron.server.messages import before_body
+        from catanatron.serialization import state_to_json
+
+        seeds = [seed, None]
+        game = new_game(
+            self.room.config,
+            master_seed(self.room.server_seed, seeds, digest(commitments)),
+            "g-" + digest(commitments)[:8],
+        )
+        doc = state_to_json(game)
+        body = before_body(
+            game,
+            doc,
+            color,
+            commitments=commitments,
+            client_seeds=seeds,
+            reveals=[reveal_sig, None],
+        )
+        return body, {"index": 0, "hash": state_commitment(doc, "00" * 16)}
+
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js")
+
+
+async def _seated_page(page, server):
+    """The page sits in seat 0 and reveals over the honest commitments."""
+    await page.do(op="open")
+    box = server.chain()
+    await page.recv(server.hello(box))
+    out = await page.do(op="sit", seat=0)
+    join = out["sends"][0]
+    assert join["type"] == "join"
+    await page.recv(server.joined(box, join))
+    commitments = server.commitments()
+    out = await page.recv(box.push(commitments))
+    reveal = out["sends"][-1]
+    assert reveal["type"] == "reveal", out
+    return box, join, commitments, reveal
+
+
+@needs_node
+def test_after_a_reload_the_page_plays_only_the_game_it_revealed_for():
+    """Round 5: after a reload the server answered the rejoin with a fresh
+    seat chain (no commitments, or other ones, or another seed commitment)
+    and a game it chose; the page played it."""
+
+    async def scenario(variant):
+        server = FakeServer()
+        async with ScriptedPage(server.room.id) as page:
+            box, join, commitments, reveal = await _seated_page(page, server)
+            await page.do(op="open")  # the tab reloads
+            throwaway = server.chain()
+            out = await page.recv(server.hello(throwaway))
+            assert out["sends"][0]["type"] == "rejoin"
+            fresh = server.chain()
+            hello = server.room.hello_body(fresh.nonce)
+            if variant == "newseed":
+                hello["room"]["seed_commitment"] = "ab" * 32
+            await page.recv(fresh.push(hello))
+            await page.recv(server.joined(fresh, join))
+            other = server.commitments(reveal_timeout_ms=31_000)
+            if variant == "other":
+                await page.recv(fresh.push(other))
+            body, commit = server.before(other, reveal["client_seed"], reveal["sig"])
+            await page.recv(fresh.push(body, commit))
+            return await page.do(op="act")
+
+    for variant in ("none", "other", "newseed"):
+        out = run(scenario(variant))
+        assert out["problems"], variant
+        assert out["game"] is None, variant
+        assert not [s for s in out["sends"] if s["type"] in ("action", "reveal")]
+
+
+@needs_node
+def test_a_void_ends_the_page_s_chain_and_its_seat():
+    """Round 5: the page played a game sent after a void, and later rejoined
+    a voided room's seat record."""
+
+    async def scenario():
+        server = FakeServer()
+        async with ScriptedPage(server.room.id) as page:
+            box, join, commitments, reveal = await _seated_page(page, server)
+            from catanatron.server.messages import aborted_body
+
+            void = aborted_body(
+                server.room.id,
+                game_id=None,
+                reason="void",
+                blame=[],
+                server_seed=server.room.server_seed,
+            )
+            await page.recv(box.push(void))
+            body, commit = server.before(
+                commitments, reveal["client_seed"], reveal["sig"]
+            )
+            after_void = await page.recv(box.push(body, commit))
+            await page.do(op="open")  # opened again later
+            reopened = await page.recv(server.hello(server.chain()))
+            return after_void, reopened
+
+    after_void, reopened = run(scenario())
+    assert any("after the void" in p for p in after_void["problems"])
+    assert after_void["game"] is None
+    assert [s["type"] for s in reopened["sends"]] == ["spectate"], reopened["sends"]
+
+
+@needs_node
+def test_the_page_checks_its_own_seat_and_every_room_description():
+    """Round 5: the page revealed with its own seat marked a bot's, a bad
+    pop, its key seated twice, or a joined naming another seed commitment
+    or seat."""
+
+    async def scenario(variant):
+        server = FakeServer()
+        async with ScriptedPage(server.room.id) as page:
+            await page.do(op="open")
+            box = server.chain()
+            await page.recv(server.hello(box))
+            join = (await page.do(op="sit", seat=0))["sends"][0]
+            room = None
+            if variant == "joined-seed":
+                room = server.room.describe()
+                room["seed_commitment"] = "cd" * 32
+            seat = 1 if variant == "joined-seat" else 0
+            if seat == 1:
+                server.room.seats[1].kind = "open"
+            out = await page.recv(server.joined(box, join, seat=seat, room=room))
+            if variant in ("joined-seed", "joined-seat"):
+                return out
+            commitments = server.commitments()
+            seats = commitments["seats"]
+            if variant == "kind":
+                seats[0]["kind"] = "bot"
+            elif variant == "pop":
+                seats[0]["pop"] = "00" * 64
+            elif variant == "twice":
+                seats[1] = dict(seats[0], seat=1, color="BLUE")
+            return await page.recv(box.push(commitments))
+
+    for variant in ("kind", "pop", "twice", "joined-seed", "joined-seat"):
+        out = run(scenario(variant))
+        assert out["problems"], variant
+        assert not [s for s in out["sends"] if s["type"] == "reveal"], variant
+
+
+@needs_node
+def test_the_page_refuses_numbers_python_reads_otherwise():
+    """Round 5: the page accepted a float (5.0 parses as 5 in JavaScript,
+    not in Python), so its transcript held a message the verifier rejects."""
+
+    async def scenario():
+        server = FakeServer()
+        async with ScriptedPage(server.room.id) as page:
+            await page.do(op="open")
+            box = server.chain()
+            hello = server.hello(box)
+            text = json.dumps(hello).replace('"seq": 0', '"seq": 0.0', 1)
+            out = await page.do(op="recv", text=text)
+            big = json.dumps(server.hello(server.chain())).replace(
+                '"seq": 0', '"seq": 9007199254740993', 1
+            )
+            out2 = await page.do(op="recv", text=big)
+            return out, out2
+
+    out, out2 = run(scenario())
+    for result in (out, out2):
+        assert result["messages"] == 0
+        assert any(
+            "number the protocol does not allow" in p for p in result["problems"]
+        )

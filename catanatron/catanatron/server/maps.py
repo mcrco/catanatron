@@ -35,6 +35,11 @@ NUMBERS = (2, 3, 4, 5, 6, 8, 9, 10, 11, 12)
 MAX_TILES = 200
 
 
+#: How far from the center a tile may be (well inside what every client
+#: represents exactly, and far beyond any playable board).
+MAX_COORDINATE = 100
+
+
 class MapError(ValueError):
     """A map spec that cannot be played."""
 
@@ -65,10 +70,13 @@ def _tiles_document(spec: Any) -> dict:
         if (
             not isinstance(coordinate, list)
             or len(coordinate) != 3
-            or not all(type(c) is int for c in coordinate)
+            or not all(type(c) is int and abs(c) <= MAX_COORDINATE for c in coordinate)
             or sum(coordinate) != 0
         ):
-            raise MapError(f"{where}: coordinate must be three integers summing to 0")
+            raise MapError(
+                f"{where}: coordinate must be three integers summing to 0, "
+                f"each at most {MAX_COORDINATE} away from the center"
+            )
         coordinate = tuple(coordinate)
         if coordinate in seen:
             raise MapError(f"{where}: {list(coordinate)} appears twice")

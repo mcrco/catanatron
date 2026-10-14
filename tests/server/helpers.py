@@ -83,7 +83,14 @@ def join_request(hello, key=None, seat=None, seed=None, pop_key=None, name="raw"
     seed = seed or random_hex()
     room = hello["room"]
     commitment = client_seed_commitment(room["id"], key.public_hex, seed)
-    statement = join_statement(room["id"], room["seed_commitment"], seat, commitment)
+    statement = join_statement(
+        room["id"],
+        hello["server_key"],
+        room["seed_commitment"],
+        seat,
+        commitment,
+        hello["nonce"],
+    )
     request = {
         "type": "join",
         "protocol_version": PROTOCOL_VERSION,

@@ -223,6 +223,8 @@ class Seat:
     #: The seat it asked for (None: any), as its join signature covers it.
     requested_seat: Optional[int] = None
     client_commitment: Optional[str] = None
+    #: The nonce of the connection it joined on, which its pop signs.
+    nonce: Optional[str] = None
     pop: Optional[str] = None
     client_seed: Optional[str] = None
     reveal_sig: Optional[str] = None
@@ -255,6 +257,7 @@ class Seat:
             "public_key": self.public_key,
             "requested_seat": self.requested_seat,
             "client_commitment": self.client_commitment,
+            "nonce": self.nonce,
             "pop": self.pop,
         }
 
@@ -263,7 +266,7 @@ class Seat:
 
     def free(self) -> None:
         self.kind, self.name, self.spec = "open", "", None
-        self.public_key = self.requested_seat = self.address = None
+        self.public_key = self.requested_seat = self.address = self.nonce = None
         self.client_commitment = self.pop = self.client_seed = self.reveal_sig = None
         self.outbox = self.recipe = self.table = None
 
@@ -335,6 +338,8 @@ class Room:
         self.finished = asyncio.Event()
         self.on_finish = on_finish
         self._room_broadcast = False
+        #: What the last pushed room message said (seats, not spectators).
+        self._room_sent: Optional[bytes] = None
         self._aborted_body: Optional[dict] = None
 
     # ===== describing =====
@@ -375,10 +380,18 @@ class Room:
         asyncio.get_running_loop().call_soon(self._flush_room)
 
     def _flush_room(self) -> None:
+        """Push the room, if its seats changed since it was last pushed:
+        connections coming and going that hold no seat change nothing, so
+        they cannot make every chain grow."""
         self._room_broadcast = False
         if self.status != "waiting":
             return
-        body = {"type": "room", "room": self.describe()}
+        room = self.describe()
+        seen = canonical({k: v for k, v in room.items() if k != "spectators"})
+        if seen == self._room_sent:
+            return
+        self._room_sent = seen
+        body = {"type": "room", "room": room}
         for outbox in self._outboxes(lobby=True):
             outbox.push(body)
 
@@ -446,9 +459,19 @@ class Room:
         wanted = request.get("seat")
         if wanted is not None and type(wanted) is not int:
             raise RoomError("bad_join", "seat must be an integer or null")
-        statement = join_statement(self.id, self.seed_commitment, wanted, commitment)
+        statement = join_statement(
+            self.id,
+            self.key.public_hex,
+            self.seed_commitment,
+            wanted,
+            commitment,
+            outbox.nonce,
+        )
         if not verify_signature(public_key, statement, request.get("pop")):
-            raise RoomError("bad_join", "pop must sign the join statement with the key")
+            raise RoomError(
+                "bad_join",
+                "pop must sign the join statement (with this connection's nonce)",
+            )
         if any(s.public_key == public_key for s in self.seats):
             raise RoomError(
                 "duplicate_key", "that key already holds a seat here (rejoin instead)"
@@ -459,6 +482,7 @@ class Room:
         seat.public_key = public_key
         seat.requested_seat = wanted
         seat.client_commitment = commitment
+        seat.nonce = outbox.nonce
         seat.pop = request["pop"]
         seat.address = peer.address
         seat.outbox = outbox
@@ -506,7 +530,11 @@ class Room:
         last_seq = request.get("last_seq", -1)
         if type(last_seq) is not int:
             raise RoomError("bad_join", "last_seq must be an integer")
+        # This connection carries the seat's chain from now on, and only it
+        # (a connection the lock made a spectator stops being one).
         self.lobby.discard(outbox)
+        if outbox in self.spectators:
+            self.spectators.remove(outbox)
         old = seat.outbox
         assert old is not None
         if old.peer is not None and old.peer is not peer:
@@ -594,6 +622,7 @@ class Room:
         self.status = "revealing"
         self.commitments = commitments_body(
             self.id,
+            server_key=self.key.public_hex,
             config=self.config.to_json(),
             seats=[seat.public() for seat in self.seats],
             seed_commitment=self.seed_commitment,
@@ -635,14 +664,18 @@ class Room:
         if self.status != "revealing":
             raise RoomError("not_revealing", "seeds are not being revealed now")
         self._check_connection(seat, peer)
-        if not self._allow_receipt(seat, peer):
-            return
         signature = request.get("sig")
         statement = reveal_statement(self.commitments_digest)
         submission = submission_digest(statement, signature)
         client_seed = request.get("client_seed")
+        resent = seat.reveal_sig == signature and seat.client_seed == client_seed
+        # (An accepted reveal resent after a reconnect is not charged: an
+        # honest client on a flaky link must not run out of allowance.)
+        if seat.client_seed is None or not resent:
+            if not self._allow_receipt(seat, peer):
+                return
         if seat.client_seed is not None:
-            accepted = seat.reveal_sig == signature and seat.client_seed == client_seed
+            accepted = resent
             reason = "accepted" if accepted else "refused: this seat has revealed"
         elif (
             not is_hex(client_seed, 32)
@@ -711,6 +744,7 @@ class Room:
             self._flush_held(seat)
         self._aborted_body = aborted_body(
             self.id,
+            game_id=self.game_id if self.game is not None else None,
             reason=reason,
             blame=list(blame or []),
             server_seed=self.server_seed,

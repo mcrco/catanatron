@@ -144,17 +144,26 @@ def verify_envelope(server_key: Any, envelope: Any) -> bool:
 
 
 def join_statement(
-    room_id: str, server_commitment: str, seat: Optional[int], client_commitment: str
+    room_id: str,
+    server_key: str,
+    server_commitment: str,
+    seat: Optional[int],
+    client_commitment: str,
+    nonce: str,
 ) -> dict:
     """What a joining client signs with its seat key: proof that it holds
-    the key, bound to the room, the server's seed commitment it saw, the
-    seat it asked for and its own seed commitment."""
+    the key, bound to the room, the server (its key and the seed commitment
+    it saw), the seat it asked for, its own seed commitment, and the nonce
+    of the connection it joins on: the pop is published, but it seats its
+    key on that connection only, so nobody can replay it."""
     return {
-        "domain": "catanatron-join/1",
+        "domain": "catanatron-join/2",
         "room_id": room_id,
+        "server_key": server_key,
         "seed_commitment": server_commitment,
         "seat": seat,
         "client_commitment": client_commitment,
+        "nonce": nonce,
     }
 
 
