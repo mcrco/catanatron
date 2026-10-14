@@ -79,9 +79,9 @@ def test_play_a_server_game_to_the_end_and_verify_it(tmp_path):
                 await pilot.press("enter")
                 await pilot.pause()
                 assert "unknown command" in app.messages[-1]
-                return server, session, app.screen_text(), choices
+                return server, session, app.screen_text(), choices, app.messages
 
-    server, session, screen, choices = run(scenario(), timeout=300)
+    server, session, screen, choices, messages = run(scenario(), timeout=300)
     assert choices > 4
     assert session.result.color == "RED"
     room = server.rooms[session.client.room_id]
@@ -89,6 +89,8 @@ def test_play_a_server_game_to_the_end_and_verify_it(tmp_path):
     assert session.result.winning_color == winner.value
     assert session.report.ok, session.report.errors
     assert "verified" in screen and f"{winner.value} wins!" in screen
+    assert any(m.startswith("created room") for m in messages)
+    assert any(m.startswith("transcript verified") for m in messages)
     path = session.transcript_path
     assert path and os.path.dirname(path) == str(tmp_path)
     with open(path) as file:

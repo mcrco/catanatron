@@ -17,7 +17,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from catanatron.models.enums import Action
@@ -105,7 +105,8 @@ class RemoteSession(Session):
         self.transcript_path: Optional[str] = None
         self.error: Optional[str] = None
         self.done = asyncio.Event() if _has_loop() else None
-        self.messages: List[str] = []
+        #: What happened outside the game, as (message, is_error), for the UI.
+        self.messages: List[Tuple[str, bool]] = []
         self.title = f"remote game at {url}"
 
     # ===== running =====
@@ -147,13 +148,13 @@ class RemoteSession(Session):
             raise
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"
-            self.note(self.error)
+            self.note(self.error, error=True)
         finally:
             self.done.set()
             self.changed()
 
-    def note(self, message: str) -> None:
-        self.messages.append(message)
+    def note(self, message: str, error: bool = False) -> None:
+        self.messages.append((message, error))
         self.changed()
 
     async def verify(self) -> Any:
@@ -168,7 +169,8 @@ class RemoteSession(Session):
             self.note(f"transcript verified: {_counts(self.report)}")
         else:
             self.note(
-                "transcript verification FAILED: " + "; ".join(self.report.errors[:3])
+                "transcript verification FAILED: " + "; ".join(self.report.errors[:3]),
+                error=True,
             )
         return self.report
 
@@ -205,7 +207,7 @@ class RemoteSession(Session):
         elif kind == "joined":
             self.note(f"seated as {body['color']} (seat {body['seat']})")
         elif kind == "error":
-            self.note(f"server: {body.get('message')}")
+            self.note(f"server: {body.get('message')}", error=True)
         if kind in ("step", "after") and self.pending is not None:
             # The server moved on without our answer (a timeout); the client
             # drops whatever we would have said.

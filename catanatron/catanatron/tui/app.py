@@ -262,6 +262,7 @@ class CatanApp(App):
         self._picture_key: Optional[tuple] = None
         self._redraw_timer = None
         self._last_redraw = 0.0
+        self._notes_shown = 0
 
     # ===== layout =====
     def compose(self) -> ComposeResult:
@@ -368,6 +369,11 @@ class CatanApp(App):
         if not self._alive():
             return
         self._last_redraw = time.monotonic()
+        notes = getattr(self.session, "messages", None)
+        if notes is not None and len(notes) > self._notes_shown:
+            for message, error in notes[self._notes_shown :]:
+                self.show_message(message, error=error)
+            self._notes_shown = len(notes)
         frame = self.frame
         self.sub_title = frame.status
         self._update_status()

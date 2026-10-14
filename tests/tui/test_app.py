@@ -183,6 +183,13 @@ def test_picking_on_the_board_by_click_and_by_keyboard():
             assert app.messages[-1].startswith(f"node {busy}:")
             assert len(session.game.state.action_records) == records
 
+            # Hovering says what is there too.
+            coordinate = next(iter(session.game.state.board.map.land_tiles))
+            x, y = app._picture.anchors[("tile", coordinate)]
+            await pilot.hover(BoardView, offset=(x, y))
+            await pilot.pause()
+            assert str(app.board_view.tooltip).startswith("tile #")
+
     run(scenario())
 
 
