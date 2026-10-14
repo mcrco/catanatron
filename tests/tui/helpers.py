@@ -50,7 +50,21 @@ async def idle(pilot, app, timeout=30.0):
         and app._timer is None,
         timeout,
     )
-    await pilot.pause(0.1)  # one batched redraw
+    if not session.over:
+        await settle(pilot, lambda: choices_shown(app), timeout)
+    await pilot.pause(0.05)
+
+
+def choices_shown(app):
+    """Whether the action list shows the moves the person may play now."""
+    actions = app.frame.actions
+    shown = list(app._shown_actions.values())
+    return (
+        app._redraw_timer is None
+        and bool(actions)
+        and bool(shown)
+        and all(a in actions for a in shown)
+    )
 
 
 def free_port():

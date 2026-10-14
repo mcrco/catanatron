@@ -18,7 +18,7 @@ from catanatron.tui.app import CatanApp
 from catanatron.tui.cli import build_parser, remote_session
 from catanatron.tui.remote import RemoteSession, describe_rooms
 
-from tests.tui.helpers import free_port, run, settle
+from tests.tui.helpers import choices_shown, free_port, run, settle
 
 FAST = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 60_000}
 SIZE = (160, 50)
@@ -58,7 +58,7 @@ def test_play_a_server_game_to_the_end_and_verify_it(tmp_path):
                 while not session.done.is_set():
                     await pilot.pause(0.01)
                     pending = session.pending
-                    if pending is not None and app.frame.actions:
+                    if pending is not None and choices_shown(app):
                         # Whatever is highlighted: the first option of the list.
                         await pilot.press("enter")
                         choices += 1
@@ -138,7 +138,7 @@ def test_join_an_open_seat_by_url_while_a_bot_client_waits():
                 while not session.done.is_set():
                     await pilot.pause(0.01)
                     pending = session.pending
-                    if pending is not None and app.frame.actions:
+                    if pending is not None and choices_shown(app):
                         await pilot.press("enter")
                         await settle(
                             pilot, lambda p=pending: session.pending is not p, 30

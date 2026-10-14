@@ -337,11 +337,23 @@ class CatanApp(App):
     def _session_changed(self) -> None:
         self.refresh_view()
 
+    def _alive(self) -> bool:
+        """Whether there is a screen to draw on (not so while shutting down,
+        when a timer, a bot's thread or a server message can still arrive)."""
+        try:
+            return (
+                self.is_running
+                and bool(self.screen_stack)
+                and self.board_view.is_mounted
+            )
+        except Exception:
+            return False
+
     def refresh_view(self, now: bool = False) -> None:
         """Redraw everything, soon: changes that come in quick succession
         (bots at full speed, a burst of server messages) share one redraw."""
         self._frame = None
-        if not self.is_mounted:
+        if not self._alive():
             return
         if now:
             self._redraw()
@@ -353,7 +365,7 @@ class CatanApp(App):
         if self._redraw_timer is not None:
             self._redraw_timer.stop()
             self._redraw_timer = None
-        if not self.board_view.is_mounted:
+        if not self._alive():
             return
         self._last_redraw = time.monotonic()
         frame = self.frame
@@ -365,6 +377,8 @@ class CatanApp(App):
         self.refresh_board()
 
     def _update_status(self) -> None:
+        if not self._alive():
+            return
         frame = self.frame
         if frame is None:
             return
@@ -392,6 +406,8 @@ class CatanApp(App):
         if not message:
             return
         self.messages.append(message)
+        if not self._alive():
+            return
         style = "bold #ff6b6b" if error else "italic #a0c0ff"
         self.message_view.update(Text(message, style=style))
 
@@ -600,7 +616,8 @@ class CatanApp(App):
             self.session.choose(action)
         except CommandError as error:
             self.show_message(str(error), error=True)
-        self.refresh_view()
+        # At once: the list must not offer the old moves a moment longer.
+        self.refresh_view(now=True)
         self.schedule()
 
     def on_board_view_picked(self, message: BoardView.Picked) -> None:
@@ -724,6 +741,8 @@ class CatanApp(App):
 
     def _advance(self) -> None:
         self._timer = None
+        if not self._alive():
+            return
         session = self.session
         if self.thinking is not None or session.over:
             return
@@ -758,6 +777,8 @@ class CatanApp(App):
 
     def _thought(self, turn, action, error, seconds) -> None:
         self.thinking = None
+        if not self._alive():
+            return
         if error is not None:
             self.autoplay = False
             self.steps_left = 0
