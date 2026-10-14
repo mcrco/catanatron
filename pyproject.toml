@@ -28,6 +28,7 @@ web = [
     "sqlalchemy",
     "psycopg2-binary",
 ]
+server = ["websockets>=13", "cryptography>=42"]
 dev = [
     "black==25.11.0",
     "pytest",
@@ -43,9 +44,15 @@ Repository = "https://github.com/bcollazo/catanatron"
 
 [project.scripts]
 catanatron-play = "catanatron.cli.play:simulate"
+catanatron-server = "catanatron.server.app:main"
+catanatron-play-bot = "catanatron.server.bot:main"
+catanatron-verify = "catanatron.server.verify:main"
 
 [tool.setuptools.packages.find]
 where = ["catanatron"]
+
+[tool.setuptools.package-data]
+"catanatron.server" = ["static/*", "README.md"]
 
 [tool.black]
 target-version = ["py311"]
