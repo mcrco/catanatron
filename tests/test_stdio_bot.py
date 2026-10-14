@@ -154,6 +154,27 @@ def test_a_broken_bot_is_dropped_after_repeated_failures(bot_class, which):
     assert bot._process is None
 
 
+@pytest.mark.parametrize("which", ["illegal", "garbage"])
+def test_every_random_fallback_is_counted(bot_class, which):
+    """So a caller can tell (and discard) results the bot did not earn."""
+    bot = bot_class(which)(Color.RED, build_params_timeout(200))
+    game = Game([bot, RandomPlayer(Color.BLUE)], seed=4)
+    asked = 0
+    while game.winning_color() is None and game.state.num_turns < 1000:
+        if game.state.current_color() == Color.RED and len(game.playable_actions) > 1:
+            asked += 1
+        game.play_tick()
+    assert bot.forfeits == bot.game_forfeits == asked > 3
+    Game([bot, RandomPlayer(Color.BLUE)], seed=5)  # before() starts a new game
+    assert bot.game_forfeits == 0 and bot.forfeits == asked
+
+
+def test_a_good_bot_forfeits_nothing(bot_class):
+    bot = bot_class("good")(Color.RED)
+    Game([bot, RandomPlayer(Color.BLUE)], seed=4).play()
+    assert bot.forfeits == 0
+
+
 def build_params_timeout(ms):
     from catanatron.players.stdio import StdioPlayer
 

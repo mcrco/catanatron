@@ -64,6 +64,11 @@ class StdioPlayer(Player):
         self._complained = False
         self._failures = 0
         self._given_up = False
+        #: Decisions this seat lost to a random legal action (a timeout, a bad
+        #: reply, a bot that was given up on), since it was built and in the
+        #: current game. A caller can discard results the bot did not earn.
+        self.forfeits = 0
+        self.game_forfeits = 0
 
     # ===== process =====
     def _start(self):
@@ -149,6 +154,7 @@ class StdioPlayer(Player):
     def before(self, game):
         # A failed handshake is a configuration problem, not a bad turn, so it
         # is deliberately not swallowed here.
+        self.game_forfeits = 0
         if self._given_up:
             return
         self._start()
@@ -178,7 +184,7 @@ class StdioPlayer(Player):
         if len(playable_actions) == 1:
             return playable_actions[0]
         if self._given_up:
-            return random.choice(playable_actions)
+            return self._random_fallback(playable_actions)
         try:
             self._start()
             self._send(decide_message(game, self.color))
@@ -197,6 +203,11 @@ class StdioPlayer(Player):
     def _forfeit(self, playable_actions, reason):
         """One bad decision costs one turn, not the whole simulation."""
         self._note_failure(reason)
+        return self._random_fallback(playable_actions)
+
+    def _random_fallback(self, playable_actions):
+        self.forfeits += 1
+        self.game_forfeits += 1
         return random.choice(playable_actions)
 
     def _note_failure(self, reason):
