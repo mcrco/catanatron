@@ -290,6 +290,35 @@ def test_a_registry_remembers_where_a_source_came_from(tmp_path):
     assert again[key].COMMAND == registry[key].COMMAND
 
 
+def test_a_bot_hears_the_end_of_the_game_before_it_is_stopped(bot_class, tmp_path):
+    """close() lets a bot that exits on end of input finish its last message."""
+    log = tmp_path / "log.txt"
+    script = tmp_path / "logging_bot.py"
+    script.write_text(
+        HEADER.replace(
+            "for line in sys.stdin:",
+            f"log = open({str(log)!r}, 'a')\nfor line in sys.stdin:",
+        ).replace(
+            "    m = json.loads(line)\n",
+            "    m = json.loads(line)\n"
+            # It takes a moment over the end of the game.
+            '    if m["type"] == "after": time.sleep(0.4)\n'
+            '    log.write(m["type"] + "\\n"); log.flush()\n',
+        )
+        + """
+    if m["type"] == "decide":
+        reply({"action": m["playable_actions"][0]})
+"""
+    )
+    bot = build_stdio_player_class("LOGGER", f"{sys.executable} {script}")(Color.RED)
+    game = Game([bot, RandomPlayer(Color.BLUE)], seed=4)
+    for _ in range(30):
+        game.play_tick()
+    bot.after(game)
+    bot.close()
+    assert log.read_text().split()[-1] == "after"
+
+
 def test_exec_source_needs_a_name():
     registry = PlayerRegistry()
     with pytest.raises(SpecError, match="needs a name"):

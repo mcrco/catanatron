@@ -137,8 +137,13 @@ class StdioPlayer(Player):
             return
         try:
             self._process.stdin.close()
-            self._process.terminate()
-            self._process.wait(timeout=2)
+            try:
+                # A well-behaved bot exits on end of input: let it finish
+                # what it was told last (``after``) before it is stopped.
+                self._process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._process.terminate()
+                self._process.wait(timeout=2)
         except Exception:  # a bot that will not die is not worth waiting on
             self._process.kill()
         finally:
