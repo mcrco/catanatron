@@ -13,6 +13,7 @@ from catanatron.state import State
 from catanatron.apply_action import apply_action
 from catanatron.state_functions import player_key, player_has_rolled
 from catanatron.models.map import CatanMap, NumberPlacement
+from catanatron.models.decks import BASE_SUPPLY, Supply
 from catanatron.models.player import Color, Player
 from catanatron.observer import GameObserver
 
@@ -78,16 +79,19 @@ class Game:
         catan_map: Optional[CatanMap] = None,
         number_placement: NumberPlacement = "official_spiral",
         initialize: bool = True,
+        supply: Supply = BASE_SUPPLY,
     ):
         """Creates a game (doesn't run it).
 
         Args:
-            players (List[Player]): list of players, should be at most 4.
+            players (List[Player]): list of players, at most 6 (one per Color).
             seed (int, optional): Random seed to use (for reproducing games). Defaults to None.
             discard_limit (int, optional): Discard limit to use. Defaults to 7.
             vps_to_win (int, optional): Victory Points needed to win. Defaults to 10.
             catan_map (CatanMap, optional): Map to use. Defaults to None.
             initialize (bool, optional): Whether to initialize. Defaults to True.
+            supply (Supply, optional): Bank, development deck and piece counts.
+                Defaults to the base game's; EXTENSION_SUPPLY is the 5-6 player one.
         """
         #: Everything watching this game: the seated players, plus any
         #: accumulators handed to play(). One list, so each hook is one loop.
@@ -109,6 +113,7 @@ class Game:
                 friendly_robber=friendly_robber,
                 number_placement=number_placement,
                 rng=self.random,
+                supply=supply,
             )
             self.playable_actions = generate_playable_actions(self.state)
 

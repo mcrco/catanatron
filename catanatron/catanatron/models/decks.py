@@ -4,7 +4,8 @@ We use a histogram / 'frequency list' to represent decks (aliased 'freqdeck').
 This representation is concise, easy to copy, access and fast to compare.
 """
 
-from typing import Iterable, List
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple
 
 from catanatron.models.enums import (
     KNIGHT,
@@ -74,6 +75,55 @@ def starting_devcard_bank():
         + [MONOPOLY] * 2
         + [VICTORY_POINT] * 5
     )
+
+
+@dataclass(frozen=True)
+class Supply:
+    """Card and piece counts, which differ between the base game and the 5-6
+    player extension. The defaults are the base game's."""
+
+    #: Starting bank as a freqdeck: [WOOD, BRICK, SHEEP, WHEAT, ORE].
+    resource_bank: Tuple[int, int, int, int, int] = (19, 19, 19, 19, 19)
+    #: Starting deck in DEVELOPMENT_CARDS order:
+    #: KNIGHT, YEAR_OF_PLENTY, MONOPOLY, ROAD_BUILDING, VICTORY_POINT.
+    development_deck: Tuple[int, int, int, int, int] = (14, 2, 2, 2, 5)
+    #: Pieces each player starts with.
+    roads: int = 15
+    settlements: int = 5
+    cities: int = 4
+
+    def __post_init__(self):
+        if len(self.resource_bank) != 5 or len(self.development_deck) != 5:
+            raise ValueError("resource_bank and development_deck need five counts each")
+        if min(self.resource_bank) < 0 or min(self.development_deck) < 0:
+            raise ValueError("card counts must be non-negative")
+        if self.roads < 2 or self.settlements < 2 or self.cities < 0:
+            raise ValueError("players need at least two roads and two settlements")
+
+    def resource_freqdeck(self) -> List[int]:
+        return list(self.resource_bank)
+
+    def development_listdeck(self) -> List[FastDevCard]:
+        """Unshuffled, in starting_devcard_bank's order so seeds shuffle alike."""
+        knights, year_of_plenty, monopoly, road_building, victory_points = (
+            self.development_deck
+        )
+        return (
+            [KNIGHT] * knights
+            + [YEAR_OF_PLENTY] * year_of_plenty
+            + [ROAD_BUILDING] * road_building
+            + [MONOPOLY] * monopoly
+            + [VICTORY_POINT] * victory_points
+        )
+
+
+BASE_SUPPLY = Supply()
+#: The 5-6 player extension adds five of each resource and nine development
+#: cards (six knights and one of each progress card).
+EXTENSION_SUPPLY = Supply(
+    resource_bank=(24, 24, 24, 24, 24),
+    development_deck=(20, 3, 3, 3, 5),
+)
 
 
 def draw_from_listdeck(list1: List, amount: int, card: int):

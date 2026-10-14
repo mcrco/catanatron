@@ -37,6 +37,8 @@ PLAYER_COLORS = {
     Color.RED: (250, 0, 0),
     Color.ORANGE: (255, 165, 0),
     Color.WHITE: (250, 250, 250),
+    Color.GREEN: (0, 140, 60),
+    Color.BROWN: (139, 69, 19),
 }
 
 BACKGROUND_COLOR = (90, 180, 215)  # light blue (water)

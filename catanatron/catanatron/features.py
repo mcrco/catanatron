@@ -590,7 +590,7 @@ def create_sample_vector(game, p0_color, features=None):
     return [float(sample_dict[i]) for i in features if i in sample_dict]
 
 
-@functools.lru_cache(4 * 3)
+@functools.lru_cache(6 * 3)
 def get_feature_ordering(
     num_players=4, map_type: Literal["BASE", "MINI", "TOURNAMENT"] = "BASE"
 ):
@@ -599,6 +599,8 @@ def get_feature_ordering(
         SimplePlayer(Color.BLUE),
         SimplePlayer(Color.WHITE),
         SimplePlayer(Color.ORANGE),
+        SimplePlayer(Color.GREEN),
+        SimplePlayer(Color.BROWN),
     ]
     players = players[:num_players]
     game = Game(players, catan_map=build_map(map_type))

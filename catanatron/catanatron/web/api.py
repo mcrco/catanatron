@@ -119,7 +119,9 @@ def post_action_endpoint(game_id):
 @bp.route("/stress-test", methods=["GET"])
 def stress_test_endpoint():
     params = AlphaBetaPlayer.Params(depth=2, prunning=True)
-    players = [AlphaBetaPlayer(color, params) for color in Color]
+    # The web UI draws the base game's four colors.
+    colors = [Color.RED, Color.BLUE, Color.ORANGE, Color.WHITE]
+    players = [AlphaBetaPlayer(color, params) for color in colors]
     game = Game(players=players)
     game.play_tick()
     return Response(

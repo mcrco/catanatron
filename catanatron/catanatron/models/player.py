@@ -16,6 +16,9 @@ class Color(Enum):
     BLUE = "BLUE"
     ORANGE = "ORANGE"
     WHITE = "WHITE"
+    # The 5-6 player extension's colors.
+    GREEN = "GREEN"
+    BROWN = "BROWN"
 
     def __repr__(self):
         return f"C.{self.name}"

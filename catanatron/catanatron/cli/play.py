@@ -274,6 +274,8 @@ COLOR_TO_RICH_STYLE = {
     Color.BLUE: "blue",
     Color.ORANGE: "yellow",
     Color.WHITE: "white",
+    Color.GREEN: "green",
+    Color.BROWN: "#8b4513",
 }
 
 

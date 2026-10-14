@@ -10,10 +10,7 @@ from catanatron.models.enums import (
     ActionPrompt,
     ActionRecord,
 )
-from catanatron.models.decks import (
-    starting_devcard_bank,
-    starting_resource_bank,
-)
+from catanatron.models.decks import BASE_SUPPLY, Supply
 from catanatron.models.player import Color, Player
 
 # These will be prefixed by P0_, P1_, ...
@@ -93,6 +90,7 @@ class State:
         number_placement: NumberPlacement = "official_spiral",
         initialize=True,
         rng=None,
+        supply: Supply = BASE_SUPPLY,
     ):
         if initialize:
             self.random = rng if rng is not None else random.Random()
@@ -109,15 +107,21 @@ class State:
 
             # feature-ready dictionary
             self.player_state = dict()
+            initial_state = {
+                **PLAYER_INITIAL_STATE,
+                "ROADS_AVAILABLE": supply.roads,
+                "SETTLEMENTS_AVAILABLE": supply.settlements,
+                "CITIES_AVAILABLE": supply.cities,
+            }
             for index in range(len(self.colors)):
-                for key, value in PLAYER_INITIAL_STATE.items():
+                for key, value in initial_state.items():
                     self.player_state[f"P{index}_{key}"] = value
             self.color_to_index = {
                 color: index for index, color in enumerate(self.colors)
             }
 
-            self.resource_freqdeck = starting_resource_bank()
-            self.development_listdeck = starting_devcard_bank()
+            self.resource_freqdeck = supply.resource_freqdeck()
+            self.development_listdeck = supply.development_listdeck()
             self.random.shuffle(self.development_listdeck)
 
             # Auxiliary attributes to implement game logic

@@ -56,13 +56,29 @@ CONTENDER_WEIGHTS = {
 }
 
 
-def base_fn(params=DEFAULT_WEIGHTS):
+Enemies = Literal["next", "all"]
+
+
+def base_fn(params=DEFAULT_WEIGHTS, enemies: Enemies = "next"):
+    """``enemies`` picks whose production counts against p0: the next seat
+    only (the original heuristic), or the mean over every opponent. Both are
+    the same in two-player games."""
+    if enemies not in ("next", "all"):
+        raise ValueError(f"enemies must be 'next' or 'all', got {enemies!r}")
+
     def fn(game, p0_color):
         production_features = build_production_features(True)
         our_production_sample = production_features(game, p0_color)
         enemy_production_sample = production_features(game, p0_color)
         production = value_production(our_production_sample, "P0")
-        enemy_production = value_production(enemy_production_sample, "P1", False)
+        if enemies == "next":
+            enemy_production = value_production(enemy_production_sample, "P1", False)
+        else:
+            num_enemies = len(game.state.colors) - 1
+            enemy_production = sum(
+                value_production(enemy_production_sample, f"P{i}", False)
+                for i in range(1, num_enemies + 1)
+            ) / max(num_enemies, 1)
 
         key = player_key(game.state, p0_color)
         longest_road_length = get_longest_road_length(game.state, p0_color)
@@ -139,15 +155,16 @@ def value_production(sample, player_name="P0", include_variety=True):
     return prod_sum + (0 if not include_variety else prod_variety)
 
 
-def contender_fn(params):
-    return base_fn(params or CONTENDER_WEIGHTS)
+def contender_fn(params, enemies: Enemies = "next"):
+    return base_fn(params or CONTENDER_WEIGHTS, enemies)
 
 
 class ValueFunctionPlayer(Player):
     """
     Player that selects the move that maximizes a heuristic value function.
 
-    For now, the base value function only considers 1 enemy player.
+    By default the value function only considers 1 enemy player, the next
+    seat; ``enemies="all"`` averages the production of every opponent.
     """
 
     LABEL = "Value Function"
@@ -156,6 +173,7 @@ class ValueFunctionPlayer(Player):
     class Params:
         value_fn: Literal["base", "contender"] = "base"
         epsilon: Optional[float] = None
+        enemies: Enemies = "next"
         #: Non-scalar: programmatic use only, not settable from CLI/web.
         weights: Optional[dict] = None
 
@@ -177,7 +195,11 @@ class ValueFunctionPlayer(Player):
             game_copy = game.copy()
             game_copy.execute(action)
 
-            value_fn = get_value_fn(self.value_fn_builder_name, self.params.weights)
+            value_fn = get_value_fn(
+                self.value_fn_builder_name,
+                self.params.weights,
+                enemies=self.params.enemies,
+            )
             value = value_fn(game_copy, self.color)
             if value > best_value:
                 best_value = value
@@ -186,12 +208,12 @@ class ValueFunctionPlayer(Player):
         return best_action
 
 
-def get_value_fn(name, params, value_function=None):
+def get_value_fn(name, params, value_function=None, enemies: Enemies = "next"):
     if value_function is not None:
         return value_function
     elif name == "base_fn":
-        return base_fn(DEFAULT_WEIGHTS)
+        return base_fn(DEFAULT_WEIGHTS, enemies)
     elif name == "contender_fn":
-        return contender_fn(params)
+        return contender_fn(params, enemies)
     else:
         raise ValueError
