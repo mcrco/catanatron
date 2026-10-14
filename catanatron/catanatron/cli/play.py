@@ -11,6 +11,7 @@ from rich.theme import Theme
 from rich.text import Text
 
 from catanatron.game import Game
+from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY
 from catanatron.models.player import Color
 from catanatron.models.map import NumberPlacement, build_map
 from catanatron.state_functions import get_actual_victory_points
@@ -304,6 +305,8 @@ def play_batch_core(num_games, players, game_config, accumulators=[]):
             friendly_robber=game_config.friendly_robber,
             vps_to_win=game_config.vps_to_win,
             catan_map=catan_map,
+            # Five or six players play with the 5-6 player extension's cards.
+            supply=EXTENSION_SUPPLY if len(players) > 4 else BASE_SUPPLY,
         )
         game.play(accumulators)
         yield game

@@ -112,10 +112,15 @@ def test_build_all_assigns_colors_in_order():
     assert [p.color for p in players] == [Color.RED, Color.BLUE, Color.ORANGE]
 
 
-@pytest.mark.parametrize("specs", ["R", "R,R,R,R,R"])
+@pytest.mark.parametrize("specs", ["R", "R,R,R,R,R,R,R"])
 def test_build_all_rejects_bad_player_counts(specs):
-    with pytest.raises(SpecError, match="2 to 4 players"):
+    with pytest.raises(SpecError, match="2 to 6 players"):
         REGISTRY.build_all(specs)
+
+
+def test_build_all_seats_up_to_six_players():
+    players = REGISTRY.build_all("R,W,F,AB:1,VP,R")
+    assert [p.color for p in players] == list(Color)
 
 
 # ===== registration =====

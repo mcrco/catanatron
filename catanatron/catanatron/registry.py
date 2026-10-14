@@ -127,8 +127,8 @@ class PlayerRegistry(dict):
         if isinstance(specs, str):
             specs = [s for s in specs.split(",") if s.strip()]
         specs = list(specs)
-        if not 2 <= len(specs) <= 4:
-            raise SpecError(f"a game needs 2 to 4 players, got {len(specs)}")
+        if not 2 <= len(specs) <= len(Color):
+            raise SpecError(f"a game needs 2 to {len(Color)} players, got {len(specs)}")
         return [self.build(spec, color) for spec, color in zip(specs, colors or Color)]
 
     def spec_of(self, player: Player) -> dict:

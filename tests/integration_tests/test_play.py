@@ -143,3 +143,9 @@ def test_parquet_output():
         assert "F_BANK_BRICK" in df.columns
         assert "RETURN" in df.columns
         assert "ACTION" in df.columns
+
+
+def test_six_player_games_from_the_cli():
+    runner = CliRunner()
+    result = runner.invoke(simulate, ["--num=2", "--players=R,W,F,R,W,F"])
+    assert result.exit_code == 0, result.output
