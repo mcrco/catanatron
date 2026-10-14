@@ -475,6 +475,63 @@ def test_exec_bots_hear_after_when_a_game_is_called_off(exec_bot):
     assert wait_for(log, "after"), log.read_text()
 
 
+CAPTURED_STDIO_WORKER = """
+import asyncio, io, sys
+
+class Captured(io.StringIO):  # as Textual's run_test leaves sys.stderr
+    def fileno(self):
+        return -1
+
+sys.stdout, sys.stderr = Captured(), Captured()
+from catanatron.server.botproc import BotWorker
+
+async def main():
+    worker = BotWorker()
+    reply = await worker.call(("ping",), 60)
+    worker.stop()
+    return reply
+
+if __name__ == "__main__":
+    reply = asyncio.run(main())
+    sys.__stdout__.write(repr(reply))
+"""
+
+
+def test_bot_workers_start_while_the_host_app_captures_stdio(tmp_path):
+    # The resource tracker would be handed sys.stderr.fileno() (-1 here) and
+    # refuse to start: "bad value(s) in fds_to_keep".
+    script = tmp_path / "captured.py"
+    script.write_text(CAPTURED_STDIO_WORKER)
+    done = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=240
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "('pong',)"
+
+
+def test_a_room_whose_bot_worker_cannot_start_plays_on(monkeypatch):
+    from catanatron.server import botproc
+
+    def broken(self):
+        raise OSError("no more processes")
+
+    monkeypatch.setattr(botproc.BotWorker, "start", broken)
+
+    async def scenario():
+        async with serving() as (server, base):
+            room = await create_room(base, CONFIG, ["F", "F"])
+            room_obj = server.rooms[room["id"]]
+            deadline = time.monotonic() + 120
+            while len(room_obj.actions) < 10 and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            assert room_obj.status == "playing"
+            assert len(room_obj.actions) >= 10
+            forced = {entry["forced"] for entry in room_obj.actions}
+            assert forced <= {"bot_error", "only"} and "bot_error" in forced
+
+    run(scenario())
+
+
 SLOW_G_SERVER = """
 import os, sys
 os.environ["CATANATRON_TEST_MARK"] = sys.argv[1]
@@ -563,16 +620,33 @@ def test_reconnects_while_another_seat_thinks_do_not_use_up_the_client():
         async with serving() as (server, base):
             config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
             room = await create_room(base, config, [None, "F"])
-            client, decide = bot_client(f"{base}/room/{room['id']}", "F")
+            client, bot_decide = bot_client(f"{base}/room/{room['id']}", "F")
             drops = 0
 
-            async def flap():
-                nonlocal drops
+            async def decide(view, playable):
+                # Our seat holds the game until the connection has flapped
+                # eight times, so that a quick game cannot end first.
                 while drops < 8:
-                    await asyncio.sleep(0.25)
-                    if client.connection is not None and client.seat_key:
-                        drops += 1
-                        await client.connection.close()
+                    await asyncio.sleep(0.05)
+                return await asyncio.to_thread(bot_decide, view, playable)
+
+            async def flap():
+                # Each connection, once the game is on and the client has
+                # verified the server's hello on it, is dropped: eight drops,
+                # more than the client's five reconnect attempts.
+                nonlocal drops
+                dropped = None
+                while drops < 8:
+                    await asyncio.sleep(0.02)
+                    ws = client.connection
+                    if ws is None or ws is dropped or client.table.state is None:
+                        continue
+                    if client._attempts:  # back, but not yet in
+                        continue
+                    await asyncio.sleep(0.1)
+                    dropped = ws
+                    drops += 1
+                    await ws.close()
 
             flapping = asyncio.create_task(flap())
             result = await client.play(decide)
@@ -580,7 +654,7 @@ def test_reconnects_while_another_seat_thinks_do_not_use_up_the_client():
             return result, drops
 
     result, drops = run(scenario())
-    assert drops >= 6
+    assert drops == 8
     assert result.verified, result.report.errors
 
 

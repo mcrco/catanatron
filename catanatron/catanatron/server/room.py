@@ -26,7 +26,6 @@ import asyncio
 import hmac
 import json
 import logging
-import threading
 import time
 import unicodedata
 import uuid
@@ -714,7 +713,13 @@ class Room:
                 seat.color.value,
             )
         if self.bot_seats():
-            self.worker.start()
+            # Up now, so that exec bots watch the game from its first action.
+            # A worker that cannot start costs the next bot decision (its
+            # call tries again and fails as a bot_error), never the room.
+            try:
+                self.worker.start()
+            except Exception:
+                logger.exception("room %s: the bot worker did not start", self.id)
         self.task = asyncio.get_running_loop().create_task(self._run())
 
     def abort(self, reason: str, blame: Optional[list] = None) -> None:
@@ -983,7 +988,8 @@ class Room:
         except asyncio.CancelledError:
             raise
         except BaseException:  # the worker died; never let a bot take the room down
-            logger.exception("room %s: bot %s failed", self.id, seat.spec)
+            if self.status == "playing":  # (else the game ended under it)
+                logger.exception("room %s: bot %s failed", self.id, seat.spec)
             return "bot_error"
         if reply[0] != "decided":
             logger.warning("room %s: bot %s failed: %s", self.id, seat.spec, reply[1:])
@@ -1023,9 +1029,7 @@ class Room:
         """Let every server bot hear the game ended (exec bots get ``after``
         and their programs are stopped), then end the worker, off the loop."""
         worker = self.worker
-        if worker.process is None:
-            return
-        for seat in self.bot_seats():
+        for seat in self.bot_seats():  # (posts reach only a live worker)
             if seat.table is not None and seat.table.state is not None:
                 worker.post(
                     (
@@ -1036,7 +1040,9 @@ class Room:
                         seat.table.winning_color,
                     )
                 )
-        threading.Thread(target=worker.stop, daemon=True).start()
+        # Let go of the worker now, so that a shutdown right behind this
+        # cannot kill it before its bots have finished.
+        worker.stop()
 
     def kill_bots(self) -> None:
         """At shutdown: no grace."""

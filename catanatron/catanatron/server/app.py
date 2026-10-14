@@ -282,10 +282,12 @@ class GameServer:
         if self.janitor is not None:
             self.janitor.cancel()
         for room in list(self.rooms.values()):
+            # Killed first, so that the abort has no worker to give grace to
+            # (a room that ended earlier keeps the grace it was given).
+            room.kill_bots()
             room.abort("the server is shutting down")
             if room.task is not None:
                 room.task.cancel()
-            room.kill_bots()
 
     def _archive(self, room: Room) -> None:
         """Keep the server's own record of a finished game."""
