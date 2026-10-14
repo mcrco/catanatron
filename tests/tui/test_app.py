@@ -8,9 +8,10 @@ import pytest
 pytest.importorskip("textual")
 
 from catanatron.models.enums import ActionType
+from catanatron.serialization import state_to_json
 from catanatron.tui.app import BoardView, CatanApp, HelpScreen
 from catanatron.tui.local import LocalSession
-from catanatron.tui.positions import GameSettings, document_of
+from catanatron.tui.positions import GameSettings
 
 from tests.tui.helpers import SHAPES, idle, map_spec_file, run, settle
 
@@ -68,22 +69,22 @@ def test_undo_back_and_redo_keys():
     async def scenario():
         async with app.run_test(size=SIZE) as pilot:
             await idle(pilot, app)
-            choice_point = document_of(session.game)
+            choice_point = state_to_json(session.game)
             await pilot.press("enter")
             await idle(pilot, app)
-            after = document_of(session.game)
+            after = state_to_json(session.game)
             await pilot.press("u")
             assert not app.autoplay, "taking moves back pauses the bots"
             assert len(session.redo_stack) == 1
             await pilot.press("U")
-            assert same(document_of(session.game), choice_point)
+            assert same(state_to_json(session.game), choice_point)
             await pilot.press("r")
             assert (
                 len(session.game.state.action_records)
                 == len(choice_point["action_records"]) + 1
             )
             await command(pilot, app, "redo 1000")
-            assert same(document_of(session.game), after)
+            assert same(state_to_json(session.game), after)
             await pilot.press("space")
             assert app.autoplay
 
@@ -128,12 +129,12 @@ def test_save_and_load_in_the_app(tmp_path):
             await idle(pilot, app)
             await pilot.press("enter")
             await idle(pilot, app)
-            saved = document_of(session.game)
+            saved = state_to_json(session.game)
             await command(pilot, app, f"save {path}")
             for _ in range(3):
                 await pilot.press("enter")
                 await idle(pilot, app)
-            assert not same(document_of(session.game), saved)
+            assert not same(state_to_json(session.game), saved)
             await command(pilot, app, f"load {path}")
             await idle(pilot, app)
             assert app.messages[-1].startswith("loaded")
@@ -141,7 +142,7 @@ def test_save_and_load_in_the_app(tmp_path):
 
     saved = run(scenario())
     # Loading resumes at the saved position (and bots play on from there).
-    records = json.loads(json.dumps(document_of(session.game)["action_records"]))
+    records = json.loads(json.dumps(state_to_json(session.game)["action_records"]))
     assert records[: len(saved["action_records"])] == saved["action_records"]
     with open(path) as file:
         assert json.load(file)["format"] == "catanatron-tui/1"

@@ -8,9 +8,10 @@ import pytest
 from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY
 from catanatron.models.enums import RESOURCES, Action, ActionType
 from catanatron.models.player import Color, Player
+from catanatron.serialization import state_to_json
 from catanatron.tui.agents import make_agent
 from catanatron.tui.local import LocalSession, parse_outcome
-from catanatron.tui.positions import GameSettings, document_of, supply_of
+from catanatron.tui.positions import GameSettings, supply_of
 from catanatron.tui.session import CommandError
 
 from tests.tui.helpers import SHAPES, map_spec_file
@@ -148,7 +149,7 @@ def test_players_decide_on_sampled_worlds_and_oracles_on_the_true_game():
         if turn is None or session.forced_action() is not None:
             session.step()
             continue
-        hands = document_of(session.game)["player_state"]
+        hands = state_to_json(session.game)["player_state"]
         session.finish(turn, turn.think())
         handed = turn.request.game
         if turn.agent.oracle:
@@ -176,14 +177,14 @@ def test_undo_and_redo_restore_the_game_exactly():
         ["F", "R", "F"], settings=GameSettings(num_players=3), seed=4
     )
     session.run(limit=150)
-    before = document_of(session.game)
+    before = state_to_json(session.game)
     assert session.undo(60) == 60
-    middle = document_of(session.game)
+    middle = state_to_json(session.game)
     assert session.redo(60) == 60
-    assert documents_equal(document_of(session.game), before)
+    assert documents_equal(state_to_json(session.game), before)
     # Replaying from the middle draws the same chance as the first time.
     session.undo(60)
-    assert documents_equal(document_of(session.game), middle)
+    assert documents_equal(state_to_json(session.game), middle)
     session.redo(1)
     assert session.undo(1) == 1
     record_count = len(session.game.state.action_records)
@@ -203,11 +204,11 @@ def test_back_undoes_to_the_last_choice_of_a_person():
     while session.undo_stack:
         session.undo()
         if session.person_to_move():
-            choice_point = document_of(session.game)
+            choice_point = state_to_json(session.game)
             break
     session.redo(10_000)
     session.back()
-    assert documents_equal(document_of(session.game), choice_point)
+    assert documents_equal(state_to_json(session.game), choice_point)
 
 
 # ===== chance =====
@@ -278,7 +279,7 @@ def test_edits_keep_the_bank_whole_and_can_be_undone():
     session = LocalSession.new(["human", "F"], settings=FAST, seed=7)
     session.run()
     supply = supply_of(session.game)
-    before = document_of(session.game)
+    before = state_to_json(session.game)
     color = session.colors[0]
     session.execute(f"hand {color.value} wood=5 ore=0")
     assert supply_of(session.game) == supply
@@ -295,7 +296,7 @@ def test_edits_keep_the_bank_whole_and_can_be_undone():
         in session.game.state.board.map.land_tiles
     )
     session.undo(2)
-    assert documents_equal(document_of(session.game), before)
+    assert documents_equal(state_to_json(session.game), before)
 
 
 def test_views_and_seats():
@@ -343,35 +344,35 @@ def test_save_and_load_keep_the_position_seats_notes_and_history(tmp_path):
     assert "saved" in session.execute(f"save {path}")
 
     loaded = LocalSession.load(path)
-    assert documents_equal(document_of(loaded.game), document_of(session.game))
+    assert documents_equal(state_to_json(loaded.game), state_to_json(session.game))
     assert loaded.specs == session.specs
     assert loaded.notes == session.notes
     assert len(loaded.undo_stack) == len(session.game.state.action_records)
     # The history replays to the very first position.
     loaded.undo(10_000)
-    assert documents_equal(document_of(loaded.game), session.initial)
+    assert documents_equal(state_to_json(loaded.game), session.initial)
     loaded.redo(10_000)
-    assert documents_equal(document_of(loaded.game), document_of(session.game))
+    assert documents_equal(state_to_json(loaded.game), state_to_json(session.game))
 
     # And a session can load in place, keeping its hooks.
     calls = []
     other = LocalSession.new(["human", "F"], settings=FAST, seed=11)
     other.on_change = lambda: calls.append(1)
     assert "loaded" in other.execute(f"load {path}")
-    assert calls and documents_equal(document_of(other.game), document_of(session.game))
+    assert calls and documents_equal(state_to_json(other.game), state_to_json(session.game))
 
 
 def test_load_bare_documents_and_archives(tmp_path):
     session = LocalSession.new(["F", "F"], settings=FAST, seed=12)
     session.run(limit=80)
-    doc = document_of(session.game)
+    doc = state_to_json(session.game)
     bare = tmp_path / "state.json"
     bare.write_text(json.dumps(doc))
     archive = tmp_path / "archive.json"
     archive.write_text(json.dumps({"room": {}, "final_state": doc}))
     for path in (bare, archive):
         loaded = LocalSession.load(str(path), ["human", "F"])
-        assert documents_equal(document_of(loaded.game), doc)
+        assert documents_equal(state_to_json(loaded.game), doc)
         assert not loaded.undo_stack
         assert loaded.agents[Color.RED].human
     bad = tmp_path / "bad.json"

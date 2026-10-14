@@ -35,6 +35,7 @@ from catanatron.serialization import (
     client_view,
     public_view,
     state_from_json,
+    state_to_json,
 )
 from catanatron.tui.agents import (
     Agent,
@@ -49,7 +50,6 @@ from catanatron.tui.positions import (
     GameSettings,
     SavedSession,
     colors_for,
-    document_of,
     new_game,
     read_saved,
     replay,
@@ -156,7 +156,7 @@ class LocalSession(Session):
         for color in game.state.colors:
             self._seat(color, seats.get(color, "F"))
         self.supply = supply_of(game)
-        self.initial = initial if initial is not None else document_of(game)
+        self.initial = initial if initial is not None else state_to_json(game)
         self.undo_stack: List[Snapshot] = list(history)
         self.redo_stack: List[Snapshot] = []
         self.notes: Dict[int, List[str]] = {
@@ -425,7 +425,7 @@ class LocalSession(Session):
         agent = self.agents[color]
         if agent.human:
             return None
-        doc = document_of(self.game)
+        doc = state_to_json(self.game)
         if agent.oracle:
             view = client_view(doc)
             game = oracle_copy(self.game, self._decisions.getrandbits(63))
@@ -577,7 +577,7 @@ class LocalSession(Session):
 
     # ===== what is shown =====
     def frame(self) -> Frame:
-        doc = document_of(self.game)
+        doc = state_to_json(self.game)
         viewer = self.viewer()
         god = self.god()
         if god:
@@ -635,7 +635,7 @@ class LocalSession(Session):
     # ===== files =====
     def saved(self) -> SavedSession:
         return SavedSession(
-            state=document_of(self.game),
+            state=state_to_json(self.game),
             initial=self.initial,
             seats={c.value: s for c, s in self.specs.items()},
             notes=self.notes,

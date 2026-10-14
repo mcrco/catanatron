@@ -70,18 +70,6 @@ def new_game(settings: GameSettings, players: Sequence[Player], seed: int) -> Ga
     )
 
 
-def document_of(game: Game) -> dict:
-    """``state_to_json(game)``, detached from the game.
-
-    ``state_to_json`` hands out the live ``player_state`` dict; a document
-    that outlives the moment (a saved initial position, a bot's view on
-    another thread) must not change as the game goes on.
-    """
-    doc = state_to_json(game)
-    doc["player_state"] = dict(doc["player_state"])
-    return doc
-
-
 def supply_of(game: Game) -> Supply:
     """The game's bank, deck and pieces, recovered from the state.
 
