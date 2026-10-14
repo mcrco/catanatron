@@ -277,6 +277,19 @@ def test_exec_source_registers_a_bot(tmp_path):
     assert [p["name"] for p in describe(key, registry[key])["params"]] == ["timeout_ms"]
 
 
+def test_a_registry_remembers_where_a_source_came_from(tmp_path):
+    """So another process (a server's bot worker) can register it alike."""
+    registry = PlayerRegistry()
+    path = tmp_path / "good.py"
+    path.write_text(textwrap.dedent(BOTS["good"]))
+    source = f"exec:{sys.executable} {path}"
+    key = registry.register_source(source, name="RUSTY")
+    assert registry.sources[key] == (source, None)
+    again = PlayerRegistry()
+    again.register_source(*registry.sources[key][:1], key, registry.sources[key][1])
+    assert again[key].COMMAND == registry[key].COMMAND
+
+
 def test_exec_source_needs_a_name():
     registry = PlayerRegistry()
     with pytest.raises(SpecError, match="needs a name"):

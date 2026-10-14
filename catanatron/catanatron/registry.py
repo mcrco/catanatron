@@ -64,6 +64,12 @@ def describe(key, player_class):
 class PlayerRegistry(dict):
     """Maps keys to the player classes that implement them."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: key -> (source, base_dir) for entries registered from a source, so
+        #: another process can register them the same way.
+        self.sources = {}
+
     def register(self, key, player_class, *, replace=False):
         key = key.upper()
         if key in self and not replace:
@@ -96,6 +102,7 @@ class PlayerRegistry(dict):
         if taken is not None and identity(taken) != identity(player_class):
             raise SpecError(f"{key} collides with the existing {taken.__name__!r}")
         self.register(key, player_class, replace=True)
+        self.sources[key] = (source, base_dir)
         return key
 
     def lookup(self, key):
