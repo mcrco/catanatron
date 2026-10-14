@@ -114,9 +114,9 @@ def test_bots_decide_from_their_view_and_oracles_from_everything():
         assert "random_state" not in view and "development_listdeck" not in view
         assert "seed" not in view["game"]
         assert view["map"] and "action_records" in view
-        # The server's order: sorted by canonical JSON.
+        # The server's order: Catanatron's own (the same in every process).
         keys = [json.dumps(a, sort_keys=True, separators=(",", ":")) for a in playable]
-        assert keys == sorted(keys)
+        assert len(set(keys)) == len(keys) and all(len(a) == 3 for a in playable)
     for view, _ in seen["peek"]:
         state = view["player_state"]
         assert all(f"P{i}_WOOD_IN_HAND" in state for i in range(3))
@@ -400,7 +400,7 @@ def test_new_game_keeps_the_rules_and_seats():
 
 def test_settings_validate():
     assert GameSettings.from_json({"num_players": 5}).game_supply == EXTENSION_SUPPLY
-    assert GameSettings.from_json({"decision_timeout_ms": 5}).num_players == 4
+    assert GameSettings.from_json({"decision_timeout_ms": 5000}).num_players == 4
     for bad in ({"num_players": 7}, {"colour": 1}, {"supply": "x"}, {"map_type": "X"}):
         with pytest.raises(ValueError):
             GameSettings.from_json(bad)

@@ -198,9 +198,9 @@ def test_picking_on_the_board_by_click_and_by_keyboard():
     [(2, "BASE"), (3, SHAPES[0]), (4, SHAPES[2]), (5, SHAPES[3]), (6, SHAPES[1])],
 )
 def test_every_shape_and_player_count_draws_and_fits(num_players, shape):
-    settings = GameSettings(num_players=num_players)
-    if shape != "BASE":
-        settings.map = map_spec_file(shape)
+    settings = GameSettings(
+        num_players=num_players, map=None if shape == "BASE" else map_spec_file(shape)
+    )
     seats = ["human"] + ["F"] * (num_players - 1)
     app, session = make_app(seats, settings=settings, seed=num_players)
 

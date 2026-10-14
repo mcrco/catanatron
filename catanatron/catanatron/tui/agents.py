@@ -218,14 +218,9 @@ def _register_builtins() -> None:
 
 
 def canonical_order(actions: Sequence[Action]) -> list:
-    """``actions`` as JSON triples, in the order catanatron-server offers them
-    (sorted by their canonical JSON), so a bot sees the same list locally as
-    over the wire."""
-    triples = [action_to_json(a) for a in actions]
-    return sorted(
-        triples,
-        key=lambda t: json.dumps(t, sort_keys=True, separators=(",", ":")),
-    )
+    """``actions`` as JSON triples, in the order catanatron-server offers them:
+    Catanatron's own, which is the same in every process."""
+    return [action_to_json(a) for a in actions]
 
 
 def oracle_copy(game: Game, seed: int) -> Game:

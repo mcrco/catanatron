@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from catanatron.game import Game
-from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY, Supply
+from catanatron.models.decks import Supply
 from catanatron.models.enums import (
     CITY,
     DEVELOPMENT_CARDS,
@@ -35,8 +35,8 @@ from catanatron.models.enums import (
     Action,
     ActionType,
 )
-from catanatron.models.map import CatanMap, build_map
 from catanatron.models.player import Color, Player
+from catanatron.server.config import GameConfig
 from catanatron.serialization import (
     action_record_from_json,
     state_from_json,
@@ -44,67 +44,11 @@ from catanatron.serialization import (
 )
 
 FORMAT = "catanatron-tui/1"
-SUPPLIES = {"base": BASE_SUPPLY, "extension": EXTENSION_SUPPLY}
-MAP_TYPES = ("BASE", "MINI", "TOURNAMENT")
-NUMBER_PLACEMENTS = ("official_spiral", "random")
 #: The actions whose log entry carries their outcome in the action's value.
 CHANCE_IN_VALUE = (ActionType.ROLL, ActionType.BUY_DEVELOPMENT_CARD)
-
-
-@dataclass
-class GameSettings:
-    """The rules of a new game. The keys are those of a catanatron-server
-    room config (``GameConfig``), so one ``--config`` works for both."""
-
-    num_players: int = 4
-    #: BASE, MINI or TOURNAMENT; ignored when ``map`` is given.
-    map_type: str = "BASE"
-    #: An explicit map spec (``{"tiles": [...]}``, see catanatron.server.maps).
-    map: Optional[dict] = None
-    number_placement: str = "official_spiral"
-    vps_to_win: int = 10
-    discard_limit: int = 7
-    friendly_robber: bool = False
-    #: "base" or "extension"; None picks by the number of players.
-    supply: Optional[str] = None
-
-    @classmethod
-    def from_json(cls, payload: Optional[dict]) -> "GameSettings":
-        payload = dict(payload or {})
-        known = set(cls.__dataclass_fields__)
-        # Server-only keys are accepted and ignored, so one config serves both.
-        ignored = {"decision_timeout_ms", "autoplay_forced"}
-        unknown = set(payload) - known - ignored
-        if unknown:
-            raise ValueError(f"unknown config keys: {sorted(unknown)}")
-        settings = cls(**{k: v for k, v in payload.items() if k in known})
-        settings.validate()
-        return settings
-
-    def validate(self) -> None:
-        if not 2 <= self.num_players <= 6:
-            raise ValueError("num_players must be 2 to 6")
-        if self.map is None and self.map_type not in MAP_TYPES:
-            raise ValueError(f"map_type must be one of {MAP_TYPES}")
-        if self.number_placement not in NUMBER_PLACEMENTS:
-            raise ValueError(f"number_placement must be one of {NUMBER_PLACEMENTS}")
-        if self.supply is not None and self.supply not in SUPPLIES:
-            raise ValueError(f"supply must be one of {sorted(SUPPLIES)}")
-
-    @property
-    def game_supply(self) -> Supply:
-        name = self.supply or ("extension" if self.num_players > 4 else "base")
-        return SUPPLIES[name]
-
-    def to_json(self) -> dict:
-        return {k: v for k, v in asdict(self).items() if v is not None}
-
-    def build_map(self, rng: random.Random) -> CatanMap:
-        if self.map is not None:
-            from catanatron.server.maps import parse_map
-
-            return parse_map(self.map)
-        return build_map(self.map_type, self.number_placement, rng=rng)  # type: ignore[arg-type]
+#: The rules of a new game: catanatron-server's room config, so one
+#: ``--config`` works for both (server-only keys are simply not used here).
+GameSettings = GameConfig
 
 
 def colors_for(num_players: int) -> List[Color]:
