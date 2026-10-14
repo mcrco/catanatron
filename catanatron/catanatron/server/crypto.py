@@ -17,7 +17,10 @@ The scheme (see the server README for the threat model):
 * :func:`seal` -- a server message: recipient, sequence number, the hash of
   the previous message to that recipient, the state commitment and the
   body, signed with the server's Ed25519 key.
-* :func:`action_statement` -- what a client signs to make a move.
+* :func:`reveal_statement` -- what a seat signs when it reveals its seed:
+  the digest of the commitments it saw.
+* :func:`action_statement` -- what a client signs to make a move, bound to
+  the game's commitments and the move's index.
 """
 
 from __future__ import annotations
@@ -153,17 +156,34 @@ def join_statement(
     }
 
 
+def reveal_statement(commitments: str) -> dict:
+    """What a seat signs when it reveals its seed: that it saw this round's
+    commitments (``commitments`` is their digest), which name every seat's
+    fresh seed commitment. A key that did not take part in this game cannot
+    have signed it."""
+    return {"domain": "catanatron-reveal/1", "commitments": commitments}
+
+
 def action_statement(
-    room_id: str, game_id: str, index: int, seq: int, decide_hash: str, action: list
+    commitments: str, index: int, seq: int, decide_hash: str, action: list
 ) -> dict:
     """What a client signs to play ``action`` as the game's action number
     ``index``, in answer to the ``decide`` message number ``seq`` (whose hash
-    is ``decide_hash``)."""
+    is ``decide_hash``). ``commitments`` is the digest of the game's signed
+    commitments: fresh for every game, and known to every verifier, so a
+    statement cannot be replayed into another game."""
     return {
-        "room_id": room_id,
-        "game_id": game_id,
+        "domain": "catanatron-action/1",
+        "commitments": commitments,
         "index": index,
         "seq": seq,
         "decide": decide_hash,
         "action": action,
     }
+
+
+def submission_digest(statement: Any, signature: Any) -> str:
+    """How the server's receipt names a submitted action: statement and
+    signature together, so a receipt for a badly signed copy is not a
+    receipt for the real one."""
+    return digest({"statement": statement, "sig": signature})

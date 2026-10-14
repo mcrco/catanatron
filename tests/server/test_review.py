@@ -31,7 +31,7 @@ from catanatron.server.client import (
 )
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import digest, random_hex
-from catanatron.server.messages import decide_body
+from catanatron.server.messages import PROTOCOL_VERSION, decide_body
 from catanatron.server.room import Room, RoomError, RoomLimits
 from catanatron.server.verify import verify_transcript
 
@@ -112,7 +112,10 @@ class SilentClient(GameClient):
         return await super()._handle(ws, body, decide)
 
 
-def test_a_seat_that_does_not_reveal_is_blamed_and_the_game_is_void():
+def test_a_seat_that_does_not_reveal_is_replaced_and_the_others_commit_afresh():
+    """Withholding no longer voids the game: the withholder is out (and
+    barred), every seed is replaced, and the room fills again."""
+
     async def scenario():
         limits = ServerLimits(room=RoomLimits(reveal_timeout_ms=400))
         async with serving(limits=limits) as (server, base):
@@ -120,12 +123,44 @@ def test_a_seat_that_does_not_reveal_is_blamed_and_the_game_is_void():
             url = f"{base}/room/{room['id']}"
             honest, decide = bot_client(url, seat=0, verify=False)
             silent, decide2 = bot_client(url, client_class=SilentClient, seat=1)
-            return (
-                await asyncio.gather(honest.play(decide), silent.play(decide2)),
-                honest,
+            playing = asyncio.create_task(honest.play(decide))
+            withheld = await asyncio.gather(
+                silent.play(decide2), return_exceptions=True
             )
+            # The withholder's key may not come back.
+            again, decide3 = bot_client(url, key=silent.key, seat=1)
+            with pytest.raises(Refused, match="withheld"):
+                await again.play(decide3)
+            room_obj = server.rooms[room["id"]]
+            # Its address is barred from this room too: allow a second one in.
+            room_obj.banned_addresses.clear()
+            late, decide4 = bot_client(url, seat=1, verify=False)
+            results = await asyncio.gather(playing, late.play(decide4))
+            return honest, late, results, room_obj, withheld
 
-    (result, _), honest = run(scenario())
+    honest, late, results, room, withheld = run(scenario())
+    assert room.status == "finished" and room.round == 1
+    kinds = [m["body"]["type"] for m in honest.messages]
+    assert kinds.count("commitments") == 2 and kinds.count("restart") == 1
+    for client in (honest, late):
+        report = verify_transcript(client.transcript())
+        assert report.ok, report.errors
+
+
+def test_a_room_whose_seats_keep_withholding_is_called_off():
+    async def scenario():
+        limits = ServerLimits(room=RoomLimits(reveal_timeout_ms=300, max_rounds=1))
+        async with serving(limits=limits) as (server, base):
+            room = await create_room(base, CONFIG, [None, None, "F"])
+            url = f"{base}/room/{room['id']}"
+            honest, decide = bot_client(url, seat=0, verify=False)
+            silent, decide2 = bot_client(url, client_class=SilentClient, seat=1)
+            results = await asyncio.gather(
+                honest.play(decide), silent.play(decide2), return_exceptions=True
+            )
+            return results[0], honest
+
+    result, honest = run(scenario())
     assert result.aborted["blame"] == [1]
     assert result.verified is False
     errors = verify_transcript(honest.transcript()).errors
@@ -218,13 +253,19 @@ def test_a_game_other_than_the_committed_one_is_caught(room_class):
     clients, results, _ = play(room_class)
     for client in clients:
         errors = errors_of(client)
+        assert errors, "the game is not the committed one"
         assert (
-            any_error(errors, "advertised")
-            or any_error(errors, "committed")
-            or any_error(errors, "not seated in the game as it joined")
+            any_error(errors, "committed")
+            or any_error(errors, "published")
+            or any_error(errors, "malformed")
+            or any_error(errors, "vps_to_win")
         ), errors
     strict, results, _ = play(room_class, GameClient)
-    assert all(isinstance(r, ServerMisbehaved) for r in results)
+    # The live client refuses the game when it can tell from the messages; a
+    # change it cannot see there fails verification at the end.
+    assert all(
+        isinstance(r, ServerMisbehaved) or errors_of(c) for c, r in zip(strict, results)
+    )
 
 
 # ===== C. statements, refusals and the message schedule =====
@@ -281,7 +322,7 @@ def test_a_refused_legal_move_is_not_replaced_and_is_reported():
     assert all(
         len(statements) == 1 for statements in by_index.values()
     ), "never a second move"
-    assert any_error(errors_of(red), "refused this client's legal")
+    assert any_error(errors_of(red), "never acknowledged this client's legal")
 
 
 class ResolicitRoom(Room):
@@ -506,40 +547,68 @@ class CrashingBot(Player):
 
 class SlowBot(Player):
     def decide(self, game, playable_actions):
-        time.sleep(0.4)
+        time.sleep(3)
         return playable_actions[0]
+
+
+class ExitingBot(Player):
+    def decide(self, game, playable_actions):
+        raise SystemExit("a bot that quits the process")
 
 
 @pytest.fixture
 def test_bots():
     REGISTRY.register("CRASHTEST", CrashingBot, replace=True)
     REGISTRY.register("SLOWTEST", SlowBot, replace=True)
+    REGISTRY.register("EXITTEST", ExitingBot, replace=True)
     yield
-    REGISTRY.pop("CRASHTEST", None)
-    REGISTRY.pop("SLOWTEST", None)
+    for key in ("CRASHTEST", "SLOWTEST", "EXITTEST"):
+        REGISTRY.pop(key, None)
 
 
 def watch(seats, config):
+    """A spectator's view of a game of server bots; also returns the room and
+    every bot worker process the room used."""
+
     async def scenario():
         async with serving() as (server, base):
             room = await create_room(base, config, seats)
             watcher = GameClient(
                 f"{base}/room/{room['id']}", spectate=True, transcript_dir=None
             )
-            peak = 0
+            room_obj = server.rooms[room["id"]]
+            workers = {}  # pid -> most processes it ever had under it
 
             async def sample():
-                nonlocal peak
+                import psutil
+
                 while True:
-                    peak = max(peak, server.runner.running())
-                    await asyncio.sleep(0.02)
+                    process = room_obj.worker.process
+                    if process is not None and process.pid:
+                        try:
+                            under = len(
+                                psutil.Process(process.pid).children(recursive=True)
+                            )
+                        except psutil.Error:
+                            under = 0
+                        workers[process.pid] = max(workers.get(process.pid, 0), under)
+                    await asyncio.sleep(0.01)
 
             sampler = asyncio.create_task(sample())
             result = await watcher.play()
             sampler.cancel()
-            return result, server.rooms[room["id"]], peak
+            return result, room_obj, workers
 
     return run(scenario())
+
+
+def gone(pid):
+    import psutil
+
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
 
 
 def test_a_failing_bot_does_not_end_the_game(test_bots):
@@ -549,12 +618,39 @@ def test_a_failing_bot_does_not_end_the_game(test_bots):
     assert any(a["forced"] == "bot_error" for a in room.actions)
 
 
-def test_a_slow_bot_never_runs_two_decisions_at_once(test_bots):
-    config = {"num_players": 2, "vps_to_win": 3, "decision_timeout_ms": 100}
-    result, room, peak = watch(["SLOWTEST", "R"], config)
+def test_a_bot_raising_system_exit_does_not_take_the_server_down(test_bots):
+    result, room, _ = watch(["EXITTEST", "F"], {"num_players": 2, "vps_to_win": 3})
     assert result.verified, result.report.errors
-    assert peak <= 2  # its one running decision, and R's
+    assert room.status == "finished"
+    assert any(a["forced"] == "bot_error" for a in room.actions)
+
+
+def test_a_bot_that_overruns_is_killed_with_its_worker(test_bots):
+    config = {"num_players": 2, "vps_to_win": 3, "decision_timeout_ms": 1000}
+    result, room, workers = watch(["SLOWTEST", "F"], config)
+    assert result.verified, result.report.errors
     assert any(a["forced"] == "timeout" for a in room.actions)
+    assert len(workers) > 1, "each overrun killed the worker and started another"
+    for _ in range(100):
+        if all(gone(pid) for pid in workers):
+            break
+        time.sleep(0.05)
+    assert all(gone(pid) for pid in workers), "no worker outlives its game"
+
+
+def test_bots_in_workers_do_not_fork_process_pools():
+    from catanatron.players import playouts
+    from catanatron.server import botproc
+
+    assert playouts.USE_MULTIPROCESSING  # the default, outside the server
+    result, room, workers = watch(
+        ["G:2", "R"], {"num_players": 2, "vps_to_win": 3, "decision_timeout_ms": 5000}
+    )
+    assert result.verified, result.report.errors
+    assert room.status == "finished"
+    assert workers, "the G bot ran in a worker"
+    assert max(workers.values()) == 0, "G's process pool would be the worker's children"
+    assert botproc.context().get_start_method() in ("forkserver", "spawn")
 
 
 @pytest.mark.parametrize("spec", ["AB:5", "M:5000", "G:1000"])
@@ -672,7 +768,9 @@ def test_connections_per_room_are_capped():
     assert run(scenario()) == 1013
 
 
-def test_connections_that_have_not_joined_get_no_room_broadcasts():
+def test_connections_that_have_not_joined_see_the_seats_change():
+    """A page looking at a waiting room keeps its seat picker current."""
+
     async def scenario():
         async with serving() as (server, base):
             room = await create_room(base, {"num_players": 3}, [None, None, None])
@@ -682,13 +780,13 @@ def test_connections_that_have_not_joined_get_no_room_broadcasts():
             request, _, _ = join_request(hello)
             await joiner.send(json.dumps(request))
             await next_body(joiner, "joined")
-            await asyncio.sleep(0.3)
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(idle.recv(), 0.3)
+            update = await next_body(idle, "room")
             await idle.close()
             await joiner.close()
+            return update
 
-    run(scenario())
+    update = run(scenario())
+    assert [s["kind"] for s in update["room"]["seats"]].count("remote") == 1
 
 
 def test_room_creation_is_rate_limited():
@@ -754,7 +852,7 @@ def test_a_rejoin_closes_the_old_connection():
                 json.dumps(
                     {
                         "type": "join",
-                        "protocol_version": 2,
+                        "protocol_version": PROTOCOL_VERSION,
                         "seat": 0,
                         "seat_key": joined["seat_key"],
                         "public_key": key.public_hex,
@@ -787,9 +885,9 @@ def test_a_client_survives_many_brief_drops():
     async def scenario():
         async with serving() as (server, base):
             room = await create_room(
-                base, {"num_players": 2, "vps_to_win": 5}, [None, "R"]
+                base, {"num_players": 2, "vps_to_win": 5}, [None, "F"]
             )
-            client, decide = bot_client(f"{base}/room/{room['id']}", "R")
+            client, decide = bot_client(f"{base}/room/{room['id']}", "F")
             drops = []
 
             def on_message(body):
@@ -797,11 +895,7 @@ def test_a_client_survives_many_brief_drops():
                     body["type"] not in ("step", "decide")
                     or client.table.index == body["index"]
                 ), "the hook runs after the table took the message in"
-                if (
-                    body["type"] == "step"
-                    and body["index"] % 15 == 0
-                    and len(drops) < 8
-                ):
+                if body["type"] == "step" and body["index"] % 4 == 0 and len(drops) < 8:
                     drops.append(body["index"])
                     asyncio.get_running_loop().create_task(client.connection.close())
 

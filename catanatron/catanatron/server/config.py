@@ -100,7 +100,7 @@ class GameConfig:
             catan_map = self.build_map(random.Random(0))
         except MapError as error:
             raise ConfigError(f"map: {error}")
-        seats = settlement_spots(catan_map.layout)
+        seats = settlement_spots(catan_map.layout, 2 * self.num_players)
         if seats < 2 * self.num_players:
             raise ConfigError(
                 f"this map can run out of settlement spots after {seats} "
@@ -133,34 +133,35 @@ def _int(value: Any) -> int:
     return value
 
 
-@functools.lru_cache(maxsize=64)
-def settlement_spots(layout: Layout, trials: int = 48) -> int:
-    """How few settlements can use up a board's spots, as far as seeded
-    random and greedy placements find (an estimate of the smallest maximal
-    set of spots no two of which are neighbors)."""
+@functools.lru_cache(maxsize=256)
+def settlement_spots(layout: Layout, enough: int = 13) -> int:
+    """The fewest settlements that can use up a board's spots, exactly (the
+    smallest set of nodes, no two neighbors, that leaves no node free: the
+    independent domination number), or ``enough`` if it is at least that.
+
+    Players placing adversarially can reach that minimum, so a board seats
+    ``n`` players only if it is at least ``2 * n``. Branch and bound: some
+    spot in the closed neighborhood of the first free node must be taken,
+    and each placement frees at most ``1 + max degree`` spots.
+    """
     graph = layout_graph(layout)
-    nodes = sorted(graph.nodes)
-    rng = random.Random(0)
-    fewest = len(nodes)
-    for trial in range(trials):
-        free, placed = set(nodes), 0
-        while free:
-            candidates = sorted(free)
-            if trial % 2:  # greedily block as many spots as possible
-                node = max(
-                    candidates,
-                    key=lambda v: (
-                        sum(1 for u in graph.neighbors(v) if u in free),
-                        rng.random(),
-                    ),
-                )
-            else:
-                node = rng.choice(candidates)
-            free.discard(node)
-            free.difference_update(graph.neighbors(node))
-            placed += 1
-        fewest = min(fewest, placed)
-    return fewest
+    neighbors = {v: frozenset(graph.neighbors(v)) for v in graph.nodes}
+    reach = 1 + max((len(n) for n in neighbors.values()), default=0)
+    best = [enough]
+
+    def search(free: frozenset, placed: int) -> None:
+        if not free:
+            best[0] = min(best[0], placed)
+            return
+        if placed + -(-len(free) // reach) >= best[0]:
+            return  # cannot beat the best found
+        # Branch on the free node with the fewest free choices around it.
+        node = min(free, key=lambda v: (len(neighbors[v] & free), v))
+        for choice in sorted({node} | (neighbors[node] & free)):
+            search(free - {choice} - neighbors[choice], placed + 1)
+
+    search(frozenset(graph.nodes), 0)
+    return best[0]
 
 
 class ServerSeat(Player):

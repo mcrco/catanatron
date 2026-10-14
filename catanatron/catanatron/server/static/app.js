@@ -7,7 +7,7 @@
 // transcript, which it stores in IndexedDB for `catanatron-verify`.
 "use strict";
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const GENESIS = "0".repeat(64);
 const RESOURCES = ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"];
 const DEV_CARDS = ["KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT"];
@@ -51,6 +51,8 @@ const headOf = (env) => ({ to: env.to, seq: env.seq, prev: env.prev, commit: env
 let cryptoProblem = null;
 let noEd25519 = false;
 const HEX64 = /^[0-9a-f]{64}$/;
+// The errors that answer a join (any other error leaves a join in flight).
+const JOIN_REFUSALS = new Set(["seat_taken", "room_full", "bad_join", "duplicate_key", "game_started", "banned"]);
 async function checkCrypto() {
   if (!subtle) {
     cryptoProblem = "WebCrypto is unavailable (open the page over https or on localhost): you can watch, unverified, but not play.";
@@ -99,6 +101,7 @@ function checkedKey(key) {
   if (typeof key !== "string" || !HEX64.test(key)) throw new Error("the server's key is not an Ed25519 key");
   return key;
 }
+async function sha256OfHex(hex) { return toHex(await subtle.digest("SHA-256", fromHex(hex))); }
 async function clientSeedCommitment(roomId, publicKey, clientSeed) {
   return sha256Hex(canonical({
     domain: "catanatron-client-seed/1", room_id: roomId, public_key: publicKey, client_seed: clientSeed,
@@ -168,8 +171,7 @@ async function refreshRooms() {
   for (const room of rooms.reverse()) {
     const row = document.createElement("tr");
     const seats = room.seats.map((s) => (s.kind === "open" ? "open" : `${s.name} (${s.kind})`)).join(", ");
-    row.innerHTML = `<td>${escapeHtml(room.name)}</td><td>${room.status}</td>` +
-      `<td>${room.config.num_players}</td><td>${escapeHtml(seats)}</td><td></td>`;
+    setHtml(row, html`<td>${room.name}</td><td>${room.status}</td><td>${room.config.num_players}</td><td>${seats}</td><td></td>`);
     const open = document.createElement("button");
     open.textContent = room.status === "waiting" ? "Open" : "Watch";
     open.onclick = () => { location.hash = "room=" + room.id; };
@@ -186,8 +188,7 @@ function renderSeatSpecs() {
   const colors = Object.keys(PLAYER_COLORS);
   for (let i = 0; i < count; i++) {
     const select = document.createElement("select");
-    select.innerHTML = '<option value="">open (a person or a remote bot)</option>' +
-      players.map((p) => `<option value="${p.key}">bot: ${p.key} (${escapeHtml(p.name)})</option>`).join("");
+    options(select, [["", "open (a person or a remote bot)"], ...players.map((p) => [p.key, `bot: ${p.key} (${p.name})`])]);
     select.value = previous[i] !== undefined ? previous[i] : (i === 0 ? "" : "F");
     const row = document.createElement("div");
     row.className = "seat-row";
@@ -233,8 +234,30 @@ const SERVER = QUERY.get("server") || location.host;
 const TLS = QUERY.get("server") ? QUERY.get("tls") === "1" : location.protocol === "https:";
 const wsUrl = (path) => (TLS ? "wss://" : "ws://") + SERVER + path;
 const apiUrl = (path) => (TLS ? "https://" : "http://") + SERVER + path;
+// Everything the server sends is data, never markup: interpolate it with
+// html`...`, which escapes every value (an html`` fragment stays as is).
+class SafeHtml { constructor(text) { this.text = text; } toString() { return this.text; } }
+function html(strings, ...values) {
+  let out = strings[0];
+  values.forEach((value, i) => {
+    const parts = Array.isArray(value) ? value : [value];
+    out += parts.map((part) => (part instanceof SafeHtml ? part.text : escapeHtml(part))).join("") + strings[i + 1];
+  });
+  return new SafeHtml(out);
+}
+function setHtml(element, fragment) { element.innerHTML = fragment.text; }
+function addHtml(element, fragment) { element.insertAdjacentHTML("beforeend", fragment.text); }
+function options(select, entries) {
+  // [value, label] pairs, built as DOM nodes (never markup).
+  select.replaceChildren(...entries.map(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+}
 function escapeHtml(text) {
-  return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(text === undefined || text === null ? "" : text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // ===== a room =====
@@ -255,6 +278,10 @@ class Session {
     this.pending = null; // { env, hash, body }
     this.answered = false;
     this.answer = null; // the signed action for the pending decide
+    this.unreceipted = new Map(); // submission digest -> signed action not yet acknowledged
+    this.commitRequest = null; // a fresh commitment after a restart, until accepted
+    this.revealRequest = null;
+    this.C = null; // the digest of this game's commitments, which every move signs
     this.closed = false;
     this.verifiedCount = 0;
     this.unverified = 0;
@@ -323,9 +350,15 @@ class Session {
         this.send({ type: "spectate" });
         return;
       }
+      if (this.messages.length) {
+        // Reconnected before taking a seat: this connection is a new chain.
+        this.resetTranscript();
+        this.joining = false;
+      }
       await this.accept(text, env);
       if (body.protocol_version !== PROTOCOL_VERSION) throw new Error(`the server speaks protocol ${body.protocol_version}`);
       this.room = body.room;
+      this.serverCommitment = body.room.seed_commitment;
       if (body.room.status !== "waiting") this.spectate(); // too late to sit
       render();
       return;
@@ -340,7 +373,7 @@ class Session {
       this.resyncing = false;
     }
     await this.accept(text, env);
-    this.handle(env);
+    await this.handle(env);
   }
 
   async accept(text, env) {
@@ -360,7 +393,7 @@ class Session {
     env.hash = this.head;
   }
 
-  handle(env) {
+  async handle(env) {
     const body = env.body;
     switch (body.type) {
       case "joined": {
@@ -378,25 +411,42 @@ class Session {
         this.room = body.room;
         break;
       }
+      case "hello": // the seat chain's first message, resent after a reload
+        this.room = body.room;
+        this.serverCommitment = body.room.seed_commitment;
+        break;
       case "room":
         this.room = body.room;
         break;
+      case "restart":
+        await this.restart(body);
+        break;
       case "commitments":
         this.commitments = body;
-        if (this.seated) {
+        this.commitRequest = null;
+        this.C = await sha256Hex(canonical(body));
+        if (this.seated && !this.game) {
           const mine = body.seats.find((s) => s.public_key === this.saved.identity.publicHex);
           if (!mine || mine.seat !== this.saved.seat || mine.client_commitment !== this.saved.clientCommitment) {
             this.problems.push("the commitments do not seat this page as it joined");
             break;
           }
-          this.send({ type: "reveal", client_seed: this.saved.clientSeed });
+          if (!this.identity) this.identity = await loadIdentity(this.saved.identity);
+          const sig = await signHex(this.identity.privateKey, { domain: "catanatron-reveal/1", commitments: this.C });
+          this.revealRequest = { type: "reveal", client_seed: this.saved.clientSeed, sig };
+          this.send(this.revealRequest);
+        }
+        break;
+      case "received":
+        this.unreceipted.delete(body.submission);
+        if (!body.accepted && this.pending && body.index === this.pending.body.index) {
+          this.problems.push("the server did not take your move: " + body.reason);
         }
         break;
       case "error":
-        if (body.code !== "not_revealing") this.problems.push(body.message);
-        if (this.joining && body.code !== "bad_action") this.joining = false;
-        // A refused move is not replaced by another signed move: the server
-        // times the decision out, and the verifier sees the refusal.
+        if (body.code !== "not_revealing" && body.code !== "not_committing") this.problems.push(body.message);
+        // Only an answer to the join itself ends the wait for it.
+        if (this.joining && JOIN_REFUSALS.has(body.code)) this.joining = false;
         break;
       case "aborted":
         this.aborted = body;
@@ -420,10 +470,48 @@ class Session {
   }
 
   resume() {
-    // After a rejoin: finish what the drop interrupted. (Both are harmless
-    // if the server already had them.)
-    if (this.commitments && !this.game) this.send({ type: "reveal", client_seed: this.saved.clientSeed });
-    if (this.pending && this.answer) this.send(this.answer);
+    // After a rejoin: finish what the drop interrupted. Resending is harmless
+    // (the server's receipt says "stale" for what it already had), and every
+    // answer it never acknowledged is resent, so each gets a receipt.
+    if (this.commitRequest) this.send(this.commitRequest);
+    if (this.revealRequest && !this.game) this.send(this.revealRequest);
+    for (const answer of this.unreceipted.values()) this.send(answer);
+  }
+
+  async restart(body) {
+    // A seat withheld its seed: the server must reveal the seed it had
+    // committed to; then we commit afresh to a new seed of our own.
+    if (body.room_id !== this.roomId || !HEX64.test(body.server_seed || "") ||
+        (subtle && (await sha256OfHex(body.server_seed)) !== this.serverCommitment)) {
+      throw new Error("the restart does not open the server's seed commitment");
+    }
+    this.serverCommitment = body.seed_commitment;
+    this.room = body.room;
+    this.commitments = null;
+    this.revealRequest = null;
+    if (!this.seated) return;
+    if ((body.blame || []).includes(this.saved.seat)) {
+      this.problems.push("the server says this page did not reveal its seed in time");
+      return;
+    }
+    if ((this.saved.round || 0) >= body.round) {
+      // A restart already handled (the chain is being replayed after a
+      // reload): resend that round's commitment, harmless if it arrived.
+      this.commitRequest = { type: "commit", client_commitment: this.saved.clientCommitment, pop: this.saved.pop };
+      this.send(this.commitRequest);
+      return;
+    }
+    if (!this.identity) this.identity = await loadIdentity(this.saved.identity);
+    const clientSeed = randomHex(32);
+    const clientCommitment = await clientSeedCommitment(this.roomId, this.identity.publicHex, clientSeed);
+    const pop = await signHex(this.identity.privateKey, {
+      domain: "catanatron-join/1", room_id: this.roomId, seed_commitment: this.serverCommitment,
+      seat: this.saved.seat, client_commitment: clientCommitment,
+    });
+    this.saved = { ...this.saved, clientSeed, clientCommitment, pop, round: body.round };
+    localStorage.setItem(this.storageKey, JSON.stringify(this.saved));
+    this.commitRequest = { type: "commit", client_commitment: clientCommitment, pop };
+    this.send(this.commitRequest);
   }
 
   update(body) {
@@ -452,13 +540,13 @@ class Session {
     const clientSeed = randomHex(32);
     const clientCommitment = await clientSeedCommitment(this.roomId, this.identity.publicHex, clientSeed);
     const statement = {
-      domain: "catanatron-join/1", room_id: this.roomId, seed_commitment: this.room.seed_commitment,
+      domain: "catanatron-join/1", room_id: this.roomId, seed_commitment: this.serverCommitment,
       seat: index, client_commitment: clientCommitment,
     };
     const pop = await signHex(this.identity.privateKey, statement);
     this.saved = {
       identity: { publicHex: this.identity.publicHex, privatePkcs8: this.identity.privatePkcs8 },
-      clientSeed, clientCommitment,
+      clientSeed, clientCommitment, pop, round: this.room.round || 0,
     };
     localStorage.setItem(this.storageKey, JSON.stringify(this.saved));
     this.send({
@@ -477,19 +565,20 @@ class Session {
     this.answered = true;
     const pending = this.pending;
     const statement = {
-      room_id: this.roomId, game_id: pending.body.game_id, index: pending.body.index,
+      domain: "catanatron-action/1", commitments: this.C, index: pending.body.index,
       seq: pending.env.seq, decide: pending.hash, action,
     };
     const sig = await signHex(this.identity.privateKey, statement);
-    this.sent.push({ statement, sig });
+    this.sent.push({ statement, sig, sent_after: this.messages.length - 1 });
     this.answer = { type: "action", statement, sig };
-    this.send(this.answer); // resent after a reconnect if this one is lost
+    this.unreceipted.set(await sha256Hex(canonical({ statement, sig })), this.answer);
+    this.send(this.answer); // resent after a reconnect until acknowledged
     render();
   }
 
   transcript() {
     return {
-      format: "catanatron-transcript/2",
+      format: "catanatron-transcript/3",
       url: wsUrl("/room/" + this.roomId),
       room_id: this.roomId,
       server_key: this.serverKey,
@@ -542,6 +631,9 @@ function render() {
   renderFairness();
 }
 
+function swatch(color) { return PLAYER_COLORS[color] || "#999"; }
+function storedName() { try { return localStorage.getItem("catanatron-name") || ""; } catch (error) { return ""; } }
+
 function seatInfo(color) {
   const seats = session.game ? session.game.seats : (session.room ? session.room.seats : []);
   return seats.find((s) => s.color === color) || {};
@@ -551,33 +643,32 @@ function renderSeating() {
   const box = $("#seating");
   const room = session.room;
   if (!room || session.game) {
-    box.innerHTML = room ? `<h3>${escapeHtml(room.name)}</h3><div class="muted">room ${room.id}</div>` : "";
+    setHtml(box, room ? html`<h3>${room.name}</h3><div class="muted">room ${room.id}</div>` : html``);
     return;
   }
-  box.innerHTML = `<h3>${escapeHtml(room.name)} <span class="muted">(${room.status})</span></h3>`;
+  setHtml(box, html`<h3>${room.name} <span class="muted">(${room.status})</span></h3>`);
   const canSit = !session.seated && !session.spectating && !session.joining && room.status === "waiting";
   if (canSit) {
-    box.insertAdjacentHTML("beforeend", '<label>Your name <input id="my-name" maxlength="32" value="' +
-      escapeHtml(localStorage.getItem("catanatron-name") || "") + '"></label>');
+    addHtml(box, html`<label>Your name <input id="my-name" maxlength="32" value="${storedName()}"></label>`);
     $("#my-name").onchange = (e) => localStorage.setItem("catanatron-name", e.target.value);
   }
   for (const seat of room.seats) {
     const row = document.createElement("div");
     row.className = "seat-row";
-    const who = seat.kind === "open" ? '<span class="muted">open</span>'
-      : `${escapeHtml(seat.name)} <span class="muted">(${seat.kind}${seat.kind === "remote" && !seat.connected ? ", away" : ""})</span>`;
-    row.innerHTML = `<span class="swatch" style="background:${PLAYER_COLORS[seat.color]}"></span>${seat.color}: ${who}`;
+    const who = seat.kind === "open" ? html`<span class="muted">open</span>`
+      : html`${seat.name} <span class="muted">(${seat.kind}${seat.kind === "remote" && !seat.connected ? ", away" : ""})</span>`;
+    setHtml(row, html`<span class="swatch" style="background:${swatch(seat.color)}"></span>${seat.color}: ${who}`);
     if (seat.kind === "open" && room.status === "waiting") {
       if (canSit) row.append(button("Sit here", () => session.takeSeat(seat.seat), "primary"));
       const select = document.createElement("select");
-      select.innerHTML = players.map((p) => `<option>${p.key}</option>`).join("");
+      options(select, players.map((p) => [p.key, p.key]));
       select.value = "F";
       row.append(select, button("Add bot", () => session.seatBot(seat.seat, select.value)));
     }
     box.append(row);
   }
-  if (session.joining) box.insertAdjacentHTML("beforeend", "<p>Taking the seat...</p>");
-  if (session.seated) box.insertAdjacentHTML("beforeend", `<p>You are seat ${session.saved.seat}. The game starts when every seat is taken.</p>`);
+  if (session.joining) addHtml(box, html`<p>Taking the seat...</p>`);
+  if (session.seated) addHtml(box, html`<p>You are seat ${session.saved.seat}. The game starts when every seat is taken.</p>`);
   else if (!session.spectating) box.append(button("Just watch", () => session.spectate()));
   if (!players.length) fetch(apiUrl("/api/players")).then((r) => r.json()).then((p) => { players = p; renderSeating(); });
 }
@@ -734,12 +825,11 @@ function renderMe() {
     box.innerHTML = '<h3>Spectating</h3><div class="muted">Every hand is hidden from you.</div>';
     return;
   }
-  const cards = RESOURCES.map((r) => `<span>${r.toLowerCase()} ${ps(game.color, r + "_IN_HAND")}</span>`).join("");
-  const devs = DEV_CARDS.map((c) => [c, ps(game.color, c + "_IN_HAND")]).filter(([, n]) => n > 0)
-    .map(([c, n]) => `<span>${c.toLowerCase().replace(/_/g, " ")} ${n}</span>`).join("") || '<span class="muted">none</span>';
-  box.innerHTML = `<h3><span class="swatch" style="background:${PLAYER_COLORS[game.color]}"></span>You are ${game.color}` +
-    ` · ${ps(game.color, "ACTUAL_VICTORY_POINTS")} VP</h3>` +
-    `<div class="cards">${cards}</div><div class="cards">Development cards: ${devs}</div>`;
+  const cards = RESOURCES.map((r) => html`<span>${r.toLowerCase()} ${ps(game.color, r + "_IN_HAND")}</span>`);
+  const held = DEV_CARDS.map((c) => [c, ps(game.color, c + "_IN_HAND")]).filter(([, n]) => n > 0)
+    .map(([c, n]) => html`<span>${c.toLowerCase().replace(/_/g, " ")} ${n}</span>`);
+  const devs = held.length ? held : html`<span class="muted">none</span>`;
+  setHtml(box, html`<h3><span class="swatch" style="background:${swatch(game.color)}"></span>You are ${game.color} · ${ps(game.color, "ACTUAL_VICTORY_POINTS")} VP</h3><div class="cards">${cards}</div><div class="cards">Development cards: ${devs}</div>`);
 }
 
 function actionLabel(action) {
@@ -799,7 +889,7 @@ function renderPlayers() {
   const game = session.game;
   const box = $("#players");
   const state = game.state;
-  box.innerHTML = `<h3>Table</h3>`;
+  setHtml(box, html`<h3>Table</h3>`);
   for (const color of state.colors) {
     const mine = color === game.color;
     const resources = mine ? RESOURCES.reduce((n, r) => n + ps(color, r + "_IN_HAND"), 0) : ps(color, "NUM_RESOURCES_IN_HAND");
@@ -808,17 +898,14 @@ function renderPlayers() {
     const seat = seatInfo(color);
     const row = document.createElement("div");
     row.className = "player" + (color === game.current && !game.over ? " current" : "");
-    row.innerHTML = `<div><span class="swatch" style="background:${PLAYER_COLORS[color]}"></span><b>${escapeHtml(seat.name || color)}</b>` +
-      ` <span class="muted">${seat.kind || ""}</span></div><div><b>${ps(color, "VICTORY_POINTS")}</b> VP</div>` +
-      `<div class="muted">${resources} cards · ${devs} dev · ${ps(color, "PLAYED_KNIGHT")} knights · road ${ps(color, "LONGEST_ROAD_LENGTH")}</div>` +
-      `<div class="muted">${badges}</div>`;
+    setHtml(row, html`<div><span class="swatch" style="background:${swatch(color)}"></span><b>${seat.name || color}</b> <span class="muted">${seat.kind || ""}</span></div><div><b>${ps(color, "VICTORY_POINTS")}</b> VP</div><div class="muted">${resources} cards · ${devs} dev · ${ps(color, "PLAYED_KNIGHT")} knights · road ${ps(color, "LONGEST_ROAD_LENGTH")}</div><div class="muted">${badges}</div>`);
     box.append(row);
   }
-  const bank = state.resource_freqdeck.map((n, i) => `<span>${RESOURCES[i].toLowerCase()} ${n}</span>`).join("");
+  const bank = state.resource_freqdeck.map((n, i) => html`<span>${RESOURCES[i].toLowerCase()} ${n}</span>`);
   const deck = state.development_deck_size !== undefined ? state.development_deck_size : "?";
-  box.insertAdjacentHTML("beforeend", `<div class="cards">Bank: ${bank}<span>dev deck ${deck}</span></div>`);
+  addHtml(box, html`<div class="cards">Bank: ${bank}<span>dev deck ${deck}</span></div>`);
   const roll = [...game.log].reverse().find(([a]) => a[1] === "ROLL");
-  if (roll) box.insertAdjacentHTML("beforeend", `<div>Last roll: <b>${roll[1][0]} + ${roll[1][1]} = ${roll[1][0] + roll[1][1]}</b> (${roll[0][0]})</div>`);
+  if (roll) addHtml(box, html`<div>Last roll: <b>${roll[1][0]} + ${roll[1][1]} = ${Number(roll[1][0]) + Number(roll[1][1])}</b> (${roll[0][0]})</div>`);
 }
 
 function logText([action, result]) {
@@ -848,20 +935,20 @@ function renderLog() {
 function renderFairness() {
   const box = $("#fairness");
   const s = session;
-  const lines = [`<h3>Fairness</h3>`];
-  if (s.room) lines.push(`<div class="muted">Seed commitment: <code>${s.room.seed_commitment.slice(0, 16)}…</code></div>`);
-  lines.push(`<div>${s.messages.length} messages, ${s.verifiedCount} signatures checked here` +
-    (s.serverKey ? `; server key <code>${s.serverKey.slice(0, 16)}…</code>` : "") + `</div>`);
-  if (s.unverified) lines.push(`<div class="error">${s.unverified} messages could not be checked in this browser: this session is unverified.</div>`);
+  const short = (value) => String(value || "").slice(0, 16);
+  const lines = [html`<h3>Fairness</h3>`];
+  if (s.room) lines.push(html`<div class="muted">Seed commitment: <code>${short(s.room.seed_commitment)}…</code></div>`);
+  const key = s.serverKey ? html`; server key <code>${short(s.serverKey)}…</code>` : html``;
+  lines.push(html`<div>${s.messages.length} messages, ${s.verifiedCount} signatures checked here${key}</div>`);
+  if (s.unverified) lines.push(html`<div class="error">${s.unverified} messages could not be checked in this browser: this session is unverified.</div>`);
   if (serverInfo.app_sha256) {
-    lines.push(`<div class="muted">The server says it serves app.js with SHA-256 <code>${serverInfo.app_sha256.slice(0, 16)}…</code>. ` +
-      "This page only protects you from the server if it did not come from that server: see the README.</div>");
+    lines.push(html`<div class="muted">The server says it serves app.js with SHA-256 <code>${short(serverInfo.app_sha256)}…</code>. This page only protects you from the server if it (and index.html) did not come from that server: see the README.</div>`);
   }
-  if (cryptoProblem) lines.push(`<div class="error">${escapeHtml(cryptoProblem)}</div>`);
-  for (const problem of s.problems.slice(-3)) lines.push(`<div class="error">${escapeHtml(problem)}</div>`);
-  box.innerHTML = lines.join("");
+  if (cryptoProblem) lines.push(html`<div class="error">${cryptoProblem}</div>`);
+  for (const problem of s.problems.slice(-3)) lines.push(html`<div class="error">${problem}</div>`);
+  setHtml(box, html`${lines}`);
   if (s.aborted || (s.game && s.game.over)) {
-    box.insertAdjacentHTML("beforeend", "<div>The server revealed its seed. Check the game with <code>catanatron-verify</code>:</div>");
+    addHtml(box, html`<div>The server revealed its seed. Check the game with <code>catanatron-verify</code>:</div>`);
     box.append(button("Download transcript", () => download((s.saveId || "transcript") + ".json", JSON.stringify(s.transcript())), "primary"));
   }
 }

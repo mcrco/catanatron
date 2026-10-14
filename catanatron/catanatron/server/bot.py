@@ -4,7 +4,7 @@
 ``--bot`` imports...). It never sees the real game: each decision is made on
 a game sampled from the seat's view (:mod:`catanatron.server.sampling`), and
 only among the actions the seat was offered. The server seats its own bots
-this way (running each decision in a :class:`BotRunner` thread), and
+this way (in worker processes, :mod:`catanatron.server.botproc`), and
 ``catanatron-play-bot`` runs one as a remote client::
 
     catanatron-play-bot --spec AB:2 ws://localhost:8765/room/ROOM_ID
@@ -20,13 +20,16 @@ import json
 import logging
 import random
 import sys
-import threading
-from typing import Callable, Optional, Sequence
+import time
+from collections import deque
+from typing import Optional, Sequence
 
 from catanatron.models.decks import Supply
 from catanatron.models.player import Color
 from catanatron.registry import REGISTRY, SpecError
-from catanatron.serialization import action_to_json
+from catanatron.observer import GameObserver
+from catanatron.serialization import action_from_json, action_to_json
+from catanatron.server.botproc import pace
 from catanatron.server.sampling import sample_game
 
 logger = logging.getLogger(__name__)
@@ -44,25 +47,42 @@ def _registry():
 
 
 class ViewBot:
-    """A registry player deciding on games sampled from a seat's view."""
+    """A registry player deciding on games sampled from a seat's view.
+
+    A seat with only one legal move answers it as slowly as it answers real
+    decisions (a duration drawn from its own past ones): otherwise the speed
+    of the answer would tell the table that the seat's options were few,
+    which can depend on its hidden cards (a roll from a hand of victory point
+    cards only, a discard from a one-resource hand).
+    """
+
+    #: How many past decision durations a bot draws its pace from.
+    PACE_HISTORY = 64
 
     def __init__(self, spec: str, color: Color, seed: Optional[int] = None):
         self.spec = spec
         self.color = color
         self.player = _registry().build(spec, color)
         self.rng = random.Random(seed)
+        self.pace_rng = random.Random()
+        self.timings: deque = deque(maxlen=self.PACE_HISTORY)
         self.started = False
+
+    def start(self, view: dict, supply: Supply) -> None:
+        """Exec bots learn the board from before(); the sampled world shows
+        exactly what the seat may see."""
+        if not self.started:
+            self.started = True
+            self.player.before(sample_game(view, self.color, supply, self.rng))
 
     def decide(self, view: dict, playable_actions: list, supply: Supply) -> list:
         """One of ``playable_actions`` (as JSON) for ``view``."""
         if len(playable_actions) == 1:
+            pace(self.timings, self.pace_rng)
             return playable_actions[0]
+        began = time.monotonic()
+        self.start(view, supply)
         game = sample_game(view, self.color, supply, self.rng)
-        if not self.started:
-            # Exec bots learn the board from before(); the sampled world
-            # shows exactly what the seat may see.
-            self.started = True
-            self.player.before(game)
         offered = {json.dumps(a): a for a in playable_actions}
         options = [
             action
@@ -73,10 +93,22 @@ class ViewBot:
             logger.warning("%s: no offered action in the sampled world", self.spec)
             return playable_actions[0]
         choice = action_to_json(self.player.decide(game, options))
+        self.timings.append(time.monotonic() - began)
         if json.dumps(choice) not in offered:
             logger.warning("%s chose %s, which was not offered", self.spec, choice)
             return playable_actions[0]
         return offered[json.dumps(choice)]
+
+    def observe(self, view: dict, action: list, supply: Supply) -> None:
+        """Someone acted (``view`` is from before the action): players that
+        watch the game (exec bots that asked to observe) get step()."""
+        if type(self.player).step is GameObserver.step:
+            return
+        self.start(view, supply)
+        if not getattr(self.player, "_wants_step", True):
+            return
+        game = sample_game(view, self.color, supply, self.rng)
+        self.player.step(game, action_from_json(action))
 
     def finish(self, view: dict, supply: Supply, winning_color: Optional[str]) -> None:
         """The game is over: tell the player (exec bots get ``after``) and
@@ -88,9 +120,12 @@ class ViewBot:
                 game.winning_color = lambda: winner  # the view's, not the sample's
                 self.player.after(game)
         finally:
-            close = getattr(self.player, "close", None)
-            if callable(close):
-                close()
+            self.close()
+
+    def close(self) -> None:
+        close = getattr(self.player, "close", None)
+        if callable(close):
+            close()
 
 
 def check_spec(spec: str, limits: Optional[dict] = None) -> None:
@@ -104,83 +139,6 @@ def check_spec(spec: str, limits: Optional[dict] = None) -> None:
             value = getattr(params, name, None)
             if type(value) is int and value > limit:
                 raise SpecError(f"{spec!r}: {name} may be at most {limit} here")
-
-
-class BotBusy(RuntimeError):
-    """The seat's previous decision is still running."""
-
-
-class BotRunner:
-    """Runs bot decisions off the event loop, in daemon threads.
-
-    A thread cannot be stopped, so a decision that outlives its timeout keeps
-    running; the runner then refuses that seat's next decision (BotBusy)
-    until it is done, rather than stacking threads, and caps the live
-    threads of all rooms together. Daemon threads never hold up shutdown.
-    """
-
-    def __init__(self, max_threads: int = 32):
-        self.max_threads = max_threads
-        self._live: dict = {}
-        self._lock = threading.Lock()
-
-    def running(self) -> int:
-        with self._lock:
-            self._live = {k: t for k, t in self._live.items() if t.is_alive()}
-            return len(self._live)
-
-    def wait(self, key, timeout: float) -> None:
-        """Wait (blocking) for ``key``'s running decision, if any."""
-        with self._lock:
-            thread = self._live.get(key)
-        if thread is not None:
-            thread.join(timeout)
-
-    async def run(self, key, fn: Callable, *args, timeout: float):
-        """``fn(*args)`` in a thread, within ``timeout`` seconds in all (waiting
-        for the seat's previous decision included); raises BotBusy,
-        TimeoutError, or what ``fn`` raised."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while True:
-            with self._lock:
-                self._live = {k: t for k, t in self._live.items() if t.is_alive()}
-                busy = key in self._live or len(self._live) >= self.max_threads
-                if not busy:
-                    future = loop.create_future()
-                    thread = threading.Thread(
-                        target=self._target(loop, future, fn, args),
-                        name=f"bot-{key}",
-                        daemon=True,
-                    )
-                    self._live[key] = thread
-                    thread.start()
-                    break
-            if loop.time() >= deadline:
-                raise BotBusy(f"{key}: the previous decision is still running")
-            await asyncio.sleep(0.01)
-        return await asyncio.wait_for(future, max(deadline - loop.time(), 0.001))
-
-    @staticmethod
-    def _target(loop, future, fn, args):
-        def settle(result, error):
-            if not future.done():
-                if error is not None:
-                    future.set_exception(error)
-                else:
-                    future.set_result(result)
-
-        def target():
-            try:
-                result, error = fn(*args), None
-            except BaseException as exc:  # reported to the awaiting room
-                result, error = None, exc
-            try:
-                loop.call_soon_threadsafe(settle, result, error)
-            except RuntimeError:
-                pass  # the loop is gone (shutdown)
-
-        return target
 
 
 # ===== catanatron-play-bot =====

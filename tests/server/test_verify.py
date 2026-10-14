@@ -207,7 +207,7 @@ def test_a_transcript_claiming_another_seed_fails(honest):
     edited = copy.deepcopy(transcripts[0])
     edited["client_seed"] = "11" * 32
     errors = errors_of(edited)
-    assert any("another key or seed" in e for e in errors)
+    assert any("not to this client's seed" in e for e in errors)
     assert any("seed did not go into the game" in e for e in errors)
 
 

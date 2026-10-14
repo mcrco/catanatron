@@ -39,7 +39,6 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
 from catanatron.registry import REGISTRY, describe
-from catanatron.server.bot import BotRunner
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import SigningKey
 from catanatron.server.messages import PROTOCOL_VERSION
@@ -74,8 +73,16 @@ class ServerLimits:
     abandoned_playing_s: float = 1800.0
     #: Finished and aborted rooms are forgotten after this long.
     finished_ttl_s: float = 3600.0
-    #: Bot decisions running at once, across rooms.
-    bot_threads: int = 32
+    #: Games with server bots (each has a bot worker process) at once, and
+    #: server bot seats one address may have in rooms not yet ended.
+    max_bot_rooms: int = 32
+    bot_seats_per_ip: int = 12
+    #: An address blamed this often within an hour (for withholding seeds)
+    #: may not take seats anywhere for that hour.
+    blames_per_ip: int = 3
+    #: Messages per second a connection may send (and its burst).
+    messages_per_s: float = 30.0
+    message_burst: int = 60
     room: RoomLimits = field(default_factory=RoomLimits)
 
 
@@ -120,8 +127,8 @@ class GameServer:
         self.archive_dir = archive_dir
         self.limits = limits
         self.room_class = room_class
-        self.runner = BotRunner(limits.bot_threads)
         self.rooms: dict = {}
+        self.blames: dict = defaultdict(deque)
         self.connections = 0
         self.by_ip: dict = defaultdict(int)
         self.by_room: dict = defaultdict(int)
@@ -153,6 +160,7 @@ class GameServer:
             )
         if address is not None:
             self._admit_creation(address)
+        self.admit_bots(address, sum(1 for spec in seats if spec is not None))
         self._evict()
         room_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
         room = self.room_class(
@@ -162,11 +170,12 @@ class GameServer:
             name=name,
             on_finish=self._archive,
             limits=self.limits.room,
-            runner=self.runner,
+            on_blame=self._blame,
+            is_banned=self._banned,
         )
         for index, spec in enumerate(seats):
             if spec is not None:
-                room.set_bot(index, spec)
+                room.set_bot(index, spec, address)
         self.rooms[room_id] = room
         if address is not None:
             self.room_owner[room_id] = address
@@ -188,6 +197,35 @@ class GameServer:
         )
         if waiting >= self.limits.waiting_rooms_per_ip:
             raise TooMuch("you have too many rooms waiting for players")
+
+    def admit_bots(self, address: Optional[str], count: int) -> None:
+        """Refuse more server bot seats than the limits allow: each game with
+        bots runs a worker process, and one address must not fill them all."""
+        if not count:
+            return
+        live = [
+            r for r in self.rooms.values() if r.status not in ("finished", "aborted")
+        ]
+        if sum(1 for r in live if r.bot_seats()) >= self.limits.max_bot_rooms:
+            raise TooMuch("too many games with server bots are running; try later")
+        if address is not None:
+            mine = sum(
+                1 for r in live for seat in r.bot_seats() if seat.address == address
+            )
+            if mine + count > self.limits.bot_seats_per_ip:
+                raise TooMuch("you have too many server bots seated")
+
+    def _blame(self, address: Optional[str]) -> None:
+        if address:
+            self.blames[address].append(time.time())
+
+    def _banned(self, address: Optional[str]) -> bool:
+        recent = self.blames.get(address) if address else None
+        if not recent:
+            return False
+        while recent and recent[0] < time.time() - 3600:
+            recent.popleft()
+        return len(recent) >= self.limits.blames_per_ip
 
     def _evict(self) -> None:
         self.sweep()
@@ -239,13 +277,15 @@ class GameServer:
             self.janitor = asyncio.get_running_loop().create_task(self._janitor())
 
     def shutdown(self) -> None:
-        """Abort every game still going (revealing the server seed)."""
+        """Abort every game still going (revealing the server seed) and stop
+        every bot worker."""
         if self.janitor is not None:
             self.janitor.cancel()
         for room in list(self.rooms.values()):
             room.abort("the server is shutting down")
             if room.task is not None:
                 room.task.cancel()
+            room.kill_bots()
 
     def _archive(self, room: Room) -> None:
         """Keep the server's own record of a finished game."""
@@ -272,6 +312,14 @@ class GameServer:
             return _file_response("index.html")
         if path.startswith("/static/"):
             return _file_response(path[len("/static/") :])
+        if path.count("/") == 1 and os.path.splitext(path)[1] in (
+            ".js",
+            ".css",
+            ".html",
+        ):
+            # The page loads its assets by relative path, so that a copy of
+            # static/ opened from a file works the same.
+            return _file_response(path[1:])
         if path == "/api/rooms":
             return _json_response([r.describe() for r in self.rooms.values()])
         if path.startswith("/api/rooms/"):
@@ -361,11 +409,25 @@ class GameServer:
             await websocket.send(json.dumps(reply))
 
     async def _room(self, websocket: ServerConnection, room: Room) -> None:
-        peer = Peer(websocket, room.limits.max_queue)
+        peer = Peer(websocket, room.limits.max_queue, _address(websocket))
         outbox: Outbox = room.connect(peer)
         seat, watching = None, False
+        tokens, last = float(self.limits.message_burst), time.monotonic()
         try:
             async for text in websocket:
+                now = time.monotonic()
+                tokens = min(
+                    float(self.limits.message_burst),
+                    tokens + (now - last) * self.limits.messages_per_s,
+                )
+                last = now
+                if peer.closed:
+                    continue  # closing: drain what is in flight, unread
+                if tokens < 1:
+                    # Close, and keep draining so the close handshake is read.
+                    peer.kick(1008, "too many messages")
+                    continue
+                tokens -= 1
                 request: Optional[dict] = None
                 try:
                     request = parse_request(text)
@@ -379,14 +441,24 @@ class GameServer:
                         watching = True
                     elif kind == "reveal" and seat is not None:
                         room.on_reveal(seat, peer, request)
+                    elif kind == "commit" and seat is not None:
+                        room.on_commit(seat, peer, request)
                     elif kind == "action" and seat is not None:
                         room.on_action(seat, peer, request)
                     elif kind == "seat_bot":
-                        room.set_bot(request.get("seat"), request.get("spec"))
+                        try:
+                            self.admit_bots(peer.address, 1)
+                        except TooMuch as error:
+                            raise RoomError("too_many_bots", str(error))
+                        room.set_bot(
+                            request.get("seat"), request.get("spec"), peer.address
+                        )
                     elif kind == "ping":
                         pass
                     else:
-                        raise RoomError("bad_request", f"unexpected {kind!r} here")
+                        raise RoomError(
+                            "bad_request", f"unexpected {str(kind)[:40]!r} here"
+                        )
                 except RoomError as error:
                     if (
                         seat is not None

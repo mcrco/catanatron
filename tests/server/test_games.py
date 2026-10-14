@@ -112,7 +112,7 @@ def test_a_client_that_reconnects_keeps_its_seat_and_its_chain():
 def test_a_seat_that_times_out_gets_the_default_action_flagged():
     async def scenario():
         async with serving() as (server, base):
-            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 300}
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 1500}
             room = await create_room(base, config, [None, "F"])
             client, decide = bot_client(f"{base}/room/{room['id']}", "F")
             slow = {"n": 0}
@@ -120,7 +120,7 @@ def test_a_seat_that_times_out_gets_the_default_action_flagged():
             async def sometimes_slow(view, playable_actions):
                 slow["n"] += 1
                 if slow["n"] in (3, 4):
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(2.0)
                 return await asyncio.to_thread(decide, view, playable_actions)
 
             result = await client.play(sometimes_slow)

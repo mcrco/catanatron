@@ -18,7 +18,7 @@ from catanatron.server.client import GameClient, create_room, list_rooms
 from catanatron.server.crypto import envelope_hash, verify_signature
 from catanatron.server.verify import verify_transcript
 
-from tests.server.helpers import run, serving
+from tests.server.helpers import bot_client, join_request, raw_connect, run, serving
 
 APP_JS = os.path.join(
     os.path.dirname(__file__),
@@ -115,12 +115,33 @@ globalThis.localStorage = {
 vm.runInThisContext(fs.readFileSync(appJs, "utf8"));
 vm.runInThisContext(`
   const mode = ${JSON.stringify(mode)};
-  let asked = false, dropped = false, lost = false;
+  let asked = false, dropped = false, lost = false, again = false;
+  const sits = !["watch-nosubtle", "watch-room"].includes(mode);
   render = function () {
-    if (mode !== "watch-nosubtle" && session.room && !session.seated && !asked) {
+    if (mode === "watch-room") {
+      // Never sits: the seat picker must still follow the room.
+      const kinds = session.room ? session.room.seats.map((s) => s.kind) : [];
+      if (kinds.includes("remote")) {
+        process.stdout.write(JSON.stringify(kinds), () => process.exit(0));
+        render = () => {};
+      }
+      return;
+    }
+    if (mode === "unseated-reconnect" && session.room && !dropped) {
+      // The page loses its connection before it sits.
+      dropped = true; session.ws.close(); return;
+    }
+    if (sits && session.room && !session.seated && !asked && !session.first) {
       asked = true;
+      if (mode === "doubleclick-bot") session.seatBot(${seat}, "NOSUCHBOT");  // fails
       session.takeSeat(${seat});
       if (mode === "doubleclick") session.takeSeat(${seat});  // a double click
+    }
+    if (mode === "doubleclick-bot" && !again && session.problems.some((p) => p.includes("NOSUCHBOT"))) {
+      // The bot's error comes back while the join is in flight; click again.
+      again = true;
+      session.problems = session.problems.filter((p) => !p.includes("NOSUCHBOT"));
+      session.takeSeat(${seat});
     }
     if (session.problems.length) { console.error(session.problems); process.exit(2); }
     if (mode === "play" && session.game && session.game.index > 30 && !dropped) {
@@ -215,6 +236,155 @@ def test_a_double_click_and_a_lost_answer_do_not_cost_the_seat():
 
 
 @pytest.mark.skipif(not _node_has_websocket(), reason="needs Node.js with WebSocket")
+def test_a_click_after_an_unrelated_error_does_not_take_a_second_key():
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 2, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, None])
+            other, decide = bot_client(f"{base}/room/{room['id']}", "R", seat=1)
+            playing = asyncio.create_task(other.play(decide))
+            transcript = await run_session(base, room["id"], "doubleclick-bot")
+            await playing
+            return transcript
+
+    assert verify_transcript(run(scenario())).ok
+
+
+@pytest.mark.skipif(not _node_has_websocket(), reason="needs Node.js with WebSocket")
+def test_a_page_that_reconnects_before_sitting_starts_a_fresh_chain():
+    async def scenario():
+        async with serving() as (server, base):
+            config = {"num_players": 3, "vps_to_win": 4, "decision_timeout_ms": 20_000}
+            room = await create_room(base, config, [None, None, "R"])
+            page = asyncio.create_task(
+                run_session(base, room["id"], "unseated-reconnect")
+            )
+            await asyncio.sleep(0.5)  # the page has dropped by now
+            other, decide = bot_client(f"{base}/room/{room['id']}", "R", seat=1)
+            playing = asyncio.create_task(other.play(decide))
+            transcript = await page
+            await playing
+            return transcript
+
+    assert verify_transcript(run(scenario())).ok
+
+
+@pytest.mark.skipif(not _node_has_websocket(), reason="needs Node.js with WebSocket")
+def test_a_page_looking_at_a_waiting_room_sees_seats_taken():
+    async def scenario():
+        async with serving() as (server, base):
+            room = await create_room(base, {"num_players": 3}, [None, None, None])
+            page = asyncio.create_task(run_session(base, room["id"], "watch-room"))
+            await asyncio.sleep(0.5)
+            ws, hello = await raw_connect(f"{base}/room/{room['id']}")
+            request, _, _ = join_request(hello, seat=1)
+            await ws.send(json.dumps(request))
+            kinds = await asyncio.wait_for(page, 30)
+            await ws.close()
+            return kinds
+
+    assert run(scenario()) == ["open", "remote", "open"]
+
+
+ESCAPE_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const sinks = (globalThis.sinks = []);
+function element(name) {
+  const node = {
+    name, value: "", hidden: false, textContent: "", className: "", style: {},
+    set innerHTML(v) { sinks.push(String(v)); },
+    get innerHTML() { return ""; },
+    insertAdjacentHTML(_, v) { sinks.push(String(v)); },
+    append() {}, replaceChildren() {}, setAttribute() {}, addEventListener() {},
+    querySelector() { return element(name + " *"); }, querySelectorAll() { return []; },
+    classList: { add() {} }, get lastChild() { return element(name + ">*"); },
+    children: [],
+  };
+  return node;
+}
+const elements = {};
+globalThis.window = { crypto: globalThis.crypto, addEventListener() {} };
+globalThis.document = {
+  querySelector(selector) { return elements[selector] || (elements[selector] = element(selector)); },
+  createElement(tag) { return element(tag); },
+  createElementNS(_, tag) { return element(tag); },
+};
+globalThis.location = { hash: "", protocol: "file:", host: "", search: "?server=127.0.0.1:1" };
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+vm.runInThisContext(fs.readFileSync(process.argv[process.argv.length - 1], "utf8"));
+const EVIL = '<img src=x onerror="window.PWNED=1">';
+vm.runInThisContext(`
+(async () => {
+  const EVIL = ${JSON.stringify(EVIL)};
+  const room = {
+    id: EVIL, name: EVIL, status: EVIL, round: EVIL, seed_commitment: EVIL,
+    config: { num_players: EVIL },
+    seats: [{ seat: 0, color: EVIL, kind: EVIL, name: EVIL, connected: false },
+            { seat: 1, color: "RED", kind: "open", name: "", connected: false }],
+  };
+  globalThis.fetch = async (url) => ({ json: async () =>
+    url.includes("/api/rooms") ? [room] : [{ key: EVIL, name: EVIL }] });
+  document.querySelector("#create [name=num_players]").value = "2";
+  await refreshRooms();
+  players = [{ key: EVIL, name: EVIL }];
+  renderSeatSpecs();
+  serverInfo = { app_sha256: EVIL };
+  const state = {
+    colors: ["RED", "BLUE"], player_state: {}, resource_freqdeck: [EVIL, EVIL, EVIL, EVIL, EVIL],
+    development_deck_size: EVIL, board: { buildings: [], roads: [], robber_coordinate: [0, 0, 0] },
+    current_prompt: EVIL,
+  };
+  for (const i of [0, 1]) {
+    for (const key of ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"]) state.player_state["P" + i + "_" + key + "_IN_HAND"] = EVIL;
+    for (const key of ["KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT"]) state.player_state["P" + i + "_" + key + "_IN_HAND"] = EVIL;
+    for (const key of ["VICTORY_POINTS", "ACTUAL_VICTORY_POINTS", "NUM_RESOURCES_IN_HAND",
+      "NUM_DEVELOPMENT_CARDS_IN_HAND", "PLAYED_KNIGHT", "LONGEST_ROAD_LENGTH", "HAS_ROAD", "HAS_ARMY"]) state.player_state["P" + i + "_" + key] = EVIL;
+  }
+  session = {
+    room, seated: false, spectating: false, joining: false, saved: null, messages: [],
+    verifiedCount: EVIL, unverified: EVIL, serverKey: EVIL, problems: [EVIL], aborted: null,
+    game: { color: "RED", current: "RED", over: false, seats: room.seats, state,
+            log: [[["RED", "ROLL", [EVIL, EVIL]], [EVIL, EVIL]]] },
+    takeSeat() {}, seatBot() {}, spectate() {}, transcript() { return {}; },
+  };
+  renderSeating();
+  renderMe();
+  renderPlayers();
+  renderFairness();
+  session.game = null;
+  renderSeating();
+  process.stdout.write(JSON.stringify(sinks));
+})().catch((error) => { console.error(error); process.exit(3); });
+`);
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js")
+def test_the_page_never_renders_server_data_as_markup():
+    """Everything a (possibly hostile) server sends is escaped: an
+    independent copy of the page must not run the server's script."""
+    result = subprocess.run(
+        ["node", "-e", ESCAPE_HARNESS, APP_JS],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    sinks = json.loads(result.stdout)
+    assert sinks, "the harness rendered something"
+    assert not [s for s in sinks if "<img" in s], "unescaped server data"
+    assert any("&lt;img" in s for s in sinks), "the data was shown, escaped"
+
+
+def test_the_page_loads_its_assets_by_relative_path():
+    """So that a copy opened from a file (or served by any host) works."""
+    index = open(os.path.join(os.path.dirname(APP_JS), "index.html")).read()
+    assert "/static/" not in index
+    assert 'src="app.js"' in index and 'href="style.css"' in index
+
+
+@pytest.mark.skipif(not _node_has_websocket(), reason="needs Node.js with WebSocket")
 def test_a_browser_without_subtle_crypto_can_still_watch():
     async def scenario():
         async with serving() as (server, base):
@@ -295,6 +465,8 @@ def test_the_lobby_and_the_http_api():
             api = json.loads(await asyncio.to_thread(_get, f"{http}/api/rooms"))
             players = json.loads(await asyncio.to_thread(_get, f"{http}/api/players"))
             script = await asyncio.to_thread(_get, f"{http}/static/app.js")
+            assert await asyncio.to_thread(_get, f"{http}/app.js") == script
+            assert "body" in await asyncio.to_thread(_get, f"{http}/style.css")
             with pytest.raises(urllib.error.HTTPError):
                 await asyncio.to_thread(_get, f"{http}/static/../app.py")
             return room, rooms, index, api, players, script

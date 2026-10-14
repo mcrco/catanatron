@@ -62,9 +62,12 @@ from catanatron.server.crypto import (
     digest,
     envelope_hash,
     is_hex,
+    join_statement,
     master_seed,
+    reveal_statement,
     seed_commitment,
     state_commitment,
+    submission_digest,
     verify_envelope,
     verify_signature,
 )
@@ -216,11 +219,10 @@ class _Verifier:
         room = hello.get("room")
         self.require(isinstance(room, dict), "the hello describes no room")
         self.room_id = room.get("id")
-        self.server_commitment = room.get("seed_commitment")
         self.config_json = room.get("config")
         self.require(isinstance(self.room_id, str), "the room has no id")
         self.require(
-            is_hex(self.server_commitment, 32), "the room has no seed commitment"
+            is_hex(room.get("seed_commitment"), 32), "the room has no seed commitment"
         )
         if self.transcript.get("room_id") not in (None, self.room_id):
             self.fail("the transcript is for another room than its messages")
@@ -233,25 +235,77 @@ class _Verifier:
             self.fail("the config is not in its canonical form")
 
         kinds = [b.get("type") for b in self.bodies]
-        for body in self.bodies[1:]:
-            if body.get("type") == "room":
+        positions: dict = {}
+        for i, kind in enumerate(kinds):
+            positions.setdefault(kind, []).append(i)
+        self.require(positions.get("hello") == [0], "a second hello in the chain")
+        befores = positions.get("before", [])
+        self.require(
+            len(befores) <= 1, f"{len(befores)} before messages (one is honest)"
+        )
+        self.before_at = befores[0] if befores else len(self.bodies)
+
+        # Before the game, the server's commitment moves on only through
+        # restarts, each of which opens the commitment it replaces.
+        commitment = room["seed_commitment"]
+        self.committed = None  # (position, body) of this round's commitments
+        self.joined: dict = {}
+        joined_at = None
+        for position in range(1, self.before_at):
+            body = self.bodies[position]
+            kind = body.get("type")
+            if kind == "room":
                 r = body.get("room") or {}
                 if (
                     r.get("id") != self.room_id
-                    or r.get("seed_commitment") != self.server_commitment
+                    or r.get("seed_commitment") != commitment
                     or not _same(r.get("config"), self.config_json)
                 ):
                     self.fail(
-                        "a room message changed the room, its rules or its seed commitment"
+                        f"message {position}: the room changed its rules or seed commitment"
                     )
+            elif kind == "joined":
+                if joined_at is not None:
+                    self.fail("this client was seated twice")
+                joined_at, self.joined = position, body
+            elif kind == "restart":
+                old = body.get("server_seed")
+                if (
+                    body.get("room_id") != self.room_id
+                    or not is_hex(old, 32)
+                    or seed_commitment(old) != commitment
+                    or not is_hex(body.get("seed_commitment"), 32)
+                ):
+                    self.fail(
+                        f"message {position}: a restart that does not open the server's commitment"
+                    )
+                    raise _Abort()
+                commitment = body["seed_commitment"]
+                self.committed = None  # that round's commitments are void
+                if self.seated and self.joined.get("seat") in (body.get("blame") or []):
+                    self.fail(
+                        f"message {position}: this client was blamed for withholding its seed"
+                    )
+            elif kind == "commitments":
+                if (
+                    body.get("room_id") != self.room_id
+                    or body.get("seed_commitment") != commitment
+                    or not _same(body.get("config"), self.config_json)
+                ):
+                    self.fail(
+                        f"message {position}: the commitments change the room, its rules or its seed commitment"
+                    )
+                self.committed = (position, body)
+            elif kind in ("decide", "step", "after", "received"):
+                self.fail(f"message {position}: a {kind} message before the game")
+        self.server_commitment = commitment
 
         aborted = [b for b in self.bodies if b.get("type") == "aborted"]
         if aborted:
             body = aborted[0]
             revealed = body.get("server_seed")
             if revealed is not None and (
-                not is_hex(revealed, 32)
-                or seed_commitment(revealed) != self.server_commitment
+                not is_hex(revealed, 32) or seed_commitment(revealed) != commitment
             ):
                 self.fail(
                     "the aborted message reveals a seed that does not open the commitment"
@@ -262,82 +316,70 @@ class _Verifier:
             )
             raise _Abort()
 
-        positions = {
-            kind: [i for i, k in enumerate(kinds) if k == kind] for kind in set(kinds)
-        }
-        self.require(positions.get("hello") == [0], "a second hello in the chain")
-        befores = positions.get("before", [])
         afters = positions.get("after", [])
-        self.require(
-            len(befores) == 1, f"{len(befores)} before messages (one is honest)"
-        )
+        self.require(bool(befores), "the game never started")
         self.require(
             len(afters) == 1, "the game has not ended: nothing was revealed yet"
         )
-        self.before_at, self.after_at = befores[0], afters[0]
-        commitments = positions.get("commitments", [])
-        self.require(len(commitments) <= 1, "more than one commitments message")
-
-        self.committed = None
-        if self.seated:
-            joins = positions.get("joined", [])
-            self.require(len(joins) == 1, "this client was not seated exactly once")
-            joined = self.bodies[joins[0]]
-            mine = client_seed_commitment(self.room_id, self.me, self.my_seed)
-            if (
-                joined.get("room_id") != self.room_id
-                or joined.get("public_key") != self.me
-                or joined.get("client_commitment") != mine
-            ):
-                self.fail(
-                    "the server acknowledged another key or seed commitment than this client's"
-                )
-            self.require(
-                len(commitments) == 1 and joins[0] < commitments[0] < self.before_at,
-                "the seats' seed commitments were not published between joining and the game",
-            )
-            self.my_seat = joined.get("seat")
-        if commitments:
-            self.committed = self.bodies[commitments[0]]
-            c = self.committed
-            if (
-                c.get("room_id") != self.room_id
-                or c.get("seed_commitment") != self.server_commitment
-                or not _same(c.get("config"), self.config_json)
-            ):
-                self.fail(
-                    "the commitments change the room, its rules or its seed commitment"
-                )
-            self.check_seats(c.get("seats"), "commitments")
-
+        self.after_at = afters[0]
         before = self.bodies[self.before_at]
         self.before = before
+        commitments = before.get("commitments")
+        self.require(
+            isinstance(commitments, dict), "the before message carries no commitments"
+        )
+        if self.seated:
+            self.require(joined_at is not None, "this client was not seated")
+            if (
+                self.joined.get("room_id") != self.room_id
+                or self.joined.get("public_key") != self.me
+            ):
+                self.fail("the server acknowledged another key than this client's")
+            self.require(
+                self.committed is not None and joined_at < self.committed[0],
+                "the seats' seed commitments were not published between joining and the game",
+            )
+            self.my_seat = self.joined.get("seat")
+        if self.committed is not None and not _same(self.committed[1], commitments):
+            self.fail(
+                "the game's commitments are not the ones published before the seeds were revealed"
+            )
+        if (
+            commitments.get("type") != "commitments"
+            or commitments.get("room_id") != self.room_id
+            or commitments.get("seed_commitment") != commitment
+            or not _same(commitments.get("config"), self.config_json)
+        ):
+            self.fail(
+                "the game's commitments change the room, its rules or its seed commitment"
+            )
+        #: What every statement and reveal of this game signs: fresh for this
+        #: game, because it names every seat's fresh seed commitment.
+        self.C = digest(commitments)
+        self.seats = commitments.get("seats")
+        self.check_seats(self.seats, "commitments")
         self.require(
             before.get("room_id") == self.room_id
             and isinstance(before.get("game_id"), str),
             "the before message names another room, or no game",
         )
         self.report.game_id = before["game_id"]
-        if not _same(before.get("config"), self.config_json):
-            self.fail("the game's config is not the one the room advertised")
-        if before.get("seed_commitment") != self.server_commitment:
-            self.fail("the seed commitment changed during the game")
-        self.seats = before.get("seats")
-        self.check_seats(self.seats, "before")
-        if self.committed is not None and not _same(
-            self.seats, self.committed.get("seats")
+        if (
+            not _same(before.get("config"), self.config_json)
+            or not _same(before.get("seats"), self.seats)
+            or before.get("seed_commitment") != commitment
         ):
-            self.fail(
-                "the game's seats are not the ones committed before the seeds were revealed"
-            )
+            self.fail("the game's config or seats are not the committed ones")
 
-        seeds = before.get("client_seeds")
+        seeds, reveals = before.get("client_seeds"), before.get("reveals")
         self.require(
-            isinstance(seeds, list) and len(seeds) == len(self.seats),
-            "seats and client seeds do not line up",
+            isinstance(seeds, list)
+            and isinstance(reveals, list)
+            and len(seeds) == len(reveals) == len(self.seats),
+            "seats, client seeds and reveals do not line up",
         )
         self.client_seeds = seeds
-        for seat, seed in zip(self.seats, seeds):
+        for seat, seed, signature in zip(self.seats, seeds, reveals):
             if seat["kind"] == "remote":
                 if (
                     not is_hex(seed, 32)
@@ -347,7 +389,13 @@ class _Verifier:
                     self.fail(
                         f"seat {seat['seat']}'s seed does not open its commitment"
                     )
-            elif seed is not None:
+                if not verify_signature(
+                    seat["public_key"], reveal_statement(self.C), signature
+                ):
+                    self.fail(
+                        f"seat {seat['seat']}'s key did not reveal its seed for these commitments"
+                    )
+            elif seed is not None or signature is not None:
                 self.fail(f"seat {seat['seat']} is a server bot but contributed a seed")
         self.color = before.get("color")
         self.report.color = self.color
@@ -359,6 +407,12 @@ class _Verifier:
                 and mine[0]["color"] == self.color,
                 "this client is not seated in the game as it joined",
             )
+            if mine[0]["client_commitment"] != client_seed_commitment(
+                self.room_id, self.me, self.my_seed
+            ):
+                self.fail(
+                    "the game's commitment for this client is not to this client's seed"
+                )
             if seeds[self.my_seat] != self.my_seed:
                 self.fail("this client's seed did not go into the game's seed")
             if before.get("index") != 0:
@@ -372,7 +426,7 @@ class _Verifier:
         self.server_seed = reveal.get("server_seed")
         if (
             not is_hex(self.server_seed, 32)
-            or seed_commitment(self.server_seed) != self.server_commitment
+            or seed_commitment(self.server_seed) != commitment
         ):
             self.fail("the revealed server seed does not open the seed commitment")
             raise _Abort()
@@ -387,15 +441,16 @@ class _Verifier:
             f"{len(self.salts)} salts revealed for {len(self.actions)} actions",
         )
         self.report.shared = {
+            "group": [self.server_key, self.room_id, commitment],
+            "game_id": before["game_id"],
             "before": {
                 k: before.get(k)
                 for k in (
                     "room_id",
                     "game_id",
-                    "config",
-                    "seats",
+                    "commitments",
                     "client_seeds",
-                    "seed_commitment",
+                    "reveals",
                 )
             },
             "reveal": reveal,
@@ -414,12 +469,27 @@ class _Verifier:
             if seat.get("kind") == "remote":
                 ok = ok and is_hex(seat.get("public_key"), 32)
                 ok = ok and is_hex(seat.get("client_commitment"), 32)
+                requested = seat.get("requested_seat")
+                ok = ok and (requested is None or type(requested) is int)
+                # The key holder joined this room, under this round's server
+                # commitment, with this seed commitment.
+                ok = ok and verify_signature(
+                    seat.get("public_key"),
+                    join_statement(
+                        self.room_id,
+                        self.server_commitment,
+                        requested,
+                        seat.get("client_commitment"),
+                    ),
+                    seat.get("pop"),
+                )
                 keys.append(seat.get("public_key"))
             elif seat.get("kind") == "bot":
                 ok = (
                     ok
                     and seat.get("public_key") is None
                     and seat.get("client_commitment") is None
+                    and seat.get("pop") is None
                 )
             else:
                 ok = False
@@ -429,11 +499,7 @@ class _Verifier:
     # ===== 4./5./6. the replay =====
     def replay(self) -> None:
         report = self.report
-        master = master_seed(
-            self.server_seed,
-            self.client_seeds,
-            {"room_id": self.room_id, "config": self.config_json, "seats": self.seats},
-        )
+        master = master_seed(self.server_seed, self.client_seeds, self.C)
         self.game = new_game(self.config, master, self.before["game_id"])
         self.index = 0
         self.doc = state_to_json(self.game)
@@ -442,19 +508,20 @@ class _Verifier:
         self.decides: dict = {}  # index -> envelope
         self.offered: dict = {}  # index -> playable actions (JSON) at that point
         self.forced_at: dict = {}  # index -> whether publicly forced
-        self.errors_seen: list = []  # (position, body) of errors during the game
+        self.receipts: list = []  # (position, body) of the server's receipts
+        self.steps_at: dict = {}  # index -> position of the step that played it
 
         next_step = None
         for position in range(self.before_at, len(self.messages)):
             envelope, body = self.messages[position], self.bodies[position]
             kind, commit = body.get("type"), envelope.get("commit")
             if (
-                kind in ("hello", "joined", "room", "commitments", "before")
+                kind in ("hello", "joined", "room", "commitments", "restart", "before")
                 and position != self.before_at
             ):
                 self.fail(f"message {position}: a {kind} message during the game")
                 continue
-            if position > self.after_at and kind != "error":
+            if position > self.after_at and kind not in ("error", "received"):
                 self.fail(f"message {position}: a {kind} message after the game ended")
                 continue
             if not isinstance(commit, dict) or type(commit.get("index")) is not int:
@@ -475,11 +542,9 @@ class _Verifier:
                     self.game,
                     self.doc,
                     self.color,
-                    room_id=self.room_id,
-                    config=self.config_json,
-                    seats=self.seats,
+                    commitments=self.before["commitments"],
                     client_seeds=self.client_seeds,
-                    seed_commitment=self.server_commitment,
+                    reveals=self.before["reveals"],
                 )
                 next_step = target + 1
             elif kind == "decide":
@@ -513,6 +578,7 @@ class _Verifier:
                     )
                     continue
                 next_step += 1
+                self.steps_at[target - 1] = position
                 forced = self.actions[target - 1].get("forced")
                 expected = step_body(self.game, self.doc, self.color, forced=forced)
             elif kind == "after":
@@ -523,8 +589,10 @@ class _Verifier:
                 expected = after_body(
                     self.game, self.doc, self.color, reveal=self.after["reveal"]
                 )
+            elif kind == "received":
+                self.receipts.append((position, body))
+                continue
             elif kind == "error":
-                self.errors_seen.append((position, body))
                 continue
             else:
                 self.fail(f"message {position}: unexpected {kind!r} during the game")
@@ -611,21 +679,14 @@ class _Verifier:
             )
             return
         seq, decide = statement.get("seq"), statement.get("decide")
-        expected = action_statement(
-            self.room_id,
-            self.before["game_id"],
-            index,
-            seq,
-            decide,
-            entry.get("action"),
-        )
+        expected = action_statement(self.C, index, seq, decide, entry.get("action"))
         if (
             not _same(statement, expected)
             or type(seq) is not int
             or not is_hex(decide, 32)
         ):
             self.fail(
-                f"action {index}: the signed statement is for another move, game or room"
+                f"action {index}: the signed statement is for another move or game"
             )
             return
         if seq <= self.last_seq.get(seat["seat"], -1):
@@ -649,34 +710,46 @@ class _Verifier:
 
     # ===== this client's own moves =====
     def check_own_moves(self) -> None:
+        """This client's moves against what it signed and what the server
+        acknowledged.
+
+        Provable: the server signs a receipt for every submission it gets,
+        and its messages to a recipient are in order. A receipt for a legal,
+        correctly signed answer to decide k that comes before the step for
+        move k proves the server had that answer before it played the move;
+        playing anything else then is the server's doing. Not provable: when
+        an answer was sent relative to the server's deadline. An honest
+        client resends unacknowledged answers after a reconnect and an honest
+        server acknowledges every submission, so an answer that never got a
+        receipt counts against the server; one acknowledged only after the
+        move was played was late (a warning).
+        """
         if not self.seated:
             return
-        sent = self.transcript.get("sent") or []
-        statements: dict = {}
-        for item in sent:
-            statement = item.get("statement") if isinstance(item, dict) else None
-            if isinstance(statement, dict) and type(statement.get("index")) is int:
-                statements.setdefault(statement["index"], {})[
-                    digest(statement)
-                ] = statement
-        for index, signed in statements.items():
-            if len(signed) > 1:
+        signed: dict = {}  # index -> {submission digest: entry}
+        for item in self.transcript.get("sent") or []:
+            if not isinstance(item, dict):
+                continue
+            statement, signature = item.get("statement"), item.get("sig")
+            if (
+                not isinstance(statement, dict)
+                or type(statement.get("index")) is not int
+                or not verify_signature(self.me, statement, signature)
+            ):
+                continue  # only what this key really signed counts
+            signed.setdefault(statement["index"], {})[
+                submission_digest(statement, signature)
+            ] = item
+        for index, items in signed.items():
+            distinct = {digest(item["statement"]) for item in items.values()}
+            if len(distinct) > 1:
                 self.fail(
-                    f"action {index}: this client signed {len(signed)} different moves"
+                    f"action {index}: this client signed {len(distinct)} different moves"
                 )
 
-        refused = {
-            body.get("refused"): position
-            for position, body in self.errors_seen
-            if body.get("code") == "bad_action" and is_hex(body.get("refused"), 32)
-        }
-        for index, signed in statements.items():
-            for key, statement in signed.items():
-                if key in refused and self._legal_answer(index, statement):
-                    self.fail(
-                        f"action {index}: the server refused this client's legal, "
-                        f"correctly signed move (message {refused[key]})"
-                    )
+        receipts: dict = {}
+        for position, body in self.receipts:
+            receipts.setdefault(body.get("submission"), []).append(position)
 
         for index, entry in enumerate(self.actions):
             if entry.get("color") != self.color:
@@ -687,29 +760,45 @@ class _Verifier:
                 self.fail(
                     f"action {index}: this seat's move was made without asking it"
                 )
-            elif entry.get("forced") == "timeout" and any(
-                self._legal_answer(index, s) for s in statements.get(index, {}).values()
+                continue
+            legal = {
+                key: item
+                for key, item in signed.get(index, {}).items()
+                if self._legal_answer(index, item["statement"])
+            }
+            played = entry.get("statement") if entry.get("by") == "client" else None
+            if not legal or any(
+                played is not None and _same(item["statement"], played)
+                for item in legal.values()
             ):
-                self.report.warnings.append(
-                    f"action {index}: the server timed this client out although it "
-                    "answered (late, or ignored)"
+                continue
+            step_at = self.steps_at.get(index, len(self.messages))
+            seen = sorted(p for key in legal for p in receipts.get(key, []))
+            if any(p < step_at for p in seen):
+                self.fail(
+                    f"action {index}: the server had this client's legal, signed move "
+                    f"(receipt in message {seen[0]}) and played another"
                 )
-        if self.seated:
-            self.report.counts["own moves"] = sum(
-                1 for a in self.actions if a.get("color") == self.color
-            )
+            elif not seen:
+                self.fail(
+                    f"action {index}: the server never acknowledged this client's "
+                    "legal, signed move, and played another"
+                )
+            else:
+                self.report.warnings.append(
+                    f"action {index}: this client's move reached the server after the "
+                    "move was played (late)"
+                )
+        self.report.counts["own moves"] = sum(
+            1 for a in self.actions if a.get("color") == self.color
+        )
 
     def _legal_answer(self, index: int, statement: dict) -> bool:
         decide = self.decides.get(index)
         if decide is None:
             return False
         expected = action_statement(
-            self.room_id,
-            self.before["game_id"],
-            index,
-            decide["seq"],
-            envelope_hash(decide),
-            statement.get("action"),
+            self.C, index, decide["seq"], envelope_hash(decide), statement.get("action")
         )
         offered = decide["body"].get("playable_actions") or []
         return _same(statement, expected) and any(
@@ -741,27 +830,38 @@ def _short(value: Any) -> str:
 
 
 def verify_transcripts(transcripts: Sequence[Any]) -> list:
-    """Verify each transcript, then check they saw one game alike."""
+    """Verify each transcript, then check that every recipient of one room
+    and seed commitment (under one server key) saw one game alike: the same
+    game id, commitments, seeds, reveal, and state commitment at each point.
+    Grouped by what the server committed to, not by the game id it names, so
+    that naming different games to different recipients is caught; every
+    transcript of a group that disagrees fails."""
     reports = [verify_transcript(t) for t in transcripts]
-    seen: dict = {}
-    shared: dict = {}
+    groups: dict = {}
     for report in reports:
-        game = (
-            report.game_id if isinstance(report.game_id, str) else repr(report.game_id)
-        )
-        for index, digest_ in report.commitments.items():
-            if seen.setdefault((game, index), digest_) != digest_:
-                report.fail(
-                    f"equivocation: state {index} was committed differently to another recipient"
-                )
         if report.shared is not None:
-            first = shared.setdefault(game, report.shared)
-            if not _same(first["before"], report.shared["before"]):
-                report.fail(
-                    "equivocation: another recipient got other seats, config or seeds"
+            groups.setdefault(canonical(report.shared["group"]), []).append(report)
+    for members in groups.values():
+        first = members[0]
+        for report in members[1:]:
+            problems = []
+            if report.shared["game_id"] != first.shared["game_id"]:
+                problems.append("another game id")
+            if not _same(report.shared["before"], first.shared["before"]):
+                problems.append("other commitments, seeds or reveals")
+            if not _same(report.shared["reveal"], first.shared["reveal"]):
+                problems.append("another reveal")
+            for index, digest_ in report.commitments.items():
+                if first.commitments.get(index, digest_) != digest_:
+                    problems.append(f"another state {index}")
+                    break
+            if problems:
+                message = (
+                    "equivocation: recipients of one room and commitment got "
+                    + ", ".join(problems)
                 )
-            if not _same(first["reveal"], report.shared["reveal"]):
-                report.fail("equivocation: another recipient got another reveal")
+                first.fail(message)
+                report.fail(message)
     return reports
 
 
@@ -779,7 +879,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for path in args.transcripts:
         try:
             loaded.append(load_transcript(path))
-        except (OSError, ValueError, RecursionError, EOFError) as error:
+        except Exception as error:  # zlib.error, UnicodeError...: FAILED, not a crash
             loaded.append(None)
             unreadable[path] = f"cannot read: {type(error).__name__}: {error}"
     reports = verify_transcripts(loaded)

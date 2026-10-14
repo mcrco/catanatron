@@ -12,11 +12,15 @@ table:
 
     hello        server -> client, first message on every connection
     joined       the seat this connection now holds (and the room)
-    room         seats changed before the game started (to seats and spectators)
-    commitments  every seat is taken: the locked seats, the config and every
-                 seat's seed commitment; seats now reveal their seeds
+    room         seats changed before the game started
+    commitments  every seat is taken: the locked seats with their keys,
+                 seed commitments and join signatures, and the config; seats
+                 now reveal their seeds (signing the commitments' digest)
+    restart      a seat did not reveal: it is out, the server's seed is
+                 revealed and replaced, and seated clients commit afresh
     before       the game starts (or a spectator arrives): board, seats, seeds
     decide       the seat must answer with a signed action
+    received     the server's receipt for a submitted action
     step         somebody acted; the new state and that action's log entry
     after        the game is over, with the reveal: server seed, salts, actions
     aborted      the game will not be played (who is to blame, the server seed)
@@ -39,9 +43,10 @@ from catanatron.serialization import action_to_json, client_view, public_view
 from catanatron.server.maps import board_geometry
 
 #: Bumped when a change would break clients written against the old shape.
-#: 2: seeds are committed, then revealed; statements carry the room and the
-#: action's index.
-PROTOCOL_VERSION = 2
+#: 2: seeds are committed, then revealed; statements carry the action's index.
+#: 3: statements and reveals sign the commitments' digest; restart rounds;
+#: receipts for submitted actions.
+PROTOCOL_VERSION = 3
 
 GAME_MESSAGES = ("before", "decide", "step", "after")
 
@@ -72,6 +77,7 @@ def playable_json(game: Game) -> list:
 def commitments_body(
     room_id: str,
     *,
+    round: int,
     config: dict,
     seats: list,
     seed_commitment: str,
@@ -80,10 +86,45 @@ def commitments_body(
     return {
         "type": "commitments",
         "room_id": room_id,
+        "round": round,
         "config": config,
         "seats": seats,
         "seed_commitment": seed_commitment,
         "reveal_timeout_ms": reveal_timeout_ms,
+    }
+
+
+def restart_body(
+    room_id: str,
+    *,
+    round: int,
+    reason: str,
+    blame: list,
+    server_seed: str,
+    seed_commitment: str,
+    room: dict,
+) -> dict:
+    return {
+        "type": "restart",
+        "room_id": room_id,
+        "round": round,
+        "reason": reason,
+        "blame": blame,
+        "server_seed": server_seed,  # the old one, revealed
+        "seed_commitment": seed_commitment,  # the new one
+        "room": room,
+    }
+
+
+def receipt_body(
+    submission: str, index: Optional[int], accepted: bool, reason: str
+) -> dict:
+    return {
+        "type": "received",
+        "submission": submission,
+        "index": index,
+        "accepted": accepted,
+        "reason": reason,
     }
 
 
@@ -92,24 +133,24 @@ def before_body(
     doc: dict,
     color: Optional[str],
     *,
-    room_id: str,
-    config: dict,
-    seats: list,
+    commitments: dict,
     client_seeds: list,
-    seed_commitment: str,
+    reveals: list,
 ) -> dict:
     view = view_for(doc, color)
     state, records = _split(view)
     return {
         "type": "before",
         "protocol_version": PROTOCOL_VERSION,
-        "room_id": room_id,
+        "room_id": commitments["room_id"],
         "game_id": game.id,
         "color": color,
-        "config": config,
-        "seats": seats,
+        "commitments": commitments,
+        "config": commitments["config"],
+        "seats": commitments["seats"],
         "client_seeds": client_seeds,
-        "seed_commitment": seed_commitment,
+        "reveals": reveals,
+        "seed_commitment": commitments["seed_commitment"],
         "map": view["map"],
         "board": board_geometry(game.state.board.map),
         "index": len(records),
