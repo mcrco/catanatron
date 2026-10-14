@@ -390,11 +390,13 @@ or a timeout is a warning.
 
 The page checks every signature and the hash chain with WebCrypto, generates
 its Ed25519 key in the browser, commits to and reveals its seed (once per
-room), signs every action, resends unacknowledged answers after a reconnect
-(also after the game ends, until their receipts come), and stores each
-finished transcript in IndexedDB ("Saved transcripts" in the lobby) for
-`catanatron-verify`, once the receipts it is owed have come, never replacing a
-stored transcript with a poorer copy. Its seat records (key, seed, the
+room), signs every action (one per move, also after a reload), resends
+unacknowledged answers after a reconnect, and stores each finished transcript
+in IndexedDB ("Saved transcripts" in the lobby) for `catanatron-verify`, after
+waiting a few seconds for the receipts it is owed, never replacing a stored
+transcript with a poorer copy. It sends a join, a reveal or a move only once
+the seat record that holds it is stored: with its storage full, it stops and
+says so, rather than sign something a reload could make it sign again. Its seat records (key, seed, the
 server's seed commitment, its reveal, signed answers) are kept in
 `localStorage` per game server key and room, so a reload takes the seat back
 and keeps what was signed, and a copy of the page used with several servers

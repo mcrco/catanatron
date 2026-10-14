@@ -135,11 +135,13 @@ What each party keeps:
 * **Browser**: the same, in a seat record in `localStorage` keyed by the
   server's key and the room (`catanatron-seat-<server key>-<room>`: key
   pair, seed, commitment, pop, join nonce, requested seat, the server's seed
-  commitment, seat, the reveal and the digest it signed, `sent`, unreceipted
-  answers, `unanswered`, and whether the game ended), written before the join
-  goes out; finished transcripts in IndexedDB, only ever replaced by one that
-  extends them. A record whose game ended is history: the page never sits in
-  it again (it watches instead).
+  commitment and the room's rules, seat, the reveal and the digest it
+  signed, `sent`, unreceipted answers, `unanswered`, and whether the game
+  ended); the page sends a join, a reveal or a move only once the record
+  holding it is stored (read back), and stops otherwise; finished
+  transcripts in IndexedDB, only ever replaced by one that extends them. A
+  record whose game ended is history: the page never sits in it again (it
+  watches instead), and back in the lobby it is cut down to that.
 
 ## 3. Invariants
 
@@ -217,17 +219,27 @@ A void that reveals no seed is a violation.
 **I5. The game is the committed one.** `before.commitments` is, byte for
 byte, the commitments body this recipient got; its config and seats are
 those; every remote seed opens its seat's commitment; this client's seed is
-its own; the game replays from the master seed of all of it. A game called
-off after it started still has to start as the void's revealed seed says.
+its own; the game replays from the master seed of all of it. A game called off after
+it started is replayed from the void's revealed seed and the moves the
+chain's own log shows (every move's kind and value is public; what chance
+decided comes from the seed): every view the chain holds, a mid-game
+spectator's first one included, must be what an honest server builds (only
+the state commitments, whose salts the void does not reveal, are not
+checked). A seed another transcript of the room revealed replays a game that
+this one holds no end of.
 * Clients: `GameClient` compares canonical bytes (never Python value
   equality, under which 30000 == 30000.0) and checks its seed; the browser
   too.
-* Verifier: all of it, then the replay; with only a void, the game's start.
+* Verifier: all of it, then the replay; with only a void (or another
+  transcript's), the replay from the public log.
 * Tests: `test_review.py::test_seeds_that_do_not_open_their_commitments_are_caught`,
   `test_review.py::test_a_game_other_than_the_committed_one_is_caught`,
   `test_verify.py::test_a_game_not_seeded_from_the_clients_seeds_is_caught`,
   `test_round5.py::test_the_python_client_refuses_what_the_verifier_would`,
-  `test_round5.py::test_a_void_after_the_start_checks_the_start`.
+  `test_round5.py::test_a_void_after_the_start_checks_the_start`,
+  `test_round6.py::test_a_spectator_that_came_in_midgame_verifies_a_void`,
+  `test_round6.py::test_a_lie_before_a_void_is_proven_by_the_void_s_seed`,
+  `test_round6.py::test_a_void_another_transcript_holds_replays_a_game_cut_short`.
 
 **I6. Seated as joined, by its own join.** `joined` names this client's key,
 commitment and the seat it asked for (if it asked); the commitments seat
@@ -236,9 +248,12 @@ requested seat, the nonce of the connection it joined on and a pop over all
 of it. A pop is public, but it seats its key on one connection only:
 replaying it seats nothing.
 * Clients: both check `joined` (one, for their key, commitment and seat),
-  their own seat in the commitments in full (kind, nonce, requested seat),
-  and, before revealing (a reveal signs every seat), every seat: its exact
-  fields, a unique key, and a pop that verifies.
+  their own seat in the commitments in full (kind, color, nonce, requested
+  seat), the `before`'s color, and, before revealing (a reveal signs every
+  seat), every seat: its exact fields, an integer index, the config's color
+  for it, a unique key, and a pop that verifies.
+* Verifier (also): this client's seat in the commitments carries the nonce of
+  the hello its chain began with.
 * Verifier: the same, plus every seat's exact fields and pop, and
   `requested_seat` equal to the seat when given.
 * Tests: `test_review.py::test_a_join_needs_proof_of_the_key_and_a_key_not_already_seated`,
@@ -257,14 +272,19 @@ and reveal its own `before` carries, or that it never sent the commitments.
 * Clients: `GameClient.play` returns with `GameResult.aborted` (and verifies
   the transcript); the browser shows the void and offers a new room.
 * Verifier: `report.void`; the seed opens the commitment; the blamed seats
-  are remote seats; a blame on a seat whose seed and reveal the chain's
-  `before` holds is an error in any transcript; in the blamed seat's own
-  transcript, a blame without commitments before it, or after an accepted
-  receipt for its reveal, is an error; otherwise a warning.
+  are seats of the room (by the config), and remote ones when the
+  commitments are known; a blame on a seat whose seed and reveal the chain's
+  `before` holds is an error in any transcript; in any seated transcript, a
+  blame with no commitments before it is an error (a locked room sends every
+  seat its commitments); in the blamed seat's own transcript, a blame after
+  an accepted receipt for its reveal, or after its reveal was answered with
+  an error while seeds were revealed, is an error; otherwise a warning.
 * Tests: `test_review.py::test_a_seat_that_does_not_reveal_voids_the_room_and_is_blamed`,
   `test_protocol4.py::test_blaming_a_seat_whose_reveal_was_acknowledged_is_caught`,
   `test_round5.py::test_a_blame_the_servers_own_before_belies_is_caught_by_everyone`,
-  `test_round5.py::test_blaming_a_seat_never_asked_for_its_seed_is_caught`.
+  `test_round5.py::test_blaming_a_seat_never_asked_for_its_seed_is_caught`,
+  `test_round6.py::test_a_reveal_refused_by_an_error_then_blamed_is_caught`,
+  `test_round6.py::test_a_void_cannot_blame_a_seat_that_was_never_asked`.
 
 **I8. One chain per recipient, and the transcript is its own.** Every
 message is signed by `S`, numbered from 0 and hash-chained, and addressed to
@@ -273,16 +293,30 @@ client represents exactly. The transcript's header (its key, seed and room)
 agrees with what the server signed.
 * Clients: checked on every message as it arrives; the browser refuses a
   float or an unsafe integer before parsing (JavaScript would read 5.0 as 5,
-  Python not).
-* Verifier: a broken signature or chain, or a header the chain belies, makes
-  the transcript **invalid** (not evidence: anyone can write one), never an
-  accusation; a number the server signed but the protocol does not allow is
-  an error.
+  Python not), and a lone surrogate (which Python cannot encode, so no
+  honest server signs one). Hex is lowercase digits and nothing else
+  everywhere (Python's `bytes.fromhex` alone would take spaces, a browser
+  not); the server refuses lone surrogates and every other client value
+  that would not be read alike.
+* Verifier: a broken signature or chain, a header the chain belies, or
+  another protocol version makes the transcript **invalid** (not evidence:
+  anyone can write one), never an accusation; a number the server signed but
+  the protocol does not allow, a message of a malformed shape, messages
+  addressed to the client's key on a chain that never seated it, and
+  anything else the server signed that the verifier cannot read, are
+  errors (the verifier never crashes into "invalid" on signed content).
 * Tests: `test_verify.py::test_an_edited_transcript_fails_its_signatures`,
   `test_round5.py::test_a_header_that_belies_the_chain_is_not_an_accusation`,
   `test_round5.py::test_a_float_the_server_signed_is_a_violation`,
   `test_round5.py::test_numbers_beyond_every_clients_reach_are_refused`,
-  `test_browser.py::test_the_page_refuses_numbers_python_reads_otherwise`.
+  `test_browser.py::test_the_page_refuses_numbers_python_reads_otherwise`,
+  `test_round6.py::test_what_the_server_signed_never_makes_a_transcript_invalid`,
+  `test_round6.py::test_another_protocol_s_transcript_is_not_an_accusation`,
+  `test_round6.py::test_a_chain_addressed_to_a_key_it_never_seated_is_the_server_s_doing`,
+  `test_round6.py::test_hex_is_strict_everywhere`,
+  `test_round6.py::test_strings_no_client_can_encode_are_refused`,
+  `test_round6.py::test_the_page_refuses_lone_surrogates_and_wrong_colors`,
+  `test_fuzz.py::test_python_and_the_browser_read_every_value_alike`.
 
 **I9. A seat's chain is taken back only by its key, on that connection, and
 is the only chain it carries.** A `rejoin` must sign the nonce of the
@@ -313,14 +347,25 @@ recipient, and each state commitment opens with its revealed salt.
 **I11. The game's schedule.** One `before`; one `step` per action, in order;
 a `decide` exactly when this seat had a move that was not publicly forced,
 at most one per move; one `after`.
-* Verifier. Tests: `test_review.py::test_the_message_schedule_is_checked`,
+* Clients: refuse a decide before the game, or one for a move they were
+  already asked (the browser also after a reload: a replayed decide it
+  answered stays answered), so they never sign twice for one move.
+* Verifier: in the replays, and (two decides for one move) from the signed
+  messages alone. Tests: `test_round6.py::test_the_python_client_refuses_what_it_must_not_sign_under`,
+  `test_round6.py::test_the_page_answers_one_decide_per_move_even_after_a_reload`, `test_review.py::test_the_message_schedule_is_checked`,
   `test_review2.py::test_forced_moves_follow_what_the_table_can_see`.
 
 **I12. Every move is authorised.** A remote seat's move is its own signed
 statement; a server move is publicly forced (`only`, the only legal action)
 or flagged `timeout`/`bot_error` and the default action; a server bot's move
 is the server's; a seat is never timed out of a move it was not asked.
-* Verifier. Tests: `test_verify.py::test_a_forged_move_is_caught_by_everyone`.
+* Verifier: in the replays, and from the signed steps alone (so in a void or
+  an unfinished game too): a bot error on a remote seat, a move flagged
+  `only` after its seat was asked or with autoplay off, an unknown forced
+  reason, a move for this seat it was never asked to make, a timeout that is
+  not the decide's default. Tests: `test_verify.py::test_a_forged_move_is_caught_by_everyone`,
+  `test_round6.py::test_moves_the_server_could_not_make_are_caught_in_a_void`,
+  `test_round6.py::test_a_move_made_for_a_seat_that_was_never_asked_is_caught_in_a_void`.
 
 **I13. Every submission is answered.** Every `reveal` while seeds are being
 revealed, and every `action` from a seat once the game exists, gets exactly
@@ -335,8 +380,11 @@ spectator sends is answered however the server likes, and proves nothing.
 * Clients: `GameClient` resends every answer (and its reveal) not yet
   receipted after a reconnect, and waits `RECEIPT_WAIT_S` at the end for
   receipts still owed; the browser keeps unreceipted answers in its seat
-  record (a reload keeps them) and reconnects after the end while it is owed
-  receipts. A join refusal is a refusal only while a join is outstanding.
+  record (a reload keeps them) and waits a few seconds at the end for owed
+  receipts (it does not reconnect after the end: an honest server puts no
+  receipt that proves anything after the end). A join refusal is a refusal
+  only while a join is outstanding; a reveal answered by an error while
+  seeds are revealed is shown as a problem.
 * Verifier: in a seated transcript, an `error` answering an `action` between
   the join and the chain's end is an error; receipts or errors before the
   game are ignored.
@@ -357,9 +405,12 @@ the submission while decision `k` was open.
   (`unanswered`).
 * Verifier, from the signed decides, receipts and steps alone (so in a void
   or unfinished game too): a legal, correctly signed answer of this client to
-  decide `k` that step `k` did not play, with a receipt before step `k` or a
-  receipt saying `accepted` anywhere, is an error; every move played for this
-  seat as a timeout is a warning (with how long the client says it had).
+  any decide `k` that step `k` did not play, with a receipt before step `k` or
+  a receipt saying `accepted` anywhere, is an error, however many statements
+  the client signed (an honest server plays the first such answer and
+  receipts any other only after the step); every move played for this seat
+  as a timeout is a warning (with how long the client says it had; the
+  first note per move counts).
 * Tests: `test_protocol4.py::test_answers_at_the_deadline_never_frame_an_honest_server`,
   `test_protocol4.py::test_an_accepted_answer_the_server_did_not_play_is_caught`,
   `test_review2.py::test_a_legal_move_the_server_overrules_is_reported`,
@@ -375,13 +426,19 @@ does not depend on the order the transcripts are given in. Two server keys
 for one room id are a warning only: anyone can run a server with any room
 id, and since `C` names the key, nothing one key's room holds can stand in
 the other's.
-* Verifier: `verify_transcripts` (and `catanatron-verify` with several files).
+* Server: room ids are 128 random bits, never one in use.
+* Verifier: `verify_transcripts` (and `catanatron-verify` with several files):
+  every state commitment any message carries (the hello's and the void's
+  too), a void that names another game than another transcript's game, and
+  a rigged game the other transcript's void reveals.
 * Tests: `test_review2.py::test_a_server_naming_different_games_to_different_recipients_is_caught`,
   `test_protocol4.py::test_every_pair_of_transcripts_of_a_room_is_compared`,
   `test_protocol4.py::test_a_void_for_some_and_a_game_for_others_is_caught`,
   `test_round5.py::test_a_connection_that_only_heard_the_void_agrees_with_the_seat`,
   `test_round5.py::test_recipients_of_a_game_voided_midway_are_still_compared`,
-  `test_round5.py::test_one_room_cannot_be_served_under_two_keys`.
+  `test_round5.py::test_one_room_cannot_be_served_under_two_keys`,
+  `test_round6.py::test_a_lurker_s_void_is_compared_in_full`,
+  `test_round6.py::test_room_ids_are_long_and_unique`.
 
 Also kept, though not a fairness invariant: the room pushes `room` only when
 its seats change, so connections coming and going cannot make every chain
@@ -404,7 +461,8 @@ The verifier's report sorts everything it finds:
   recipients of one room told different things. These are checked over
   everything the transcript holds, finished or not, void or not.
 * **invalid** — not evidence: a broken signature or chain, a malformed file,
-  a header (key, seed, room) that the signed chain belies. Anyone can write
+  a header (key, seed, room) that the signed chain belies, a transcript of
+  another protocol version. Anyone can write
   one; it accuses nobody. (The live client knows better: it raises
   `ServerMisbehaved` the moment a message fails a check, which is why it
   checks as it plays.)
@@ -434,6 +492,20 @@ the real one), `test_review2.py::test_an_honest_server_is_not_accused`
 `test_round5.py::test_a_header_that_belies_the_chain_is_not_an_accusation`,
 `test_round5.py::test_a_spectator_cannot_make_an_honest_server_fail`,
 `test_verify.py::test_an_unfinished_transcript_cannot_be_verified_yet`.
+
+These rules are also checked systematically: `test_fuzz.py` records honest
+transcripts from a real server (seats, spectators from the start and from
+mid-game, lurkers; finished games, games voided midway or before they
+started; a seat that reconnects, answers duplicated on the wire), mutates
+them at random with a fixed seed (server lies re-signed with the server's
+key, each contradicting something provable; client edits of the header and
+of what it says it sent; the chain cut short), and asserts: an honest
+transcript has no errors, a server lie always has errors (and never because
+the verifier crashed), a client edit or a network effect never has errors.
+It also checks that Python and the browser read a generated corpus of
+values alike (canonical JSON, hex, floats, unsafe integers, lone
+surrogates). `pytest -m fuzz` (with `CATANATRON_FUZZ_BUDGET` and
+`CATANATRON_FUZZ_SEED`) runs a larger budget.
 
 ## 5. What the server can still do
 
