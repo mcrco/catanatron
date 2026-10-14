@@ -39,7 +39,11 @@ catanatron-play-bot --spec F --new --players 4 --fill F ws://localhost:8765
 
 It saves its transcript under `./transcripts/` and verifies it when the game ends.
 Anyone can verify a transcript later (several transcripts of one room are also
-checked against one another; a void room is reported as `VOID`):
+checked against one another). The verdict is `OK` (a finished game, every check
+passed), `FAILED` (the server's own signatures prove it cheated), `INVALID`
+(the file is not evidence: a broken signature, or a header the chain belies),
+`VOID` (the room was called off) or `INCOMPLETE` (the transcript stops early;
+what it holds is still checked):
 
 ```bash
 catanatron-verify transcripts/ROOM-GAME-RED.json
@@ -183,7 +187,9 @@ HTTP and WebSocket share one port:
 
 The API answers any origin, so a copy of the browser client served from
 elsewhere can use it. Client messages must be JSON objects whose numbers are
-all integers (a float anywhere is refused).
+all integers of magnitude at most 2^53 − 1 (a float, or a larger integer, is
+refused), so that every client reads every signed body alike; map coordinates
+are at most 100 from the center.
 
 Every message from the server on a room connection is a signed envelope:
 
@@ -203,20 +209,20 @@ null. All hashes, keys, seeds and signatures are lowercase hex. `H(x)` below is
 `sha256(canonical(x))`.
 
 The vocabulary extends `catanatron.protocol`'s (hello / before / decide / step /
-after); this is protocol version 4 (see [PROTOCOL.md](PROTOCOL.md)):
+after); this is protocol version 5 (see [PROTOCOL.md](PROTOCOL.md)):
 
 | body `type` | when | fields |
 |---|---|---|
 | `hello` | first message of every connection | `protocol_version`, `server_key`, `nonce` (a rejoin signs it), `room` (id, config, seats, status, `seed_commitment`) |
 | `joined` | you took a seat | `room_id`, `seat`, `color`, `public_key`, `client_commitment`, `room` |
 | `room` | seats changed before the lock (to every connection) | `room` |
-| `commitments` | every seat is taken: reveal your seed (once per room) | `room_id`, `config`, `seats` (seat, color, kind, name, spec, `public_key`, `requested_seat`, `client_commitment`, `pop`), `seed_commitment`, `reveal_timeout_ms` |
+| `commitments` | every seat is taken: reveal your seed (once per room) | `room_id`, `server_key`, `config`, `seats` (seat, color, kind, name, spec, `public_key`, `requested_seat`, `client_commitment`, `nonce`, `pop`), `seed_commitment`, `reveal_timeout_ms` |
 | `before` | the game starts (or you arrive as a spectator) | `room_id`, `game_id`, `color` (null for spectators), `commitments` (the whole body), `config`, `seats`, `client_seeds`, `reveals` (each seat's reveal signature), `seed_commitment`, `map`, `board`, `index`, `state`, `log_start`, `log`, `current_color`, `winning_color` |
 | `decide` | your move | `index`, `state`, `playable_actions` (Catanatron's order, the same in every process), `timeout_ms`, … |
 | `received` | a receipt for every reveal and action you submit | `submission` (H of {statement, sig}), `index` (the action's, or null), `accepted`, `reason` (e.g. `stale`, `refused: …`) |
 | `step` | someone acted | `index`, `state`, `log_start`, `log` (that action's entry), `forced` (null, `"only"`, `"timeout"` or `"bot_error"`), … |
 | `after` | the game is over | `index`, `state`, `num_turns`, `winning_color`, `reveal`: `server_seed`, `salts`, `actions` |
-| `aborted` | the room is void | `reason`, `blame`, `server_seed` |
+| `aborted` | the room is void | `game_id` (null if it had not started), `reason`, `blame`, `server_seed` |
 | `error` | a request was refused | `code`, `message` (never echoing the request), `answers` (which kind of request it answers) |
 
 `state` is your view of the game: Catanatron's `client_view(doc, your_color)`
@@ -232,13 +238,14 @@ tile its coordinate, type, resource/number or port, and node ids by corner
 Client → server on `/room/ID` (`C` is `H(commitments body)`):
 
 ```json
-{"type": "join", "protocol_version": 4, "name": "me", "seat": 0,
+{"type": "join", "protocol_version": 5, "name": "me", "seat": 0,
  "public_key": "<Ed25519 public key>",
  "client_commitment": "<H({domain: 'catanatron-client-seed/1', room_id, public_key, client_seed})>",
- "pop": "<sig of {domain: 'catanatron-join/1', room_id, seed_commitment, seat, client_commitment}>"}
+ "pop": "<sig of {domain: 'catanatron-join/2', room_id, server_key, seed_commitment, seat,
+          client_commitment, nonce}>"}          // nonce: this connection's hello's
 {"type": "reveal", "client_seed": "<32 random bytes>",
  "sig": "<sig of {domain: 'catanatron-reveal/1', commitments: C}>"}   // once, after `commitments`
-{"type": "rejoin", "protocol_version": 4, "public_key": "...",
+{"type": "rejoin", "protocol_version": 5, "public_key": "...",
  "sig": "<sig of {domain: 'catanatron-rejoin/1', room_id, nonce}>",
  "last_seq": 41}                     // reconnect: the hello's nonce; resend after 41
 {"type": "spectate"}
@@ -249,10 +256,12 @@ Client → server on `/room/ID` (`C` is `H(commitments body)`):
 ```
 
 `pop` proves the joining client holds its key and binds its seed commitment to
-the server's commitment it saw; a key already seated in the room is refused.
-The `commitments` publish every pop, and each seat signs `C` when it reveals,
-so every verifier can check that each key took part in this very game (`C`
-names every seat's fresh seed commitment). The server accepts an action only if
+the server (its key and seed commitment), the seat it asked for and the
+connection it joins on; a key already seated in the room is refused. The
+`commitments` publish every pop (a pop seats its key on its own connection
+only, so publishing it gives nobody a seat), and each seat signs `C` when it
+reveals, so every verifier can check that each key took part in this very
+game (`C` names the server's key and every seat's fresh seed commitment). The server accepts an action only if
 its statement is byte for byte the one for the pending `decide` and its action
 is one of the `playable_actions` that decide offered; it plays its own copy of
 that action, and answers every submission (reveal or action), accepted or not,
@@ -323,7 +332,16 @@ invariants behind each are in [PROTOCOL.md](PROTOCOL.md)):
    server key), the verifier checks every pair: one seed commitment, one set
    of commitments, one game (its id, seeds and reveals), one reveal or one
    void, one state commitment at each point; every disagreeing transcript
-   fails, whatever order the transcripts are given in.
+   fails, whatever order the transcripts are given in. Since `C` names the
+   server's key, one room cannot be served under two keys with the same
+   seats' signatures.
+
+What a transcript proves is checked over the whole chain, whatever it holds:
+a void or an early end does not hide what came before it, and nothing but
+receipts may follow the end. What only the client can say (its header, what
+it sent, how long it had) is never turned into an accusation: a transcript
+whose header the signed chain belies is not evidence, and a missing receipt
+or a timeout is a warning.
 
 ### What it does not guarantee (threat model)
 
@@ -376,10 +394,15 @@ room), signs every action, resends unacknowledged answers after a reconnect
 (also after the game ends, until their receipts come), and stores each
 finished transcript in IndexedDB ("Saved transcripts" in the lobby) for
 `catanatron-verify`, once the receipts it is owed have come, never replacing a
-stored transcript with a poorer copy. Its seat records (key, seed, reveal,
-signed answers) are kept in `localStorage` per game server key and room, so a
-reload takes the seat back, keeps what was signed, and a copy of the page
-used with several servers never hands one server's seat to another.
+stored transcript with a poorer copy. Its seat records (key, seed, the
+server's seed commitment, its reveal, signed answers) are kept in
+`localStorage` per game server key and room, so a reload takes the seat back
+and keeps what was signed, and a copy of the page used with several servers
+never hands one server's seat to another. After a reload it plays only the
+game it revealed its seed for, and a seat record whose game ended is never
+sat in again. It refuses floats and integers beyond 2^53 on the wire (which
+JavaScript and Python would read differently), and sorts keys by code point,
+as Python does.
 Everything the server sends is treated as data: it is escaped before display,
 never interpreted as markup.
 
