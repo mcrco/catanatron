@@ -5,7 +5,7 @@ by current player). Main function is generate_playable_actions.
 
 import operator as op
 from functools import reduce
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 from catanatron.models.decks import (
     CITY_COST_FREQDECK,
@@ -122,19 +122,23 @@ def monopoly_possibilities(color) -> List[Action]:
 
 
 def year_of_plenty_possibilities(color, freqdeck: List[int]) -> List[Action]:
-    options: Set[Union[Tuple[FastResource, FastResource], Tuple[FastResource]]] = set()
+    # A dict rather than a set: it dedupes and keeps the order options are
+    # found in. Set order follows the process's string hash seed (and before
+    # Python 3.12 hash(None)), which made seeded games differ per process.
+    options: Dict[Union[Tuple[FastResource, FastResource], Tuple[FastResource]], None]
+    options = {}
     for i, first_card in enumerate(RESOURCES):
         for j in range(i, len(RESOURCES)):
             second_card = RESOURCES[j]  # doing it this way to not repeat
 
             to_draw = freqdeck_from_listdeck([first_card, second_card])
             if freqdeck_contains(freqdeck, to_draw):
-                options.add((first_card, second_card))
+                options[(first_card, second_card)] = None
             else:  # try allowing player select 1 card only.
                 if freqdeck_can_draw(freqdeck, 1, first_card):
-                    options.add((first_card,))
+                    options[(first_card,)] = None
                 if freqdeck_can_draw(freqdeck, 1, second_card):
-                    options.add((second_card,))
+                    options[(second_card,)] = None
 
     return list(
         map(
@@ -227,7 +231,8 @@ def _robber_possibilities_without_friendly_robber(state, color) -> List[Action]:
 
         # each tile can yield a (move-but-cant-steal) action or
         #   several (move-and-steal-from-x) actions.
-        to_steal_from = set()  # set of player_indexs
+        # Ordered (a dict, not a set): set order would follow the hash seed.
+        to_steal_from: Dict[Any, None] = {}
         for node_id in tile.nodes.values():
             building = state.board.buildings.get(node_id, None)
             if building is not None:
@@ -236,7 +241,7 @@ def _robber_possibilities_without_friendly_robber(state, color) -> List[Action]:
                     player_num_resource_cards(state, candidate_color) >= 1
                     and color != candidate_color  # can't play yourself
                 ):
-                    to_steal_from.add(candidate_color)
+                    to_steal_from[candidate_color] = None
 
         if len(to_steal_from) == 0:
             actions.append(Action(color, ActionType.MOVE_ROBBER, (coordinate, None)))
@@ -312,8 +317,12 @@ def maritime_trade_possibilities(state, color) -> List[Action]:
 
 
 def inner_maritime_trade_possibilities(hand_freqdeck, bank_freqdeck, port_resources):
-    """This inner function is to make this logic more shareable"""
-    trade_offers = set()
+    """This inner function is to make this logic more shareable.
+
+    Offers come in RESOURCES order (given, then asked for), the same in every
+    process.
+    """
+    trade_offers = {}
 
     # Get lowest rate per resource
     rates: Dict[FastResource, int] = {WOOD: 4, BRICK: 4, SHEEP: 4, WHEAT: 4, ORE: 4}
@@ -335,6 +344,6 @@ def inner_maritime_trade_possibilities(hand_freqdeck, bank_freqdeck, port_resour
                     and freqdeck_count(bank_freqdeck, j_resource) > 0
                 ):
                     trade_offer = tuple(resource_out + [j_resource])
-                    trade_offers.add(trade_offer)
+                    trade_offers[trade_offer] = None
 
-    return trade_offers
+    return list(trade_offers)
