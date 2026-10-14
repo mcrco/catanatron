@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Catanatron Server</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <a href="#" id="home">Catanatron Server</a>
+      <span id="crypto-status" class="muted"></span>
+    </header>
+
+    <main id="lobby" hidden>
+      <section class="panel">
+        <h2>Rooms</h2>
+        <table id="rooms">
+          <thead>
+            <tr><th>Room</th><th>Status</th><th>Players</th><th>Seats</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <button id="refresh">Refresh</button>
+      </section>
+
+      <section class="panel">
+        <h2>New room</h2>
+        <form id="create">
+          <label>Name <input name="name" maxlength="32" placeholder="optional" /></label>
+          <label>Players
+            <select name="num_players">
+              <option>2</option><option>3</option><option selected>4</option>
+              <option>5</option><option>6</option>
+            </select>
+          </label>
+          <label>Map
+            <select name="map_type">
+              <option>BASE</option><option>TOURNAMENT</option><option>MINI</option>
+            </select>
+          </label>
+          <label>Numbers
+            <select name="number_placement">
+              <option value="official_spiral">official spiral</option>
+              <option value="random">random</option>
+            </select>
+          </label>
+          <label>Points to win <input name="vps_to_win" type="number" min="3" max="30" value="10" /></label>
+          <label>Discard limit <input name="discard_limit" type="number" min="3" max="100" value="7" /></label>
+          <label>Seconds per decision <input name="timeout" type="number" min="1" value="120" /></label>
+          <label class="wide">Explicit map (optional JSON: {"tiles": [...]})
+            <textarea name="map" rows="3" placeholder='{"tiles": [{"coordinate": [0,0,0], "type": "land", "resource": "WOOD", "number": 6}, ...]}'></textarea>
+          </label>
+          <fieldset class="wide">
+            <legend>Seats</legend>
+            <div id="seat-specs"></div>
+          </fieldset>
+          <button type="submit">Create room</button>
+          <span id="create-error" class="error"></span>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Saved transcripts</h2>
+        <p class="muted">Every game you play here is saved in this browser.
+          Check one with <code>catanatron-verify FILE</code>.</p>
+        <ul id="transcripts"></ul>
+      </section>
+    </main>
+
+    <main id="room" hidden>
+      <div id="board-wrap">
+        <svg id="board" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div id="prompt"></div>
+      </div>
+      <aside>
+        <section class="panel" id="seating"></section>
+        <section class="panel" id="me"></section>
+        <section class="panel" id="actions"></section>
+        <section class="panel" id="players"></section>
+        <section class="panel">
+          <h3>Log</h3>
+          <ol id="log" reversed></ol>
+        </section>
+        <section class="panel" id="fairness"></section>
+      </aside>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
