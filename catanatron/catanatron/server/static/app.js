@@ -16,8 +16,8 @@ const PLAYER_COLORS = {
   WHITE: "#f7f7f7", GREEN: "#2e9d3f", BROWN: "#7b4a2a",
 };
 const TILE_COLORS = {
-  WOOD: "#3d8c40", BRICK: "#c8623c", SHEEP: "#9ccc65",
-  WHEAT: "#f0c445", ORE: "#97a3ae", DESERT: "#e2c98f",
+  WOOD: "#3a7d44", BRICK: "#c65d3b", SHEEP: "#9bc53d",
+  WHEAT: "#e9b949", ORE: "#8e9aa6", DESERT: "#dcc48f",
 };
 const SIZE = 50;
 const W = Math.sqrt(3) * SIZE;
@@ -237,11 +237,14 @@ async function showLobby() {
   list.innerHTML = "";
   for (const entry of await listTranscripts()) {
     const item = document.createElement("li");
-    const link = button("Download", () => download(entry.id + ".json", entry.json));
-    item.append(link, " " + entry.id);
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = entry.id;
+    link.onclick = (event) => { event.preventDefault(); download(entry.id + ".json", entry.json); };
+    item.append(link);
     list.append(item);
   }
-  if (!list.children.length) list.innerHTML = '<li class="muted">none yet</li>';
+  if (!list.children.length) list.innerHTML = '<li class="muted">none</li>';
 }
 async function refreshRooms() {
   const all = await (await fetch(apiUrl("/api/rooms"))).json();
@@ -294,8 +297,8 @@ function tableKinds(rooms) {
   return [...kinds.values()].sort((a, b) => a.config.num_players - b.config.num_players);
 }
 function rulesText(config) {
-  const parts = [config.num_players === 2 ? "1 vs 1" : `${config.num_players} players`, `${config.vps_to_win} VP to win`];
-  if (config.discard_limit !== undefined && config.discard_limit !== 7) parts.push(`discard above ${config.discard_limit}`);
+  const parts = [config.num_players === 2 ? "1v1" : `${config.num_players} players`, `${config.vps_to_win} points`];
+  if (config.discard_limit !== undefined && config.discard_limit !== 7) parts.push(`discard over ${config.discard_limit}`);
   return parts.join(" · ");
 }
 function renderTables(rooms) {
@@ -306,22 +309,17 @@ function renderTables(rooms) {
     const card = document.createElement("div");
     card.className = "table-card";
     const n = Number(kind.config.num_players) || 0;
-    const hexes = [];
-    for (let i = 0; i < n; i++) {
-      hexes.push(html`<span style="background:${swatch(COLORS[i])}">${i === n - 1 ? "👤" : "🤖"}</span>`);
-    }
-    const bots = kind.bots.map((name) => html`<span class="chip"><span class="avatar" style="background:#e3e9ef">🤖</span>${name}</span>`);
-    const status = kind.open ? html`<span class="ok">● Table open</span>`
-      : html`<span class="muted">All tables busy (${kind.playing} playing)</span>`;
-    setHtml(card, html`<div class="art">${hexes}</div><div class="body"><h3>${kind.name}</h3>
-      <div class="meta">${rulesText(kind.config)}</div><div class="seats">${bots}</div>
-      <div class="foot">${status}</div></div>`);
-    const play = button(kind.open ? "Play" : "Busy", () => playTable(kind.name), "primary big");
+    const bots = kind.bots.join(", ");
+    const status = kind.open ? html`<span class="status open">open</span>`
+      : html`<span class="status">busy${kind.playing ? html` · ${kind.playing} playing` : html``}</span>`;
+    setHtml(card, html`<h3>${kind.name}</h3><div class="meta">${rulesText(kind.config)}</div>
+      <div class="bots">vs ${n - 1 > 1 ? html`${n - 1} × ` : html``}${bots}</div><div class="foot">${status}</div>`);
+    const play = button("Play", () => playTable(kind.name), "primary big");
     play.disabled = !kind.open;
     card.querySelector(".foot").append(play);
     box.append(card);
   }
-  if (!kinds.length) box.innerHTML = '<div class="panel muted">The bots are warming up: no table is open yet. Try again in a minute.</div>';
+  if (!kinds.length) box.innerHTML = '<div class="panel muted">No tables open yet.</div>';
 }
 function renderLive(rooms) {
   const list = $("#live");
@@ -329,11 +327,11 @@ function renderLive(rooms) {
   for (const room of rooms.filter((r) => r.status === "playing").reverse()) {
     const item = document.createElement("li");
     const seats = room.seats.map((s) => html`<span class="swatch" style="background:${swatch(s.color)}"></span>${s.name || s.color} `);
-    setHtml(item, html`<b>${room.name}</b><span class="grow muted">${seats}</span>`);
+    setHtml(item, html`<b>${room.name}</b><span class="grow">${seats}</span>`);
     item.append(button("Watch", () => { location.hash = "room=" + room.id; }));
     list.append(item);
   }
-  if (!list.children.length) list.innerHTML = '<li class="muted">No games right now.</li>';
+  if (!list.children.length) list.innerHTML = '<li class="muted">none</li>';
 }
 function saveName() {
   const field = $("#lobby-name");
@@ -349,7 +347,7 @@ async function playTable(name) {
   try { rooms = await (await fetch(apiUrl("/api/rooms"))).json(); } catch (error) { /* shown below */ }
   const room = rooms.find((r) => r.name === name && readyRoom(r));
   if (!room) {
-    lobbyNotice = `Every "${name}" table is busy right now. A new one opens as soon as a game ends.`;
+    lobbyNotice = `${name} is busy. A table opens when a game ends.`;
     if (location.hash) location.hash = ""; else showLobby();
     return;
   }
@@ -1075,9 +1073,8 @@ class Session {
 }
 
 // ===== the room page =====
-const RES_ICON = { WOOD: "🌲", BRICK: "🧱", SHEEP: "🐑", WHEAT: "🌾", ORE: "⛰️" };
-const TILE_ICON = { ...RES_ICON, DESERT: "🌵" };
-const DEV_ICON = { KNIGHT: "⚔️", YEAR_OF_PLENTY: "🎁", MONOPOLY: "💰", ROAD_BUILDING: "🛤️", VICTORY_POINT: "🏆" };
+const RES_COLORS = { WOOD: "#2f7a3d", BRICK: "#c2410c", SHEEP: "#84cc16", WHEAT: "#eab308", ORE: "#64748b" };
+const RES_LABEL = { WOOD: "wood", BRICK: "brick", SHEEP: "sheep", WHEAT: "wheat", ORE: "ore" };
 const DEV_NAME = {
   KNIGHT: "Knight", YEAR_OF_PLENTY: "Year of Plenty", MONOPOLY: "Monopoly",
   ROAD_BUILDING: "Road Building", VICTORY_POINT: "Victory Point",
@@ -1088,7 +1085,9 @@ const COSTS = {
   city: ["WHEAT", "WHEAT", "ORE", "ORE", "ORE"], dev: ["SHEEP", "WHEAT", "ORE"],
 };
 const BUILD_TYPES = { road: "BUILD_ROAD", settlement: "BUILD_SETTLEMENT", city: "BUILD_CITY" };
-const icon = (resource) => RES_ICON[resource] || "❓";
+// A resource, as a colored word (or a swatch when there is no room for one).
+const res = (resource) => html`<span style="color:${RES_COLORS[resource] || "#999"};font-weight:600">${RES_LABEL[resource] || String(resource).toLowerCase()}</span>`;
+const dot = (resource) => html`<span class="res res-${resource}"></span>`;
 // What the page shows besides the protocol: the build mode, the open
 // dialog, whether it was sent here to sit (and at which kind of table),
 // and which seats the house holds.
@@ -1135,7 +1134,7 @@ function render() {
 
 function swatch(color) { return PLAYER_COLORS[color] || "#999"; }
 // Readable on white (a white seat's name is shown in grey).
-function inkOf(color) { return color === "WHITE" ? "#7b8794" : swatch(color); }
+function inkOf(color) { return color === "WHITE" ? "#6b7280" : swatch(color); }
 function storedName() { try { return localStorage.getItem("catanatron-name") || ""; } catch (error) { return ""; } }
 
 function seatInfo(color) {
@@ -1158,8 +1157,11 @@ function nameOf(color) {
   return seatName(color);
 }
 function avatarHtml(seat, color) {
-  return html`<span class="avatar" style="background:${swatch(color)}">${isBot(seat) ? "🤖" : "👤"}</span>`;
+  const name = seat.name || String(color || "");
+  const initial = Array.from(name.trim())[0] || "?";
+  return html`<span class="avatar${color === "WHITE" ? " light" : ""}" style="background:${swatch(color)}">${initial.toUpperCase()}</span>`;
 }
+const botTag = (seat) => (isBot(seat) ? html` <span class="tag">bot</span>` : html``);
 
 // Which seats the house holds (the server's list says; a room message does
 // not): asked once the room is full, when it no longer changes.
@@ -1190,7 +1192,7 @@ function renderSeating() {
   const canSit = !session.joinSent && !session.spectating && !session.joining && room.status === "waiting";
   setHtml(box, html`<h3>${room.name}</h3><div class="muted">${rulesText(room.config)}</div>`);
   if (canSit || (session.joining && !session.seated)) {
-    addHtml(box, html`<label>Your name <input id="my-name" maxlength="32" placeholder="Guest" value="${storedName()}"></label>`);
+    addHtml(box, html`<label>Name <input id="my-name" maxlength="32" placeholder="Guest" value="${storedName()}"></label>`);
     $("#my-name").onchange = (e) => localStorage.setItem("catanatron-name", e.target.value);
   }
   for (const seat of room.seats) {
@@ -1198,10 +1200,9 @@ function renderSeating() {
     row.className = "seat-row";
     const mine = session.seated && session.saved.seat === seat.seat;
     const away = seat.kind === "remote" && !seat.connected ? html` <span class="muted">(away)</span>` : html``;
-    const who = seat.kind === "open" ? html`<span class="muted">open seat</span>`
-      : html`<b>${seat.name}</b>${mine ? html` <span class="muted">(you)</span>` : html``}${away}`;
-    const face = seat.kind === "open" ? "·" : mine ? "👤" : seat.kind === "bot" || house ? "🤖" : "👤";
-    setHtml(row, html`<span class="avatar" style="background:${swatch(seat.color)}">${face}</span><span class="grow">${who}</span>`);
+    const who = seat.kind === "open" ? html`<span class="muted">open</span>`
+      : html`<b>${seat.name}</b>${mine ? html` <span class="muted">(you)</span>` : seat.kind === "bot" || house ? html` <span class="tag">bot</span>` : html``}${away}`;
+    setHtml(row, html`<span class="swatch" style="background:${swatch(seat.color)}"></span><span class="grow">${who}</span>`);
     if (seat.kind === "open" && room.status === "waiting") {
       if (canSit) row.append(button("Sit here", () => session.takeSeat(seat.seat), "primary"));
       if (!house) {
@@ -1216,17 +1217,16 @@ function renderSeating() {
     box.append(row);
   }
   let status = html``;
-  if (session.joining) status = html`<p><span class="spinner"></span>Taking your seat…</p>`;
-  else if (session.commitments) status = html`<p><span class="spinner"></span>Every seat is taken: shuffling (each seat reveals its seed)…</p>`;
-  else if (session.seated) {
-    status = house ? html`<p><span class="spinner"></span>You're in. The bots are sitting down…</p>`
-      : html`<p><span class="spinner"></span>You're in. The game starts when every seat is taken.</p>`;
-  } else if (session.spectating) status = html`<p class="muted">Watching: the game shows here when it starts.</p>`;
+  if (session.joining) status = html`<p><span class="spinner"></span>Joining…</p>`;
+  else if (session.commitments) status = html`<p><span class="spinner"></span>Starting…</p>`;
+  else if (session.seated) status = html`<p><span class="spinner"></span>Waiting for the other seats…</p>`;
+  else if (session.spectating) status = html`<p class="muted">Watching.</p>`;
   addHtml(box, status);
   for (const problem of session.problems.slice(-1)) addHtml(box, html`<p class="error">${problem}</p>`);
   const foot = document.createElement("div");
-  if (!session.spectating && !session.joining && !session.joinSent) foot.append(button("Just watch", () => session.spectate()));
-  foot.append(button("Back to lobby", () => { location.hash = ""; }));
+  foot.className = "foot";
+  if (!session.spectating && !session.joining && !session.joinSent) foot.append(button("Watch", () => session.spectate()));
+  foot.append(button("Lobby", () => { location.hash = ""; }));
   box.append(foot);
   if (!house && !players.length) fetch(apiUrl("/api/players")).then((r) => r.json()).then((p) => { players = p; renderSeating(); });
 }
@@ -1325,23 +1325,22 @@ function renderBoard() {
     if (tile.type !== "land") continue;
     const [cx, cy] = pixel(tile.coordinate);
     const resource = tile.resource || "DESERT";
-    board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE + 3), fill: "#f1dfae" }));
+    board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE + 3), fill: "#e8d9b0" }));
     board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE - 2), fill: TILE_COLORS[resource] }));
-    board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE - 9), fill: "none", stroke: "rgba(255,255,255,0.22)", "stroke-width": 3 }));
-    board.append(svg("text", { x: cx, y: cy - 13, "text-anchor": "middle", "font-size": 22 }, TILE_ICON[resource]));
+    board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE - 9), fill: "none", stroke: "rgba(255,255,255,0.18)", "stroke-width": 3 }));
     if (tile.number) {
       const hot = tile.number === 6 || tile.number === 8;
       const lit = rolled !== null && tile.number === rolled;
-      board.append(svg("circle", { cx, cy: cy + 14, r: 14, fill: lit ? "#ffe066" : "#fbf3dc", stroke: lit ? "#f59f00" : "#b7a77d", "stroke-width": lit ? 3 : 1.5 }));
-      board.append(svg("text", { x: cx, y: cy + 18, "text-anchor": "middle", "font-size": 14, "font-weight": 800, fill: hot ? "#c92a2a" : "#2b2b2b" }, tile.number));
-      board.append(svg("text", { x: cx, y: cy + 25, "text-anchor": "middle", "font-size": 6, fill: hot ? "#c92a2a" : "#2b2b2b" }, "•".repeat(PIPS[tile.number] || 0)));
+      board.append(svg("circle", { cx, cy, r: 14, fill: lit ? "#fde68a" : "#fbf6e6", stroke: lit ? "#d97706" : "#b9ab84", "stroke-width": lit ? 3 : 1.5 }));
+      board.append(svg("text", { x: cx, y: cy + 4, "text-anchor": "middle", "font-size": 14, "font-weight": 700, fill: hot ? "#b91c1c" : "#1f2937" }, tile.number));
+      board.append(svg("text", { x: cx, y: cy + 11, "text-anchor": "middle", "font-size": 6, fill: hot ? "#b91c1c" : "#1f2937" }, "•".repeat(PIPS[tile.number] || 0)));
     }
     const key = tile.coordinate.join(",");
     if (key === robber) {
-      board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE - 2), fill: "rgba(0,0,0,0.28)" }));
-      const [rx, ry] = [cx + 17, cy + 4];
-      board.append(svg("path", { d: `M${rx - 8} ${ry + 13} L${rx + 8} ${ry + 13} L${rx + 5} ${ry - 1} Q${rx} ${ry - 6} ${rx - 5} ${ry - 1} Z`, fill: "#3a3a3a", stroke: "#e8e8e8", "stroke-width": 1.2 }));
-      board.append(svg("circle", { cx: rx, cy: ry - 8, r: 5.5, fill: "#3a3a3a", stroke: "#e8e8e8", "stroke-width": 1.2 }));
+      board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE - 2), fill: "rgba(0,0,0,0.3)" }));
+      const [rx, ry] = tile.number ? [cx + 19, cy + 2] : [cx, cy];
+      board.append(svg("path", { d: `M${rx - 8} ${ry + 13} L${rx + 8} ${ry + 13} L${rx + 5} ${ry - 1} Q${rx} ${ry - 6} ${rx - 5} ${ry - 1} Z`, fill: "#1f2937", stroke: "#e5e7eb", "stroke-width": 1.2 }));
+      board.append(svg("circle", { cx: rx, cy: ry - 8, r: 5.5, fill: "#1f2937", stroke: "#e5e7eb", "stroke-width": 1.2 }));
     }
     if (clicks.tiles[key]) {
       const pick = svg("polygon", { points: hexPoints(cx, cy, SIZE - 4), fill: "rgba(255,255,255,0.12)", stroke: "#fff", "stroke-width": 3, "stroke-dasharray": "6 4", class: "tile-pick" });
@@ -1356,9 +1355,9 @@ function renderBoard() {
       const [nx, ny] = positions[node];
       board.append(svg("line", { x1: cx + (nx - cx) * 0.35, y1: cy + (ny - cy) * 0.35, x2: nx, y2: ny, stroke: "#8a6a3f", "stroke-width": 5, "stroke-linecap": "round" }));
     }
-    board.append(svg("circle", { cx, cy, r: 16, fill: "#fff6e0", stroke: "#8a6a3f", "stroke-width": 2 }));
-    board.append(svg("text", { x: cx, y: cy - 1, "text-anchor": "middle", "font-size": 10, "font-weight": 800 }, tile.port_resource ? "2:1" : "3:1"));
-    board.append(svg("text", { x: cx, y: cy + 11, "text-anchor": "middle", "font-size": 9 }, tile.port_resource ? icon(tile.port_resource) : "❔"));
+    board.append(svg("circle", { cx, cy, r: 15, fill: "#fbf6e6", stroke: "#8a6a3f", "stroke-width": 2 }));
+    board.append(svg("text", { x: cx, y: cy + (tile.port_resource ? -1 : 4), "text-anchor": "middle", "font-size": 10, "font-weight": 700, fill: "#1f2937" }, tile.port_resource ? "2:1" : "3:1"));
+    if (tile.port_resource) board.append(svg("circle", { cx, cy: cy + 7, r: 4, fill: RES_COLORS[tile.port_resource] || "#999" }));
   }
 
   const drawn = new Set();
@@ -1421,9 +1420,9 @@ function renderDice() {
 
 // ===== prompts =====
 const THEIR_PROMPTS = {
-  BUILD_INITIAL_SETTLEMENT: "placing a settlement", BUILD_INITIAL_ROAD: "placing a road",
-  PLAY_TURN: "taking their turn", DISCARD: "discarding", MOVE_ROBBER: "moving the robber",
-  DECIDE_TRADE: "deciding on a trade", DECIDE_ACCEPTEES: "choosing whom to trade with",
+  BUILD_INITIAL_SETTLEMENT: "placing", BUILD_INITIAL_ROAD: "placing",
+  PLAY_TURN: "playing", DISCARD: "discarding", MOVE_ROBBER: "moving the robber",
+  DECIDE_TRADE: "deciding on a trade", DECIDE_ACCEPTEES: "choosing a trade partner",
 };
 function myPromptText() {
   const game = session.game;
@@ -1431,26 +1430,26 @@ function myPromptText() {
   const has = (type) => actions.some((a) => a[1] === type);
   switch (game.state.current_prompt) {
     case "BUILD_INITIAL_SETTLEMENT": return "Place a settlement";
-    case "BUILD_INITIAL_ROAD": return "Place a road next to it";
-    case "DISCARD": return "Too many cards: click a card to discard it";
-    case "MOVE_ROBBER": return "Move the robber: click a tile";
+    case "BUILD_INITIAL_ROAD": return "Place a road";
+    case "DISCARD": return "Discard: pick a card";
+    case "MOVE_ROBBER": return "Move the robber";
     case "PLAY_TURN":
-      if (has("ROLL")) return "Your turn: roll the dice";
-      if (actions.every((a) => a[1] === "BUILD_ROAD")) return "Road Building: place a free road";
-      return ui.build ? `Pick a spot for your ${ui.build}` : "Your turn: build, trade or end your turn";
-    default: return "Your move: " + prettyPrompt(game.state.current_prompt);
+      if (has("ROLL")) return "Roll";
+      if (actions.every((a) => a[1] === "BUILD_ROAD")) return "Place a free road";
+      return ui.build ? `Pick a spot for the ${ui.build}` : "Your turn";
+    default: return prettyPrompt(game.state.current_prompt);
   }
 }
 function promptText() {
-  if (session.aborted) return `Game void: ${session.aborted.reason}`;
+  if (session.aborted) return `Void: ${session.aborted.reason}`;
   const game = session.game;
   if (game.over) {
-    if (!game.winner) return "Game over (turn limit)";
-    return game.winner === game.color ? "You win! 🏆" : `${nameOf(game.winner)} wins`;
+    if (!game.winner) return "Game over";
+    return game.winner === game.color ? "You win" : `${nameOf(game.winner)} wins`;
   }
   if (session.pending && !session.answered) return myPromptText();
   const prompt = THEIR_PROMPTS[game.state.current_prompt] || prettyPrompt(game.state.current_prompt);
-  return game.current === game.color ? `You: ${prompt}…` : `${nameOf(game.current)} is ${prompt}…`;
+  return game.current === game.color ? "Sent" : `${nameOf(game.current)} is ${prompt}…`;
 }
 const prettyPrompt = (prompt) => String(prompt || "").toLowerCase().replace(/_/g, " ");
 function renderTimer() {
@@ -1488,7 +1487,7 @@ function renderMe() {
   const game = session.game;
   const box = $("#me");
   if (!game.color) {
-    setHtml(box, html`<div class="label">Watching: every hand is hidden from spectators.</div>`);
+    setHtml(box, html`<div class="label">Watching</div>`);
     return;
   }
   const actions = pendingActions();
@@ -1497,15 +1496,13 @@ function renderMe() {
   const cards = RESOURCES.map((r) => {
     const n = ps(game.color, r + "_IN_HAND");
     const cls = `card res-${r}${n ? "" : " empty"}${discard[r] ? " pick" : ""}`;
-    return html`<div class="${cls}" data-res="${r}" title="${r.toLowerCase()}">${RES_ICON[r]}<span class="count">${n}</span></div>`;
+    return html`<div class="${cls}" data-res="${r}">${RES_LABEL[r]}<span class="count">${n}</span></div>`;
   });
   const devs = DEV_CARDS.map((c) => [c, ps(game.color, c + "_IN_HAND")]).filter(([, n]) => n > 0).map(([c, n]) => {
     const playable = DEV_PLAY[c] && actions.some((a) => a[1] === DEV_PLAY[c]);
-    return html`<div class="card dev${playable ? " pick" : ""}" data-dev="${c}" title="${DEV_NAME[c]}">${DEV_ICON[c]}<span class="count">${n}</span><span class="name">${DEV_NAME[c]}</span></div>`;
+    return html`<div class="card dev${playable ? " pick" : ""}" data-dev="${c}">${DEV_NAME[c]}<span class="count">${n}</span></div>`;
   });
-  const hint = Object.keys(discard).length ? " · click a card to discard it"
-    : actions.some((a) => Object.values(DEV_PLAY).includes(a[1])) ? " · click a glowing card to play it" : "";
-  setHtml(box, html`<div class="label">Your hand · ${ps(game.color, "ACTUAL_VICTORY_POINTS")} VP${hint}</div>${cards}<span class="cards-gap"></span>${devs}`);
+  setHtml(box, html`<div class="label">${vpOf(game.color)} points</div>${cards}<span class="cards-gap"></span>${devs}`);
   for (const element of box.querySelectorAll(".card.pick")) {
     element.classList.add("clickable");
     const resource = element.getAttribute("data-res"), dev = element.getAttribute("data-dev");
@@ -1531,7 +1528,7 @@ const ACTION_TYPES = new Set([
 function actionLabel(action) {
   const [, type, value] = action;
   switch (type) {
-    case "ROLL": return "Roll the dice";
+    case "ROLL": return "Roll";
     case "END_TURN": return "End turn";
     case "BUY_DEVELOPMENT_CARD": return "Buy a development card";
     case "PLAY_KNIGHT_CARD": return "Play a knight";
@@ -1565,25 +1562,24 @@ function renderActions() {
   const has = (type) => actions.some((a) => a[1] === type);
   const boardOnly = actions.length > 0 && actions.every((a) => ON_BOARD.has(a[1]));
   if (ui.build && !has(BUILD_TYPES[ui.build])) ui.build = null;
-  const add = (symbol, label, cost, enabled, onclick, extra) => {
+  const add = (label, cost, enabled, onclick, extra) => {
     const element = button("", onclick, "act" + (extra ? " " + extra : ""));
-    const costs = cost ? html`<span class="cost">${cost.map(icon).join("")}</span>` : html``;
-    setHtml(element, html`<span class="icon">${symbol}</span>${label}${costs}`);
+    const costs = cost ? html`<span class="cost">${cost.map(dot)}</span>` : html``;
+    setHtml(element, html`<span>${label}</span>${costs}`);
     element.disabled = !enabled;
     box.append(element);
   };
-  add("💱", "Trade", null, has("MARITIME_TRADE"), () => openModal({ kind: "trade" }));
-  add("🃏", "Dev card", COSTS.dev, has("BUY_DEVELOPMENT_CARD"), () => act("BUY_DEVELOPMENT_CARD"));
-  for (const [mode, symbol, label] of [["road", "🛣️", "Road"], ["settlement", "🏠", "Settlement"], ["city", "🏙️", "City"]]) {
-    add(symbol, label, COSTS[mode], has(BUILD_TYPES[mode]) && !boardOnly,
+  add("Trade", null, has("MARITIME_TRADE"), () => openModal({ kind: "trade" }));
+  add("Dev card", COSTS.dev, has("BUY_DEVELOPMENT_CARD"), () => act("BUY_DEVELOPMENT_CARD"));
+  for (const [mode, label] of [["road", "Road"], ["settlement", "Settlement"], ["city", "City"]]) {
+    add(label, COSTS[mode], has(BUILD_TYPES[mode]) && !boardOnly,
       () => { ui.build = ui.build === mode ? null : mode; render(); }, ui.build === mode ? "on" : "");
   }
-  if (has("ROLL")) add("🎲", "Roll", null, true, () => act("ROLL"), "go");
-  else add("⏭️", "End turn", null, has("END_TURN"), () => act("END_TURN"), "go");
+  if (has("ROLL")) add("Roll", null, true, () => act("ROLL"), "go");
+  else add("End turn", null, has("END_TURN"), () => act("END_TURN"), "go");
   for (const action of actions.filter((a) => !ACTION_TYPES.has(a[1]))) {
     box.append(button(actionLabel(action), () => session.act(action), "primary"));
   }
-  if (session.answered) addHtml(box, html`<div class="label">Sent…</div>`);
 }
 
 // ===== the side panels =====
@@ -1598,24 +1594,23 @@ function renderPlayers() {
     const devs = mine ? DEV_CARDS.reduce((n, c) => n + ps(color, c + "_IN_HAND"), 0) : ps(color, "NUM_DEVELOPMENT_CARDS_IN_HAND");
     const seat = seatInfo(color);
     const badges = [];
-    if (ps(color, "HAS_ROAD")) badges.push(html`<span class="badge">🛣️ Longest Road</span>`);
-    if (ps(color, "HAS_ARMY")) badges.push(html`<span class="badge">⚔️ Largest Army</span>`);
-    const vp = vpText(color);
+    if (ps(color, "HAS_ROAD")) badges.push(html`<span class="badge">Longest road</span>`);
+    if (ps(color, "HAS_ARMY")) badges.push(html`<span class="badge">Largest army</span>`);
     const row = document.createElement("div");
     row.className = "player" + (color === game.current && !game.over ? " current" : "");
     setHtml(row, html`${avatarHtml(seat, color)}
-      <div class="who">${seatName(color)}${mine ? html` <span class="tag">(you)</span>` : html``}</div>
-      <div class="vp">${vp}<small>VP</small></div>
-      <div class="stats"><span title="resource cards">🂠 ${resources}</span><span title="development cards">🃏 ${devs}</span><span title="knights played">⚔️ ${ps(color, "PLAYED_KNIGHT")}</span><span title="longest road">🛣️ ${ps(color, "LONGEST_ROAD_LENGTH")}</span></div>
+      <div class="who"><span>${seatName(color)}</span>${mine ? html`<span class="tag">you</span>` : botTag(seat)}</div>
+      <div class="vp">${vpText(color)}<small>pts</small></div>
+      <div class="stats"><span>${resources} cards</span><span>${devs} dev</span><span>${ps(color, "PLAYED_KNIGHT")} knights</span><span>road ${ps(color, "LONGEST_ROAD_LENGTH")}</span></div>
       ${badges.length ? html`<div class="badges">${badges}</div>` : html``}`);
     box.append(row);
   }
 }
 function renderBank() {
   const state = session.game.state;
-  const bank = state.resource_freqdeck.map((n, i) => html`<span title="${RESOURCES[i].toLowerCase()}">${RES_ICON[RESOURCES[i]]} ${n}</span>`);
+  const bank = state.resource_freqdeck.map((n, i) => html`<span>${dot(RESOURCES[i])} ${n}</span>`);
   const deck = state.development_deck_size !== undefined ? state.development_deck_size : "?";
-  setHtml($("#bank"), html`<h3>Bank</h3><div class="row">${bank}<span title="development cards left">🃏 ${deck}</span></div>`);
+  setHtml($("#bank"), html`<h3>Bank</h3><div class="row">${bank}<span class="muted">${deck} dev</span></div>`);
 }
 
 function who(color) { return html`<span class="who" style="color:${inkOf(color)}">${nameOf(color)}</span>`; }
@@ -1625,24 +1620,24 @@ function logHtml([action, result]) {
   switch (type) {
     case "ROLL": {
       const sum = Number(result[0]) + Number(result[1]);
-      return html`${by} rolled 🎲 ${result[0]} + ${result[1]} = <b>${sum}</b>`;
+      return html`${by} rolled <b>${sum}</b> <span class="muted">(${result[0]}+${result[1]})</span>`;
     }
-    case "BUILD_SETTLEMENT": return html`${by} built a 🏠 settlement`;
-    case "BUILD_CITY": return html`${by} built a 🏙️ city`;
-    case "BUILD_ROAD": return html`${by} built a 🛣️ road`;
-    case "BUY_DEVELOPMENT_CARD": return html`${by} bought a 🃏 development card${value ? ` (${DEV_NAME[value] || value})` : ""}`;
-    case "PLAY_KNIGHT_CARD": return html`${by} played a ⚔️ Knight`;
-    case "PLAY_ROAD_BUILDING": return html`${by} played 🛤️ Road Building`;
-    case "PLAY_YEAR_OF_PLENTY": return html`${by} played 🎁 Year of Plenty: ${(value || []).map(icon).join(" ")}`;
-    case "PLAY_MONOPOLY": return html`${by} played 💰 Monopoly on ${icon(value)}`;
+    case "BUILD_SETTLEMENT": return html`${by} built a settlement`;
+    case "BUILD_CITY": return html`${by} built a city`;
+    case "BUILD_ROAD": return html`${by} built a road`;
+    case "BUY_DEVELOPMENT_CARD": return html`${by} bought a development card${value ? html` <span class="muted">(${DEV_NAME[value] || value})</span>` : html``}`;
+    case "PLAY_KNIGHT_CARD": return html`${by} played a knight`;
+    case "PLAY_ROAD_BUILDING": return html`${by} played road building`;
+    case "PLAY_YEAR_OF_PLENTY": return html`${by} took ${res(value[0])} and ${res(value[1])}`;
+    case "PLAY_MONOPOLY": return html`${by} monopolized ${res(value)}`;
     case "MOVE_ROBBER": {
-      const stole = value[1] ? html`, stealing ${result ? icon(result) : "a card"} from ${who(value[1])}` : html``;
+      const stole = value[1] ? html`, stealing ${result ? res(result) : "a card"} from ${who(value[1])}` : html``;
       return html`${by} moved the robber${stole}`;
     }
-    case "DISCARD_RESOURCE": return html`${by} discarded ${value ? icon(value) : "a card"}`;
+    case "DISCARD_RESOURCE": return html`${by} discarded ${value ? res(value) : "a card"}`;
     case "MARITIME_TRADE": {
       const give = value.slice(0, 4).filter((r) => r);
-      return html`${by} traded ${give.length} ${icon(give[0])} for 1 ${icon(value[4])}`;
+      return html`${by} traded ${give.length} ${res(give[0])} for 1 ${res(value[4])}`;
     }
     case "END_TURN": return null;
     default: return html`${by}: ${actionLabel(action).toLowerCase()}`;
@@ -1669,23 +1664,18 @@ function renderFairness() {
   const s = session;
   const short = (value) => String(value || "").slice(0, 16);
   const ok = !s.unverified && !s.problems.length && !cryptoProblem;
-  setHtml($("#fairness-summary"), ok ? html`🔒 Fair play: ${s.verifiedCount} signatures checked`
-    : html`<span class="error">⚠ Fairness: see details</span>`);
+  setHtml($("#fairness-summary"), ok ? html`Verified · ${s.verifiedCount} signatures` : html`<span class="error">Verification: see details</span>`);
   const lines = [];
-  lines.push(html`<div class="muted">The server committed to its dice seed before anyone sat, each seat added a seed of its own, and every message is signed and hash-chained.</div>`);
-  if (s.serverCommitment) lines.push(html`<div class="muted">Seed commitment: <code>${short(s.serverCommitment)}…</code></div>`);
-  const key = s.serverKey ? html`; server key <code>${short(s.serverKey)}…</code>` : html``;
-  lines.push(html`<div>${s.messages.length} messages, ${s.verifiedCount} signatures checked here${key}</div>`);
-  if (s.unverified) lines.push(html`<div class="error">${s.unverified} messages could not be checked in this browser: this session is unverified.</div>`);
-  if (serverInfo.app_sha256) {
-    lines.push(html`<div class="muted">The server says it serves app.js with SHA-256 <code>${short(serverInfo.app_sha256)}…</code>. This page only protects you from the server if it (and index.html) did not come from that server: see the README.</div>`);
-  }
+  if (s.serverCommitment) lines.push(html`<div><span>Seed commitment</span><code>${short(s.serverCommitment)}…</code></div>`);
+  if (s.serverKey) lines.push(html`<div><span>Server key</span><code>${short(s.serverKey)}…</code></div>`);
+  lines.push(html`<div><span>Messages</span><span>${s.messages.length}, ${s.verifiedCount} signatures checked</span></div>`);
+  if (serverInfo.app_sha256) lines.push(html`<div><span>app.js</span><code>${short(serverInfo.app_sha256)}…</code></div>`);
+  if (s.unverified) lines.push(html`<div class="error">${s.unverified} messages could not be checked in this browser.</div>`);
   if (cryptoProblem) lines.push(html`<div class="error">${cryptoProblem}</div>`);
   for (const problem of s.problems.slice(-3)) lines.push(html`<div class="error">${problem}</div>`);
   setHtml(box, html`${lines}`);
   if (s.aborted || (s.game && s.game.over)) {
-    addHtml(box, html`<div>The server revealed its seed. Check the game with <code>catanatron-verify</code>:</div>`);
-    box.append(button("Download transcript", () => download((s.saveId || "transcript") + ".json", JSON.stringify(s.transcript())), "primary"));
+    box.append(button("Download transcript", () => download((s.saveId || "transcript") + ".json", JSON.stringify(s.transcript()))));
   }
 }
 
@@ -1727,33 +1717,33 @@ function renderModal() {
   const pending = pendingActions();
   switch (ui.modal.kind) {
     case "robber":
-      setHtml(inner, html`<h2>Steal from…</h2>`);
+      setHtml(inner, html`<h2>Steal from</h2>`);
       for (const action of ui.modal.actions) {
         const victim = action[2][1];
-        choose(victim ? html`${avatarHtml(seatInfo(victim), victim)} ${nameOf(victim)} <span class="muted">(${ps(victim, "NUM_RESOURCES_IN_HAND")} cards)</span>`
+        choose(victim ? html`${avatarHtml(seatInfo(victim), victim)} ${nameOf(victim)} <span class="muted">${ps(victim, "NUM_RESOURCES_IN_HAND")} cards</span>`
           : html`Nobody`, action);
       }
       inner.append(choices);
       foot.append(button("Cancel", closeModal));
       break;
     case "yop":
-      setHtml(inner, html`<h2>🎁 Year of Plenty</h2><p class="muted">Take any two resources from the bank.</p>`);
+      setHtml(inner, html`<h2>Year of Plenty</h2>`);
       for (const action of pending.filter((a) => a[1] === "PLAY_YEAR_OF_PLENTY")) {
-        choose(html`<span style="font-size:20px">${action[2].map(icon).join(" ")}</span>`, action);
+        choose(html`${dot(action[2][0])}${dot(action[2][1])} ${RES_LABEL[action[2][0]]} + ${RES_LABEL[action[2][1]]}`, action);
       }
       inner.append(choices);
       foot.append(button("Cancel", closeModal));
       break;
     case "monopoly":
-      setHtml(inner, html`<h2>💰 Monopoly</h2><p class="muted">Every other player gives you all their cards of one resource.</p>`);
+      setHtml(inner, html`<h2>Monopoly</h2>`);
       for (const action of pending.filter((a) => a[1] === "PLAY_MONOPOLY")) {
-        choose(html`<span style="font-size:20px">${icon(action[2])}</span> ${String(action[2]).toLowerCase()}`, action);
+        choose(html`${dot(action[2])} ${RES_LABEL[action[2]]}`, action);
       }
       inner.append(choices);
       foot.append(button("Cancel", closeModal));
       break;
     case "trade": {
-      setHtml(inner, html`<h2>💱 Trade with the bank</h2><p class="muted">Ports give better rates. Pick what you get:</p>`);
+      setHtml(inner, html`<h2>Trade with the bank</h2>`);
       const byGive = new Map();
       for (const action of pending.filter((a) => a[1] === "MARITIME_TRADE")) {
         const give = action[2].slice(0, 4).filter((r) => r);
@@ -1764,11 +1754,10 @@ function renderModal() {
       for (const { give, actions } of byGive.values()) {
         const row = document.createElement("div");
         row.className = "trade-row";
-        setHtml(row, html`<span class="give">${give.length} × ${icon(give[0])} →</span>`);
+        setHtml(row, html`<span class="give">${give.length} ${res(give[0])} for</span>`);
         for (const action of actions) {
           const element = button("", () => { closeModal(); session.act(action); });
-          setHtml(element, html`<span style="font-size:18px">${icon(action[2][4])}</span>`);
-          element.title = String(action[2][4]).toLowerCase();
+          setHtml(element, html`${dot(action[2][4])} ${RES_LABEL[action[2][4]]}`);
           row.append(element);
         }
         inner.append(row);
@@ -1780,21 +1769,19 @@ function renderModal() {
     case "void": {
       const game = s.game;
       if (ui.modal.kind === "void") {
-        setHtml(inner, html`<h2>Game void</h2><p>${s.aborted ? s.aborted.reason : ""}</p>`);
+        setHtml(inner, html`<h2>Game void</h2><p class="muted">${s.aborted ? s.aborted.reason : ""}</p>`);
       } else {
-        const won = game.winner && game.winner === game.color;
-        setHtml(inner, html`<div class="trophy">${won ? "🏆" : game.winner ? "🤖" : "⏱️"}</div>
-          <h2 style="text-align:center">${promptText()}</h2>`);
+        setHtml(inner, html`<p class="result">${promptText()}</p>`);
         const table = document.createElement("table");
         table.className = "final";
         const rows = [...game.state.colors].sort((a, b) => vpOf(b) - vpOf(a));
-        setHtml(table, html`${rows.map((color) => html`<tr><td>${avatarHtml(seatInfo(color), color)}</td><td>${seatName(color)}</td><td><b>${vpText(color)}</b> VP</td></tr>`)}`);
+        setHtml(table, html`${rows.map((color) => html`<tr><td>${avatarHtml(seatInfo(color), color)}</td><td>${seatName(color)}${botTag(seatInfo(color))}</td><td style="text-align:right"><b>${vpText(color)}</b> pts</td></tr>`)}`);
         inner.append(table);
       }
       const name = s.room && s.room.name;
       if (serverInfo.house && name) foot.append(button("Play again", () => { ui.retries = 0; playTable(name); }, "primary"));
-      foot.append(button("Look at the board", closeModal));
-      foot.append(button("Back to lobby", () => { location.hash = ""; }));
+      foot.append(button("Board", closeModal));
+      foot.append(button("Lobby", () => { location.hash = ""; }));
       break;
     }
     default:
@@ -1820,7 +1807,7 @@ let serverInfo = {};
 window.addEventListener("load", async () => {
   await checkCrypto();
   try { serverInfo = await (await fetch(apiUrl("/api/server"))).json(); } catch (error) { serverInfo = {}; }
-  $("#crypto-status").textContent = cryptoProblem ? "watch-only browser" : "🔒 your moves are signed in this browser";
+  $("#crypto-status").textContent = cryptoProblem ? "watch only" : "";
   $("#create").addEventListener("submit", createRoom);
   $("#create [name=num_players]").addEventListener("change", renderSeatSpecs);
   $("#refresh").onclick = refreshRooms;
