@@ -110,14 +110,28 @@ class GameResult:
         }
 
 
+def house_headers(token: Optional[str] = None) -> dict:
+    """The house token (``token``, else ``CATANATRON_HOUSE_TOKEN``) as the
+    header a server in house mode asks of the connections that open its
+    rooms."""
+    if token is None:
+        token = os.environ.get("CATANATRON_HOUSE_TOKEN", "")
+    token = token.strip()
+    return {"X-Catanatron-House": token} if token else {}
+
+
 def lobby_url(url: str) -> str:
     """``ws://host:port/lobby`` for any URL on that server."""
     parts = urlsplit(url)
     return urlunsplit((parts.scheme, parts.netloc, "/lobby", "", ""))
 
 
-async def lobby_request(url: str, request: dict) -> dict:
-    async with websockets.connect(lobby_url(url), max_size=None) as ws:
+async def lobby_request(
+    url: str, request: dict, house_token: Optional[str] = None
+) -> dict:
+    async with websockets.connect(
+        lobby_url(url), max_size=None, additional_headers=house_headers(house_token)
+    ) as ws:
         await ws.send(json.dumps(request))
         reply = json.loads(await ws.recv())
     if reply.get("type") == "error":
@@ -126,12 +140,19 @@ async def lobby_request(url: str, request: dict) -> dict:
 
 
 async def create_room(
-    url: str, config: dict, seats: Optional[list] = None, name: str = ""
+    url: str,
+    config: dict,
+    seats: Optional[list] = None,
+    name: str = "",
+    house_token: Optional[str] = None,
 ) -> dict:
     """Create a room; ``seats`` lists a registry spec (a server bot) or None
-    (open) per seat. Returns the room's description."""
+    (open) per seat. Returns the room's description. (A server in house mode
+    takes rooms only from its house: see :func:`house_headers`.)"""
     reply = await lobby_request(
-        url, {"type": "create_room", "config": config, "seats": seats, "name": name}
+        url,
+        {"type": "create_room", "config": config, "seats": seats, "name": name},
+        house_token,
     )
     return reply["room"]
 
@@ -173,6 +194,7 @@ class GameClient:
         transcript_dir: Optional[str] = "transcripts",
         verify: bool = True,
         reconnect_attempts: int = 5,
+        house_token: Optional[str] = None,
     ):
         match = re.search(r"/room/([A-Za-z0-9_-]+)/?$", urlsplit(url).path)
         if not match:
@@ -194,6 +216,8 @@ class GameClient:
         self.transcript_dir = transcript_dir
         self.verify = verify
         self.reconnect_attempts = reconnect_attempts
+        #: Shown to a server in house mode (None: CATANATRON_HOUSE_TOKEN).
+        self.house_token = house_token
 
         # One seed for this room, made here and never used for anything else.
         self.client_seed = random_hex()
@@ -349,7 +373,11 @@ class GameClient:
                 await asyncio.sleep(min(0.2 * 2**self._attempts, 5))
 
     async def _session(self, decide: Optional[Decide]) -> GameResult:
-        async with websockets.connect(self.url, max_size=None) as ws:
+        async with websockets.connect(
+            self.url,
+            max_size=None,
+            additional_headers=house_headers(self.house_token),
+        ) as ws:
             self.connection = ws
             first = json.loads(await ws.recv())
             rejoining = self._join_sent and not self.spectate

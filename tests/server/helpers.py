@@ -70,9 +70,9 @@ def bot_client(url, spec="F", client_class=GameClient, **kwargs):
     return client, decide
 
 
-async def raw_connect(url):
+async def raw_connect(url, headers=None):
     """A bare connection to a room: (websocket, hello body)."""
-    ws = await websockets.connect(url)
+    ws = await websockets.connect(url, additional_headers=headers)
     hello = json.loads(await ws.recv())["body"]
     return ws, hello
 

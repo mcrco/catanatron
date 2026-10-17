@@ -3,19 +3,38 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Catanatron Server</title>
+    <title>Catan vs RL bots</title>
     <!-- Assets load by relative path: this directory works opened from a
          file or served from any host (add ?server=HOST:PORT to play). -->
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header>
-      <a href="#" id="home">Catanatron Server</a>
+    <header id="topbar">
+      <a href="#" id="home"><span class="logo">⬢</span> Catan <span class="vs">vs</span> RL bots</a>
+      <span id="room-title"></span>
       <span id="crypto-status" class="muted"></span>
     </header>
 
     <main id="lobby" hidden>
-      <section class="panel">
+      <section class="hero">
+        <h1>Play Catan against a reinforcement-learning bot</h1>
+        <p>The bots learned the game from scratch by self-play (PPO). Every game is
+          provably fair: the dice seed is committed before anyone sits, every move is
+          signed, and you can verify the whole game afterwards.</p>
+        <label class="name-field">Your name
+          <input id="lobby-name" maxlength="32" placeholder="Guest" />
+        </label>
+      </section>
+
+      <p id="lobby-notice" class="notice" hidden></p>
+      <section id="tables" class="tables"></section>
+
+      <section class="panel" id="live-panel">
+        <h2>Games in progress</h2>
+        <ul id="live" class="live"></ul>
+      </section>
+
+      <section class="panel" id="rooms-panel">
         <h2>Rooms</h2>
         <table id="rooms">
           <thead>
@@ -24,9 +43,11 @@
           <tbody></tbody>
         </table>
         <button id="refresh">Refresh</button>
+        <label><input type="checkbox" id="show-finished"> Show finished</label>
+        <span id="hidden-count" class="muted"></span>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="create-panel">
         <h2>New room</h2>
         <form id="create">
           <label>Name <input name="name" maxlength="32" placeholder="optional" /></label>
@@ -57,35 +78,50 @@
             <legend>Seats</legend>
             <div id="seat-specs"></div>
           </fieldset>
-          <button type="submit">Create room</button>
+          <button type="submit" class="primary">Create room</button>
           <span id="create-error" class="error"></span>
         </form>
       </section>
 
-      <section class="panel">
-        <h2>Saved transcripts</h2>
+      <details class="panel">
+        <summary>Your saved transcripts</summary>
         <p class="muted">Every game you play here is saved in this browser.
           Check one with <code>catanatron-verify FILE</code>.</p>
         <ul id="transcripts"></ul>
-      </section>
+      </details>
+      <footer class="muted">Rules engine: <a href="https://github.com/bcollazo/catanatron">Catanatron</a>.
+        Bots: <a href="https://github.com/mcrco/catanrl">catanrl</a>.</footer>
     </main>
 
     <main id="room" hidden>
-      <div id="board-wrap">
-        <svg id="board" xmlns="http://www.w3.org/2000/svg"></svg>
-        <div id="prompt"></div>
+      <div id="stage">
+        <div id="board-wrap">
+          <svg id="board" xmlns="http://www.w3.org/2000/svg"></svg>
+          <div id="banner">
+            <div id="prompt"></div>
+            <div id="timer"><div id="timer-fill"></div></div>
+          </div>
+          <div id="dice"></div>
+          <section id="seating"></section>
+        </div>
+        <div id="hand-bar">
+          <section id="me"></section>
+          <section id="actions"></section>
+        </div>
       </div>
-      <aside>
-        <section class="panel" id="seating"></section>
-        <section class="panel" id="me"></section>
-        <section class="panel" id="actions"></section>
+      <aside id="side">
         <section class="panel" id="players"></section>
-        <section class="panel">
-          <h3>Log</h3>
-          <ol id="log" reversed></ol>
+        <section class="panel" id="bank"></section>
+        <section class="panel log-panel">
+          <h3>Game log</h3>
+          <ol id="log"></ol>
         </section>
-        <section class="panel" id="fairness"></section>
+        <details class="panel" id="fairness-box">
+          <summary id="fairness-summary">Fairness</summary>
+          <div id="fairness"></div>
+        </details>
       </aside>
+      <div id="modal" hidden></div>
     </main>
 
     <script src="app.js"></script>

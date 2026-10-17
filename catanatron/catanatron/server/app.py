@@ -6,8 +6,16 @@ Routes (one port, HTTP and WebSocket):
     GET /static/FILE       its assets
     GET /api/rooms         rooms, as JSON
     GET /api/players       the registry's bots, as JSON
-    GET /api/server        the server's public key, protocol version and the
-                           SHA-256 of the app.js it serves
+    GET /api/server        the server's public key, protocol version, the
+                           SHA-256 of the app.js it serves, and whether it
+                           runs in house mode
+
+House mode (``--house-token-file``): the server is a place to play its
+operator's bots, not a platform. Only connections that present the house
+token (the ``X-Catanatron-House`` header) may create rooms or seat server
+bots, and a room takes at most one seat from anyone else, so every game is
+one person against the house. A person who leaves a game for good (no
+connection for ``human_away_s``) voids it, so their table frees up.
     WS  /lobby             create_room, list_rooms, players
     WS  /room/ROOM_ID      join a seat, or spectate, and play
 
@@ -21,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -83,6 +92,9 @@ class ServerLimits:
     #: may not take seats anywhere for that hour; a blamed key may not take
     #: a seat for that hour at all.
     blames_per_ip: int = 3
+    #: House mode: a game whose only person has had no connection this long
+    #: is void (its bots would otherwise play out the person's timeouts).
+    human_away_s: float = 180.0
     #: Messages per second a connection may send (and its burst).
     messages_per_s: float = 30.0
     message_burst: int = 60
@@ -149,6 +161,7 @@ class GameServer:
         limits: ServerLimits = ServerLimits(),
         room_class: type = Room,
         trusted_proxies: Sequence[str] = (),
+        house_token: Optional[str] = None,
     ):
         from catanatron.players import register_builtins
 
@@ -173,6 +186,37 @@ class GameServer:
         self.room_owner: dict = {}
         self.janitor: Optional[asyncio.Task] = None
         self.app_sha256 = _file_sha256("app.js")
+        #: House mode (see the module doc): the token house connections show,
+        #: the keys they hold seats with (by room), and since when each house
+        #: game's person has been away.
+        self.house_token = house_token or None
+        self.house_keys: dict = defaultdict(set)
+        self.away_since: dict = {}
+
+    @property
+    def house(self) -> bool:
+        return self.house_token is not None
+
+    def is_house(self, websocket: ServerConnection) -> bool:
+        if self.house_token is None or websocket.request is None:
+            return False
+        shown = websocket.request.headers.get("X-Catanatron-House", "")
+        return hmac.compare_digest(shown.encode(), self.house_token.encode())
+
+    def guests(self, room: Room) -> list:
+        """A house room's seats held by people (not by the house)."""
+        keys = self.house_keys.get(room.id, set())
+        return [s for s in room.seats if s.kind == "remote" and s.public_key not in keys]
+
+    def describe_room(self, room: Room) -> dict:
+        out = room.describe()
+        if self.house:
+            keys = self.house_keys.get(room.id, set())
+            out["house_seats"] = [
+                s.index for s in room.seats
+                if s.kind == "bot" or (s.kind == "remote" and s.public_key in keys)
+            ]
+        return out
 
     # ===== rooms =====
     def create_room(
@@ -289,6 +333,8 @@ class GameServer:
     def _forget(self, room: Room) -> None:
         self.rooms.pop(room.id, None)
         self.room_owner.pop(room.id, None)
+        self.house_keys.pop(room.id, None)
+        self.away_since.pop(room.id, None)
 
     def sweep(self, now: Optional[float] = None) -> None:
         """Expire idle waiting rooms, abandoned games and old results."""
@@ -304,6 +350,14 @@ class GameServer:
             elif room.status == "playing" and absent > limits.abandoned_playing_s:
                 if any(s.kind == "remote" for s in room.seats):
                     room.abort("every remote seat left the game")
+            elif room.status == "playing" and self.house:
+                people = self.guests(room)
+                if people and not any(s.connected for s in people):
+                    since = self.away_since.setdefault(room.id, now)
+                    if now - since > limits.human_away_s:
+                        room.abort("the player left the game")
+                else:
+                    self.away_since.pop(room.id, None)
             elif (
                 room.status in ("finished", "aborted")
                 and room.ended is not None
@@ -370,12 +424,12 @@ class GameServer:
             # static/ opened from a file works the same.
             return _file_response(path[1:])
         if path == "/api/rooms":
-            return _json_response([r.describe() for r in self.rooms.values()])
+            return _json_response([self.describe_room(r) for r in self.rooms.values()])
         if path.startswith("/api/rooms/"):
             room = self.rooms.get(path[len("/api/rooms/") :])
             if room is None:
                 return _json_response({"error": "no such room"}, HTTPStatus.NOT_FOUND)
-            return _json_response(room.describe())
+            return _json_response(self.describe_room(room))
         if path == "/api/players":
             return _json_response(_players())
         if path == "/api/server":
@@ -384,6 +438,7 @@ class GameServer:
                     "server_key": self.key.public_hex,
                     "protocol_version": PROTOCOL_VERSION,
                     "app_sha256": self.app_sha256,
+                    "house": self.house,
                 }
             )
         return _json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -430,11 +485,12 @@ class GameServer:
         self.by_ip[address] += 1
         if room is not None:
             self.by_room[room.id] += 1
+        house = self.is_house(websocket)
         try:
             if room is None:
-                await self._lobby(websocket, address)
+                await self._lobby(websocket, address, house)
             else:
-                await self._room(websocket, room, address)
+                await self._room(websocket, room, address, house)
         finally:
             self.connections -= 1
             self.by_ip[address] -= 1
@@ -445,23 +501,30 @@ class GameServer:
                 if not self.by_room[room.id]:
                     del self.by_room[room.id]
 
-    async def _lobby(self, websocket: ServerConnection, address: str) -> None:
+    async def _lobby(
+        self, websocket: ServerConnection, address: str, house: bool = False
+    ) -> None:
         async for text in websocket:
             try:
                 request = parse_request(text)
                 kind = request.get("type")
                 if kind == "create_room":
+                    if self.house and not house:
+                        raise TooMuch(
+                            "games here are opened by the house: pick an open table"
+                        )
                     room = self.create_room(
                         request.get("config"),
                         request.get("seats"),
                         str(request.get("name") or ""),
-                        address=address,
+                        # The house's own rooms count against no address.
+                        address=None if house else address,
                     )
                     reply = {"type": "room_created", "room": room.describe()}
                 elif kind == "list_rooms":
                     reply = {
                         "type": "rooms",
-                        "rooms": [r.describe() for r in self.rooms.values()],
+                        "rooms": [self.describe_room(r) for r in self.rooms.values()],
                     }
                 elif kind == "players":
                     reply = {"type": "players", "players": _players()}
@@ -474,7 +537,11 @@ class GameServer:
             await websocket.send(json.dumps(reply))
 
     async def _room(
-        self, websocket: ServerConnection, room: Room, address: str
+        self,
+        websocket: ServerConnection,
+        room: Room,
+        address: str,
+        house: bool = False,
     ) -> None:
         peer = Peer(websocket, room.limits.max_queue, address)
         outbox: Outbox = room.connect(peer)
@@ -501,7 +568,14 @@ class GameServer:
                     kind = request.get("type")
                     if kind in ("join", "rejoin") and seat is None and not watching:
                         if kind == "join":
+                            if self.house and not house and self.guests(room):
+                                raise RoomError(
+                                    "room_full",
+                                    "this table already has its player; pick another",
+                                )
                             seat = room.join(outbox, peer, request)
+                            if house:
+                                self.house_keys[room.id].add(seat.public_key)
                         else:
                             seat = room.rejoin(outbox, peer, request)
                         assert seat.outbox is not None
@@ -514,6 +588,10 @@ class GameServer:
                     elif kind == "action" and seat is not None:
                         room.on_action(seat, peer, request)
                     elif kind == "seat_bot":
+                        if self.house and not house:
+                            raise RoomError(
+                                "bad_bot", "only the house seats bots here"
+                            )
                         try:
                             self.admit_bots(peer.address, 1)
                         except TooMuch as error:
@@ -650,8 +728,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "from its X-Forwarded-For (otherwise every per-address limit and ban "
         "applies to the proxy, so to everyone behind it)",
     )
+    parser.add_argument(
+        "--house-token-file",
+        metavar="FILE",
+        help="house mode: only connections showing this file's token (the "
+        "X-Catanatron-House header) create rooms or seat bots, and every room "
+        "takes at most one other seat (see the module doc)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
+    house_token = None
+    if args.house_token_file:
+        with open(args.house_token_file) as file:
+            house_token = file.read().strip()
+        if len(house_token) < 16:
+            parser.error("the house token must be at least 16 characters")
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -661,6 +752,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         SigningKey.load_or_create(args.key),
         archive_dir=args.archive,
         trusted_proxies=args.trusted_proxy,
+        house_token=house_token,
     )
     for declaration in args.bot:
         name, _, source = declaration.rpartition("=")
@@ -671,7 +763,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             f"catanatron-server on http://{args.host}:{args.port}/\n"
             f"  server key {server.key.public_hex}\n"
-            f"  app.js sha256 {server.app_sha256}",
+            f"  app.js sha256 {server.app_sha256}"
+            + ("\n  house mode" if server.house else ""),
             file=sys.stderr,
         )
         stop = asyncio.get_running_loop().create_future()
