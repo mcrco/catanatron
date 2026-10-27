@@ -15,6 +15,7 @@ from typing import Any, Optional, Sequence
 
 from catanatron.game import TURNS_LIMIT, Game
 from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY, Supply
+from catanatron.models.dice import DICE_MODES
 from catanatron.models.enums import Action, ActionPrompt, ActionType
 from catanatron.models.map import CatanMap, Layout, build_map, layout_graph
 from catanatron.models.player import Color, Player
@@ -25,6 +26,12 @@ from catanatron.state_functions import player_has_rolled, player_num_dev_cards
 MAP_TYPES = ("BASE", "MINI", "TOURNAMENT")
 NUMBER_PLACEMENTS = ("official_spiral", "random")
 SUPPLIES = {"base": BASE_SUPPLY, "extension": EXTENSION_SUPPLY}
+#: A config's ``robber_mode``: Catanatron's own friendly robber is
+#: ``friendly_robber`` instead (see state.ROBBER_MODES).
+ROBBER_MODES = ("normal", "friendly_public")
+#: Keys :meth:`GameConfig.to_json` leaves out at their defaults, so a config
+#: written before they existed is still in its canonical form.
+OPTIONAL_DEFAULTS = {"robber_mode": "normal", "dice_mode": "random"}
 
 
 class ConfigError(ValueError):
@@ -43,7 +50,15 @@ class GameConfig:
     number_placement: str = "official_spiral"
     vps_to_win: int = 10
     discard_limit: int = 7
+    #: Catanatron's own friendly robber (seats under 3 actual points, hidden
+    #: victory point cards included, are spared).
     friendly_robber: bool = False
+    #: ``normal``, or ``friendly_public``: OpenHex's friendly robber, on public
+    #: points only (see catanatron.models.actions.robber_possibilities).
+    robber_mode: str = "normal"
+    #: ``random`` (two fair dice) or ``balanced`` (OpenHex's balanced dice,
+    #: see catanatron.models.dice).
+    dice_mode: str = "random"
     #: "base" or "extension" (the 5-6 player bank and deck); None picks by
     #: the number of players.
     supply: Optional[str] = None
@@ -85,7 +100,7 @@ class GameConfig:
     def validate(self) -> None:
         if _int(self.num_players) not in range(2, 7):
             raise ConfigError("num_players must be 2 to 6")
-        for name in ("map_type", "number_placement", "supply"):
+        for name in ("map_type", "number_placement", "supply", "robber_mode", "dice_mode"):
             if not isinstance(getattr(self, name), str):
                 raise ConfigError(f"{name} must be a string")
         if self.map_type not in MAP_TYPES:
@@ -98,11 +113,19 @@ class GameConfig:
             raise ConfigError("discard_limit must be 3 to 100")
         if self.supply not in SUPPLIES:
             raise ConfigError(f"supply must be one of {sorted(SUPPLIES)}")
+        if self.robber_mode not in ROBBER_MODES:
+            raise ConfigError(f"robber_mode must be one of {ROBBER_MODES}")
+        if self.dice_mode not in DICE_MODES:
+            raise ConfigError(f"dice_mode must be one of {DICE_MODES}")
         if _int(self.decision_timeout_ms) not in range(100, 24 * 3600 * 1000 + 1):
             raise ConfigError("decision_timeout_ms must be 100 ms to a day")
         for name in ("friendly_robber", "autoplay_forced"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} must be true or false")
+        if self.friendly_robber and self.robber_mode != "normal":
+            raise ConfigError(
+                "friendly_robber and robber_mode are two different robbers: pick one"
+            )
         try:
             catan_map = self.build_map(random.Random(0))
         except MapError as error:
@@ -116,7 +139,16 @@ class GameConfig:
             )
 
     def to_json(self) -> dict:
-        return asdict(self)
+        out = asdict(self)
+        for key, default in OPTIONAL_DEFAULTS.items():
+            if out[key] == default:
+                del out[key]
+        return out
+
+    @property
+    def game_robber_mode(self) -> str:
+        """The game's robber (state.ROBBER_MODES)."""
+        return "friendly" if self.friendly_robber else self.robber_mode
 
     @property
     def colors(self) -> list:
@@ -208,6 +240,8 @@ def new_game(
         vps_to_win=config.vps_to_win,
         catan_map=catan_map,
         supply=config.game_supply,
+        robber_mode=config.game_robber_mode,
+        dice_mode=config.dice_mode,
     )
     game.id = game_id
     return game
@@ -236,16 +270,17 @@ def publicly_forced(game: Game) -> bool:
     whose being forced depends on hidden cards (a roll from someone holding
     only victory point cards, a discard from a one-resource hand) would tell
     the table what is in that hand. Holds for the initial placements, robber
-    moves without the friendly robber (victims are chosen by public card
-    counts), free roads, and the roll of a seat that holds no development
-    card.
+    moves (victims are chosen by public card counts) unless Catanatron's own
+    friendly robber counts hidden victory point cards (``friendly_public``
+    counts public points only), free roads, and the roll of a seat that holds
+    no development card.
     """
     if len(game.playable_actions) != 1:
         return False
     state = game.state
     prompt = state.current_prompt
     if prompt in PUBLIC_PROMPTS:
-        return prompt != ActionPrompt.MOVE_ROBBER or not state.friendly_robber
+        return prompt != ActionPrompt.MOVE_ROBBER or state.robber_mode != "friendly"
     if prompt != ActionPrompt.PLAY_TURN:
         return False
     if state.is_road_building:

@@ -43,8 +43,9 @@ from catanatron.models.map import (
     get_nodes_and_edges,
 )
 from catanatron.models.coordinate_system import Direction
+from catanatron.models.dice import DICE_MODES, BalancedDice
 from catanatron.models.player import Color
-from catanatron.state import PLAYER_INITIAL_STATE, State
+from catanatron.state import PLAYER_INITIAL_STATE, State, resolve_robber_mode
 from catanatron.state_functions import get_longest_road_length
 
 #: Bumped whenever the document shape changes incompatibly.
@@ -249,8 +250,11 @@ def action_from_json(payload) -> Action:
 
 # ===== state =====
 def state_to_json(game: Game):
+    """The document. The robber and dice modes, and their state, appear only
+    in games that use them, so every other game's document (and so every
+    commitment a server made to one) is what it always was."""
     s = game.state
-    return {
+    doc = {
         "schema_version": SCHEMA_VERSION,
         "game": {
             "id": game.id,
@@ -258,6 +262,7 @@ def state_to_json(game: Game):
             "vps_to_win": game.vps_to_win,
             "discard_limit": s.discard_limit,
             "friendly_robber": s.friendly_robber,
+            **_rule_modes(s),
         },
         "map": map_to_json(s.board.map),
         "board": board_to_json(s.board),
@@ -285,6 +290,24 @@ def state_to_json(game: Game):
         "current_trade": list(s.current_trade),
         "acceptees": list(s.acceptees),
     }
+    if s.robber_mode == "friendly_public":
+        taken = s.largest_army_taken_from
+        doc["largest_army_taken_from"] = None if taken is None else taken.value
+    if s.balanced_dice is not None:
+        # Public: every roll is, and the deck has no order (models.dice).
+        doc["balanced_dice"] = s.balanced_dice.to_json([c.value for c in s.colors])
+    return doc
+
+
+def _rule_modes(s) -> dict:
+    """The modes ``friendly_robber`` does not already say (it means
+    ``friendly`` when true, ``normal`` when false)."""
+    out = {}
+    if s.robber_mode == "friendly_public":
+        out["robber_mode"] = s.robber_mode
+    if s.dice_mode != "random":
+        out["dice_mode"] = s.dice_mode
+    return out
 
 
 def _restore_rng(payload):
@@ -324,7 +347,20 @@ def state_from_json(doc, players) -> Game:
         )
     s.players = [by_color[c] for c in s.colors]  # seating order preserved
     s.discard_limit = doc["game"]["discard_limit"]
-    s.friendly_robber = doc["game"]["friendly_robber"]
+    s.robber_mode = resolve_robber_mode(
+        doc["game"]["friendly_robber"], doc["game"].get("robber_mode")
+    )
+    s.friendly_robber = s.robber_mode != "normal"
+    s.dice_mode = doc["game"].get("dice_mode", "random")
+    if s.dice_mode not in DICE_MODES:
+        raise ValueError(f"unknown dice_mode {s.dice_mode!r}")
+    s.balanced_dice = (
+        BalancedDice.from_json(doc["balanced_dice"], doc["colors"])
+        if s.dice_mode == "balanced"
+        else None
+    )
+    taken = doc.get("largest_army_taken_from")
+    s.largest_army_taken_from = None if taken is None else Color[taken]
     s.board = board_from_json(doc["board"], catan_map)
     s.player_state = dict(doc["player_state"])
     s.resource_freqdeck = list(doc["resource_freqdeck"])

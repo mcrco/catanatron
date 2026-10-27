@@ -67,6 +67,8 @@ def new_game(settings: GameSettings, players: Sequence[Player], seed: int) -> Ga
         vps_to_win=settings.vps_to_win,
         catan_map=settings.build_map(random.Random(seed)),
         supply=settings.game_supply,
+        robber_mode=settings.game_robber_mode,
+        dice_mode=settings.dice_mode,
     )
 
 

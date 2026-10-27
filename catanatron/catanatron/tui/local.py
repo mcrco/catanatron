@@ -816,7 +816,13 @@ class LocalSession(Session):
             num_players=len(self.colors),
             vps_to_win=self.game.vps_to_win,
             discard_limit=self.game.state.discard_limit,
-            friendly_robber=self.game.state.friendly_robber,
+            friendly_robber=self.game.state.robber_mode == "friendly",
+            robber_mode=(
+                "friendly_public"
+                if self.game.state.robber_mode == "friendly_public"
+                else "normal"
+            ),
+            dice_mode=self.game.state.dice_mode,
         )
         seats = [self.specs[c] for c in sorted(self.colors, key=list(Color).index)]
         other = LocalSession.new(

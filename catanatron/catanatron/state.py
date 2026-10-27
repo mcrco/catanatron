@@ -11,7 +11,28 @@ from catanatron.models.enums import (
     ActionRecord,
 )
 from catanatron.models.decks import BASE_SUPPLY, Supply
+from catanatron.models.dice import DICE_MODES, BalancedDice
 from catanatron.models.player import Color, Player
+
+#: How the robber may be placed. ``normal``: anywhere but where it is.
+#: ``friendly`` (``friendly_robber=True``): not on a tile with an opponent
+#: under 3 actual victory points, hidden victory point cards included, so
+#: whether a move is legal can depend on (and reveal) hidden cards.
+#: ``friendly_public``: OpenHex's friendly robber, on public points only (see
+#: ``catanatron.models.actions.robber_possibilities``), which reveals nothing.
+ROBBER_MODES = ("normal", "friendly", "friendly_public")
+
+
+def resolve_robber_mode(friendly_robber=False, robber_mode=None) -> str:
+    """The robber mode of a game built with these arguments: ``robber_mode``,
+    or ``friendly`` / ``normal`` from the older ``friendly_robber`` flag."""
+    if robber_mode is None:
+        return "friendly" if friendly_robber else "normal"
+    if robber_mode not in ROBBER_MODES:
+        raise ValueError(f"robber_mode must be one of {ROBBER_MODES}, not {robber_mode!r}")
+    if friendly_robber and robber_mode == "normal":
+        raise ValueError("friendly_robber=True contradicts robber_mode='normal'")
+    return robber_mode
 
 # These will be prefixed by P0_, P1_, ...
 # Create Player State blueprint
@@ -79,6 +100,16 @@ class State:
             Building dev card.
         free_roads_available (int): Number of roads available left in Road Building
             phase.
+        robber_mode (str): One of ROBBER_MODES. ``friendly_robber`` is True for
+            either friendly mode.
+        dice_mode (str): One of DICE_MODES: ``random`` (two fair dice) or
+            ``balanced`` (OpenHex's, see catanatron.models.dice).
+        balanced_dice (BalancedDice): The balanced dice's state (None under
+            random dice).
+        largest_army_taken_from (Color): Under ``friendly_public``, at the
+            robber prompt of a knight that took Largest Army: the seat it took
+            it from, which keeps its 2 points for that robber move (OpenHex
+            places a knight's robber before it awards). None otherwise.
     """
 
     def __init__(
@@ -91,6 +122,8 @@ class State:
         initialize=True,
         rng=None,
         supply: Supply = BASE_SUPPLY,
+        robber_mode=None,
+        dice_mode="random",
     ):
         if initialize:
             self.random = rng if rng is not None else random.Random()
@@ -103,7 +136,11 @@ class State:
                 )
             )
             self.discard_limit = discard_limit
-            self.friendly_robber = friendly_robber
+            self.robber_mode = resolve_robber_mode(friendly_robber, robber_mode)
+            self.friendly_robber = self.robber_mode != "normal"
+            if dice_mode not in DICE_MODES:
+                raise ValueError(f"dice_mode must be one of {DICE_MODES}, not {dice_mode!r}")
+            self.dice_mode = dice_mode
 
             # feature-ready dictionary
             self.player_state = dict()
@@ -150,6 +187,13 @@ class State:
             self.current_trade: Tuple = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             self.acceptees = tuple(False for _ in self.colors)
 
+            # A full deck and no history; nothing drawn from self.random, so
+            # games under random dice roll as they always have.
+            self.balanced_dice = (
+                BalancedDice.fresh(len(self.colors)) if dice_mode == "balanced" else None
+            )
+            self.largest_army_taken_from = None
+
     def current_player(self):
         """Helper for accessing Player instance who should decide next"""
         return self.players[self.current_player_index]
@@ -171,6 +215,8 @@ class State:
         state_copy.players = self.players
         state_copy.discard_limit = self.discard_limit  # immutable
         state_copy.friendly_robber = self.friendly_robber  # immutable
+        state_copy.robber_mode = self.robber_mode  # immutable
+        state_copy.dice_mode = self.dice_mode  # immutable
 
         state_copy.board = self.board.copy()
 
@@ -209,5 +255,10 @@ class State:
         state_copy.is_resolving_trade = self.is_resolving_trade
         state_copy.current_trade = self.current_trade
         state_copy.acceptees = self.acceptees
+
+        state_copy.balanced_dice = (
+            None if self.balanced_dice is None else self.balanced_dice.copy()
+        )
+        state_copy.largest_army_taken_from = self.largest_army_taken_from
 
         return state_copy

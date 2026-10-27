@@ -80,6 +80,8 @@ class Game:
         number_placement: NumberPlacement = "official_spiral",
         initialize: bool = True,
         supply: Supply = BASE_SUPPLY,
+        robber_mode: Optional[str] = None,
+        dice_mode: str = "random",
     ):
         """Creates a game (doesn't run it).
 
@@ -92,6 +94,10 @@ class Game:
             initialize (bool, optional): Whether to initialize. Defaults to True.
             supply (Supply, optional): Bank, development deck and piece counts.
                 Defaults to the base game's; EXTENSION_SUPPLY is the 5-6 player one.
+            robber_mode (str, optional): One of state.ROBBER_MODES. Defaults to
+                ``friendly`` with friendly_robber, else ``normal``.
+            dice_mode (str, optional): ``random`` (two fair dice) or ``balanced``
+                (OpenHex's, see catanatron.models.dice). Defaults to random.
         """
         #: Everything watching this game: the seated players, plus any
         #: accumulators handed to play(). One list, so each hook is one loop.
@@ -105,7 +111,6 @@ class Game:
 
             self.id = str(uuid.uuid4())
             self.vps_to_win = vps_to_win
-            self.friendly_robber = friendly_robber
             self.state = State(
                 players,
                 catan_map,
@@ -114,7 +119,10 @@ class Game:
                 number_placement=number_placement,
                 rng=self.random,
                 supply=supply,
+                robber_mode=robber_mode,
+                dice_mode=dice_mode,
             )
+            self.friendly_robber = self.state.friendly_robber
             self.playable_actions = generate_playable_actions(self.state)
 
             # Seat the players as observers here rather than in play(), so

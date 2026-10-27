@@ -36,6 +36,7 @@ from catanatron.state_functions import (
     build_road,
     build_settlement,
     buy_dev_card,
+    get_largest_army,
     maintain_longest_road,
     play_dev_card,
     player_can_afford_dev_card,
@@ -191,6 +192,10 @@ def apply_build_road(state: State, action: Action):
         elif num_buildings == 2 * num_players:
             state.is_initial_build_phase = False
             state.current_prompt = ActionPrompt.PLAY_TURN
+            if state.balanced_dice is not None:
+                # OpenHex refills the deck when the main phase starts (only
+                # the deck: the window, the sevens and the streak carry over).
+                state.balanced_dice.refill()
         else:
             advance_turn(state, -1)
             state.current_prompt = ActionPrompt.BUILD_INITIAL_SETTLEMENT
@@ -267,11 +272,20 @@ def apply_buy_development_card(state: State, action: Action, action_record=None)
 
 def apply_roll(state: State, action: Action, action_record=None):
     key = player_key(state, action.color)
+    if action_record is not None:
+        dices = action_record.result
+    elif state.balanced_dice is not None:
+        dices = state.balanced_dice.draw(
+            state.random, state.color_to_index[action.color]
+        )
+    else:
+        dices = roll_dice(state.random)
+    if state.balanced_dice is not None:
+        # A replayed roll updates the deck as if that card had been drawn (and
+        # is refused, changing nothing, if the deck no longer holds it).
+        state.balanced_dice.apply(dices, state.color_to_index[action.color])
     state.player_state[f"{key}_HAS_ROLLED"] = True
 
-    dices = (
-        action_record.result if action_record is not None else roll_dice(state.random)
-    )
     number = dices[0] + dices[1]
     action = Action(action.color, action.action_type, dices)
 
@@ -363,6 +377,7 @@ def apply_move_robber(state: State, action: Action, action_record=None):
         player_deck_draw(state, robbed_color, robbed_resource)
         player_deck_replenish(state, action.color, robbed_resource)
     state.board.robber_coordinate = coordinate
+    state.largest_army_taken_from = None
 
     # state.current_player_index stays the same
     state.current_prompt = ActionPrompt.PLAY_TURN
@@ -374,7 +389,16 @@ def apply_play_knight_card(state: State, action: Action):
     if not player_can_play_dev(state, action.color, "KNIGHT"):
         raise ValueError("Player cant play knight card now")
 
+    holder, _ = get_largest_army(state)
     play_dev_card(state, action.color, "KNIGHT")
+    if (
+        state.robber_mode == "friendly_public"
+        and holder is not None
+        and not state.player_state[f"{player_key(state, holder)}_HAS_ARMY"]
+    ):
+        # Read by the robber's shields: OpenHex places a knight's robber
+        # before it awards Largest Army (models.actions.robber_possibilities).
+        state.largest_army_taken_from = holder
 
     # state.current_player_index stays the same
     state.current_prompt = ActionPrompt.MOVE_ROBBER

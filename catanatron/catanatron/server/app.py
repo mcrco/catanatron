@@ -230,7 +230,8 @@ class GameServer:
         if game_config.friendly_robber:
             raise ConfigError(
                 "friendly_robber is not offered here: whether a robbery is legal "
-                "would depend on (and reveal) hidden victory point cards"
+                "would depend on (and reveal) hidden victory point cards; "
+                'robber_mode "friendly_public" counts public points only'
             )
         if seats is not None and not isinstance(seats, list):
             raise ConfigError("seats must be a list")

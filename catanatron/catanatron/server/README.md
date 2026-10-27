@@ -85,10 +85,36 @@ A room's config (`catanatron.server.config.GameConfig`, all optional):
 | `number_placement` | `official_spiral` | or `random` |
 | `vps_to_win` | 10 | |
 | `discard_limit` | 7 | |
-| `friendly_robber` | false | refused by the server: whether a robbery is legal would depend on (and reveal) hidden victory point cards |
+| `friendly_robber` | false | Catanatron's own friendly robber; refused by the server: whether a robbery is legal would depend on (and reveal) hidden victory point cards |
+| `robber_mode` | `normal` | or `friendly_public`: OpenHex's friendly robber, which counts public points only (see below) |
+| `dice_mode` | `random` | or `balanced`: OpenHex's balanced dice (see below) |
 | `supply` | `base` (`extension` for 5–6) | bank, development deck and pieces |
 | `decision_timeout_ms` | 60000 | after which the server plays the default action for the seat |
 | `autoplay_forced` | true | play a seat's move without asking when everyone can see it has one legal action (see below) |
+
+`robber_mode` and `dice_mode` are left out of a config (and of the
+transcripts' configs) at their defaults, so rooms and transcripts from before
+they existed are unchanged. Together with `num_players: 2`, `vps_to_win: 15`
+and `discard_limit: 9` they are OpenHex's 1v1 rules:
+
+- `robber_mode: friendly_public` (catanatron.models.actions.robber_possibilities):
+  a tile with an opponent of the mover at 2 public points or fewer
+  (settlements, cities, Longest Road, Largest Army; never victory point cards)
+  is off limits, unless every tile but the robber's is, when all are open. A
+  knight's tile is judged on the points before the knight's Largest Army
+  award (OpenHex validates it first), so the seat the knight took the award
+  from keeps its 2 points for that robber move (the document's
+  `largest_army_taken_from`). Victims are not filtered. Since it reads public
+  points only, the legal moves reveal nothing, and a lone robber move is
+  publicly forced.
+- `dice_mode: balanced` (catanatron.models.dice): a 36-card deck of face pairs,
+  refilled to 36 before a roll when 13 or fewer are left (and when the main
+  phase starts); a total weighs its cards left times max(0, 1 - 0.34 x its
+  count among the last 5 totals), the 7 further times
+  clamp(imbalance + 0.4 per 7 of the current run, negative for the run's
+  owner, 0, 2). The dice's state is public (the document's `balanced_dice`,
+  in every view), and the game's random stream draws from it, so the verifier
+  replays the rolls from the revealed seeds as it does fair ones.
 
 An explicit map lists every tile, in the order that numbers the nodes (the order
 `CatanMap.from_tiles` walks):

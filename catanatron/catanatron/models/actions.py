@@ -32,6 +32,7 @@ from catanatron.models.enums import (
 from catanatron.state import State
 from catanatron.state_functions import (
     get_actual_victory_points,
+    get_visible_victory_points,
     get_player_buildings,
     get_player_freqdeck,
     player_can_afford_dev_card,
@@ -210,13 +211,32 @@ def city_possibilities(state, color) -> List[Action]:
 
 
 def robber_possibilities(state, color) -> List[Action]:
+    """Where ``color`` may move the robber (state.ROBBER_MODES).
+
+    Under a friendly robber some tiles are shielded, and are off limits
+    unless every tile but the robber's is shielded (then all are open). Under
+    ``friendly``, a tile with an opponent under 3 actual victory points
+    (hidden victory point cards count) is shielded. Under ``friendly_public``
+    (OpenHex's, and cppanatron's friendly robber), a tile with an opponent of
+    at most 2 public points (settlements, cities, Longest Road, Largest Army;
+    never victory point cards) is, so the legal moves reveal nothing; a
+    knight's tile is judged on the points before the knight's Largest Army
+    award (OpenHex validates the knight's tile, then awards), so a seat the
+    knight took the award from keeps its 2 points for that robber move. The
+    victims are not filtered.
+    """
     actions = _robber_possibilities_without_friendly_robber(state, color)
-    if not state.friendly_robber:
+    if state.robber_mode == "normal":
         return actions
+    shielded = (
+        _robber_action_shields_public_points
+        if state.robber_mode == "friendly_public"
+        else _robber_action_blocks_low_vp_enemy
+    )
 
     filtered_actions = list(
         filter(
-            lambda action: not _robber_action_blocks_low_vp_enemy(state, color, action),
+            lambda action: not shielded(state, color, action),
             actions,
         )
     )
@@ -267,6 +287,27 @@ def _robber_action_blocks_low_vp_enemy(state, color, action) -> bool:
             continue
 
         if get_actual_victory_points(state, candidate_color) < 3:
+            return True
+
+    return False
+
+
+def _robber_action_shields_public_points(state, color, action) -> bool:
+    coordinate, _ = action.value
+    tile = state.board.map.land_tiles[coordinate]
+    for node_id in tile.nodes.values():
+        building = state.board.buildings.get(node_id, None)
+        if building is None:
+            continue
+
+        candidate_color = building[0]
+        if color == candidate_color:
+            continue
+
+        points = get_visible_victory_points(state, candidate_color)
+        if candidate_color == state.largest_army_taken_from:
+            points += 2  # still on the points before the knight's award
+        if points <= 2:
             return True
 
     return False
