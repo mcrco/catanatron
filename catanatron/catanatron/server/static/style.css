@@ -164,7 +164,7 @@ details > summary { cursor: pointer; }
 #intro {
   display: flex;
   justify-content: space-between;
-  align-items: flex-end;
+  align-items: center;
   gap: 1.5rem;
   padding-top: 4.5rem !important;
 }
@@ -183,7 +183,7 @@ details > summary { cursor: pointer; }
 #ascii-board {
   margin: 0;
   font: inherit;
-  font-size: 0.66rem;
+  font-size: 0.78rem;
   line-height: 1.12;
   color: var(--faint);
   cursor: pointer;
@@ -471,10 +471,11 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
   #lobby section { padding-top: 2.25rem; }
   #intro { flex-direction: column; align-items: flex-start; padding-top: 2.5rem !important; gap: 1.5rem; }
   #intro h1 { font-size: 1.85rem; }
+  #ascii-board { font-size: 0.75rem; }
   .entry-header { flex-direction: column; gap: 0; }
   footer details { text-align: left; }
 }
-/* the board is 53 characters (about 370px) wide: only beside the title, never squeezed */
-@media (max-width: 680px) {
-  #ascii-board { display: none; }
+/* the board is 47 characters wide; whole-pixel glyph widths need a smaller step on narrow phones */
+@media (max-width: 370px) {
+  #ascii-board { font-size: 0.625rem; }
 }

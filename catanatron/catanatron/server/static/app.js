@@ -1800,7 +1800,7 @@ function renderModal() {
 // underscores on top and ASCII_SIDE rows per slanted side, in columns of
 // 3-4-5-4-3 (no 6 or 8 side by side). Click it to deal another. The inner
 // width is odd, so odd-length names and one-digit numbers sit centred.
-const ASCII_TOP = 7, ASCII_SIDE = 3;
+const ASCII_TOP = 7, ASCII_SIDE = 2;
 const ASCII_COLUMNS = [3, 4, 5, 4, 3];
 function dealAsciiBoard() {
   const step = ASCII_TOP + ASCII_SIDE, tall = 2 * ASCII_SIDE;
