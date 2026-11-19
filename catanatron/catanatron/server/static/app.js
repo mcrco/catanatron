@@ -1796,16 +1796,19 @@ function renderModal() {
 }
 
 // ===== the lobby's ascii board =====
-// A random base board drawn in text, flat-top hexes in columns of 3-4-5-4-3
-// (no 6 or 8 side by side). Click it to deal another.
-const ASCII_HEX = ["  ____  ", " /    \\ ", "/      \\", "\\      /", " \\____/ "];
+// A random base board drawn in text: flat-top hexes with ASCII_TOP
+// underscores on top and ASCII_SIDE rows per slanted side, in columns of
+// 3-4-5-4-3 (no 6 or 8 side by side). Click it to deal another. The inner
+// width is odd, so odd-length names and one-digit numbers sit centred.
+const ASCII_TOP = 7, ASCII_SIDE = 2;
 const ASCII_COLUMNS = [3, 4, 5, 4, 3];
 function dealAsciiBoard() {
+  const step = ASCII_TOP + ASCII_SIDE, tall = 2 * ASCII_SIDE;
   const cells = [];
   ASCII_COLUMNS.forEach((count, c) => {
-    for (let k = 0; k < count; k++) cells.push({ x: 6 * c, y: 2 * (5 - count) + 4 * k });
+    for (let k = 0; k < count; k++) cells.push({ x: step * c, y: ASCII_SIDE * (5 - count) + tall * k });
   });
-  const near = (a, b) => (a.x === b.x && Math.abs(a.y - b.y) === 4) || (Math.abs(a.x - b.x) === 6 && Math.abs(a.y - b.y) === 2);
+  const near = (a, b) => (a.x === b.x && Math.abs(a.y - b.y) === tall) || (Math.abs(a.x - b.x) === step && Math.abs(a.y - b.y) === ASCII_SIDE);
   const shuffle = (list) => {
     for (let i = list.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1825,28 +1828,33 @@ function dealAsciiBoard() {
   return cells;
 }
 function renderAsciiBoard() {
-  const width = 32, height = 21;
-  const grid = Array.from({ length: height }, () => Array.from({ length: width }, () => [" ", ""]));
-  const put = (x, y, text, cls) => { for (let i = 0; i < text.length; i++) grid[y][x + i] = [text[i], cls]; };
-  const centre = (text) => text.padStart(Math.floor((6 + text.length) / 2)).padEnd(6);
-  for (const cell of dealAsciiBoard()) {
-    ASCII_HEX.forEach((row, dy) => {
-      for (let dx = 0; dx < row.length; dx++) if (row[dx] !== " ") grid[cell.y + dy][cell.x + dx] = [row[dx], "edge"];
-    });
-    put(cell.x + 1, cell.y + 2, centre(cell.resource), "r-" + cell.resource);
-    const hot = cell.number === 6 || cell.number === 8;
-    put(cell.x + 1, cell.y + 3, centre(cell.number ? String(cell.number) : ""), hot ? "num hot" : "num");
+  const T = ASCII_TOP, H = ASCII_SIDE, hexWidth = 2 * H + T, inner = hexWidth - 2;
+  const width = 4 * (H + T) + hexWidth, height = 10 * H + 1;
+  const grid = Array.from({ length: height }, () => Array.from({ length: width }, () => [" ", null]));
+  const put = (x, y, ch, cls) => { grid[y][x] = [ch, cls]; };
+  const write = (x, y, text, cls) => {
+    const padded = text.padStart(Math.floor((inner + text.length) / 2)).padEnd(inner);
+    for (let i = 0; i < inner; i++) if (padded[i] !== " ") put(x + i, y, padded[i], cls);
+  };
+  for (const { x, y, resource, number } of dealAsciiBoard()) {
+    for (let i = 0; i < T; i++) { put(x + H + i, y, "_", "edge"); put(x + H + i, y + 2 * H, "_", "edge"); }
+    for (let i = 1; i <= H; i++) {
+      put(x + H - i, y + i, "/", "edge"); put(x + H + T - 1 + i, y + i, "\\", "edge");
+      put(x + i - 1, y + H + i, "\\", "edge"); put(x + hexWidth - i, y + H + i, "/", "edge");
+    }
+    write(x + 1, y + H, resource, "r-" + resource);
+    if (number) write(x + 1, y + H + 1, String(number), number === 6 || number === 8 ? "num hot" : "num");
   }
   const lines = grid.map((row) => {
     let out = "", cls = null, run = "";
     const flush = () => { if (run) out += cls ? `<span class="${cls}">${escapeHtml(run)}</span>` : escapeHtml(run); run = ""; };
     for (const [ch, c] of row) {
-      const k = ch === " " ? null : c;
-      if (k !== cls && ch !== " ") { flush(); cls = k; }
+      const k = ch === " " ? cls : c;
+      if (k !== cls) { flush(); cls = k; }
       run += ch;
     }
     flush();
-    return out.replace(/\s+$/, "");
+    return out;
   });
   $("#ascii-board").innerHTML = lines.join("\n");
 }

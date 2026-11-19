@@ -165,7 +165,7 @@ details > summary { cursor: pointer; }
   display: flex;
   justify-content: space-between;
   align-items: flex-end;
-  gap: 2rem;
+  gap: 1.5rem;
   padding-top: 4.5rem !important;
 }
 #intro h1 {
@@ -177,13 +177,14 @@ details > summary { cursor: pointer; }
   margin-bottom: 0.6rem;
 }
 #intro p { margin: 0 0 0.9rem; }
+.nowrap { white-space: nowrap; }
 .name-field { display: inline-flex; align-items: baseline; gap: 0.75em; color: var(--muted); }
 .name-field input { width: 14ch; color: var(--text); }
 #ascii-board {
   margin: 0;
   font: inherit;
-  font-size: 0.75rem;
-  line-height: 1.05;
+  font-size: 0.78rem;
+  line-height: 1.12;
   color: var(--faint);
   cursor: pointer;
   user-select: none;
@@ -470,7 +471,11 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
   #lobby section { padding-top: 2.25rem; }
   #intro { flex-direction: column; align-items: flex-start; padding-top: 2.5rem !important; gap: 1.5rem; }
   #intro h1 { font-size: 1.85rem; }
-  #ascii-board { align-self: center; font-size: 0.7rem; }
+  #ascii-board { align-self: center; font-size: 0.75rem; }
   .entry-header { flex-direction: column; gap: 0; }
   footer details { text-align: left; }
+}
+/* the board is 47 characters wide; whole-pixel glyph widths need a smaller step on narrow phones */
+@media (max-width: 370px) {
+  #ascii-board { font-size: 0.625rem; }
 }
