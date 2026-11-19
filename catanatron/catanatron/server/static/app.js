@@ -215,6 +215,7 @@ async function showLobby() {
   compactSeats();
   $("#room").hidden = true;
   $("#lobby").hidden = false;
+  $("#topbar").hidden = true;
   $("#room-title").textContent = "";
   closeModal();
   if (session) session.close();
@@ -223,7 +224,9 @@ async function showLobby() {
   const house = Boolean(serverInfo.house);
   $("#create-panel").hidden = house;
   $("#rooms-panel").hidden = house;
-  $("#tables").hidden = !house;
+  $("#tables-panel").hidden = !house;
+  $("#lobby-crypto").hidden = !cryptoProblem;
+  $("#lobby-crypto").textContent = cryptoProblem || "";
   $("#lobby-notice").hidden = !lobbyNotice;
   $("#lobby-notice").textContent = lobbyNotice;
   lobbyNotice = "";
@@ -262,7 +265,8 @@ async function refreshRooms() {
     const seats = room.seats.map((s) => (s.kind === "open" ? "open" : `${s.name} (${s.kind})`)).join(", ");
     setHtml(row, html`<td>${room.name}</td><td>${room.status}</td><td>${room.config.num_players}</td><td>${seats}</td><td></td>`);
     const open = document.createElement("button");
-    open.textContent = room.status === "waiting" ? "Open" : "Watch";
+    open.textContent = room.status === "waiting" ? "open" : "watch";
+    open.className = "link";
     open.onclick = () => { location.hash = "room=" + room.id; };
     row.lastChild.append(open);
     body.append(row);
@@ -306,29 +310,29 @@ function renderTables(rooms) {
   box.innerHTML = "";
   const kinds = tableKinds(rooms);
   for (const kind of kinds) {
-    const card = document.createElement("div");
-    card.className = "table-card";
+    const entry = document.createElement("div");
+    entry.className = "entry";
     const n = Number(kind.config.num_players) || 0;
     const bots = kind.bots.join(", ");
-    const status = kind.open ? html`<span class="status open">open</span>`
-      : html`<span class="status">busy${kind.playing ? html` · ${kind.playing} playing` : html``}</span>`;
-    setHtml(card, html`<h3>${kind.name}</h3><div class="meta">${rulesText(kind.config)}</div>
-      <div class="bots">vs ${n - 1 > 1 ? html`${n - 1} × ` : html``}${bots}</div><div class="foot">${status}</div>`);
-    const play = button("Play", () => playTable(kind.name), "primary big");
+    const status = kind.open ? html`<span class="open">open</span>`
+      : html`busy${kind.playing ? html` · ${kind.playing} playing` : html``}`;
+    setHtml(entry, html`<div class="entry-header"><h3>${kind.name}</h3><span class="entry-meta">${status}<span class="sep">·</span></span></div>
+      <p class="muted">${rulesText(kind.config)} · vs ${n - 1 > 1 ? html`${n - 1} × ` : html``}${bots}</p>`);
+    const play = button("play", () => playTable(kind.name), "link");
     play.disabled = !kind.open;
-    card.querySelector(".foot").append(play);
-    box.append(card);
+    entry.querySelector(".entry-meta").append(play);
+    box.append(entry);
   }
-  if (!kinds.length) box.innerHTML = '<div class="panel muted">No tables open yet.</div>';
+  if (!kinds.length) box.innerHTML = '<p class="muted">no tables yet</p>';
 }
 function renderLive(rooms) {
   const list = $("#live");
   list.innerHTML = "";
   for (const room of rooms.filter((r) => r.status === "playing").reverse()) {
     const item = document.createElement("li");
-    const seats = room.seats.map((s) => html`<span class="swatch" style="background:${swatch(s.color)}"></span>${s.name || s.color} `);
-    setHtml(item, html`<b>${room.name}</b><span class="grow">${seats}</span>`);
-    item.append(button("Watch", () => { location.hash = "room=" + room.id; }));
+    const seats = room.seats.map((s) => html`<span class="seat"><span class="swatch" style="background:${swatch(s.color)}"></span>${s.name || s.color.toLowerCase()}</span>`);
+    setHtml(item, html`<span class="room-name">${room.name}</span><span class="grow">${seats}</span>`);
+    item.append(button("watch", () => { location.hash = "room=" + room.id; }, "link"));
     list.append(item);
   }
   if (!list.children.length) list.innerHTML = '<li class="muted">none</li>';
@@ -1099,6 +1103,7 @@ const ui = {
 async function openRoom(roomId) {
   $("#lobby").hidden = true;
   $("#room").hidden = false;
+  $("#topbar").hidden = false;
   closeModal();
   Object.assign(ui, { build: null, sitTried: false, seenEnd: false, houseSeats: [], houseRoom: null });
   if (session) session.close();
@@ -1790,6 +1795,62 @@ function renderModal() {
   inner.append(foot);
 }
 
+// ===== the lobby's ascii board =====
+// A random base board drawn in text, flat-top hexes in columns of 3-4-5-4-3
+// (no 6 or 8 side by side). Click it to deal another.
+const ASCII_HEX = ["  ____  ", " /    \\ ", "/      \\", "\\      /", " \\____/ "];
+const ASCII_COLUMNS = [3, 4, 5, 4, 3];
+function dealAsciiBoard() {
+  const cells = [];
+  ASCII_COLUMNS.forEach((count, c) => {
+    for (let k = 0; k < count; k++) cells.push({ x: 6 * c, y: 2 * (5 - count) + 4 * k });
+  });
+  const near = (a, b) => (a.x === b.x && Math.abs(a.y - b.y) === 4) || (Math.abs(a.x - b.x) === 6 && Math.abs(a.y - b.y) === 2);
+  const shuffle = (list) => {
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    return list;
+  };
+  const tiles = ["wood", "wood", "wood", "wood", "sheep", "sheep", "sheep", "sheep", "wheat", "wheat", "wheat", "wheat",
+    "brick", "brick", "brick", "ore", "ore", "ore", "desert"];
+  for (let tries = 0; tries < 200; tries++) {
+    shuffle(tiles);
+    const numbers = shuffle([2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]);
+    cells.forEach((cell, i) => { cell.resource = tiles[i]; cell.number = tiles[i] === "desert" ? null : numbers.pop(); });
+    const hot = cells.filter((cell) => cell.number === 6 || cell.number === 8);
+    if (!hot.some((a) => hot.some((b) => a !== b && near(a, b)))) break;
+  }
+  return cells;
+}
+function renderAsciiBoard() {
+  const width = 32, height = 21;
+  const grid = Array.from({ length: height }, () => Array.from({ length: width }, () => [" ", ""]));
+  const put = (x, y, text, cls) => { for (let i = 0; i < text.length; i++) grid[y][x + i] = [text[i], cls]; };
+  const centre = (text) => text.padStart(Math.floor((6 + text.length) / 2)).padEnd(6);
+  for (const cell of dealAsciiBoard()) {
+    ASCII_HEX.forEach((row, dy) => {
+      for (let dx = 0; dx < row.length; dx++) if (row[dx] !== " ") grid[cell.y + dy][cell.x + dx] = [row[dx], "edge"];
+    });
+    put(cell.x + 1, cell.y + 2, centre(cell.resource), "r-" + cell.resource);
+    const hot = cell.number === 6 || cell.number === 8;
+    put(cell.x + 1, cell.y + 3, centre(cell.number ? String(cell.number) : ""), hot ? "num hot" : "num");
+  }
+  const lines = grid.map((row) => {
+    let out = "", cls = null, run = "";
+    const flush = () => { if (run) out += cls ? `<span class="${cls}">${escapeHtml(run)}</span>` : escapeHtml(run); run = ""; };
+    for (const [ch, c] of row) {
+      const k = ch === " " ? null : c;
+      if (k !== cls && ch !== " ") { flush(); cls = k; }
+      run += ch;
+    }
+    flush();
+    return out.replace(/\s+$/, "");
+  });
+  $("#ascii-board").innerHTML = lines.join("\n");
+}
+
 // ===== routing =====
 function route() {
   const params = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -1814,6 +1875,8 @@ window.addEventListener("load", async () => {
   $("#show-finished").onchange = refreshRooms;
   $("#lobby-name").onchange = saveName;
   $("#home").onclick = (event) => { event.preventDefault(); location.hash = ""; };
+  renderAsciiBoard();
+  $("#ascii-board").onclick = renderAsciiBoard;
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && ui.modal) closeModal(); });
   setInterval(() => {
     if (session && session.game && session.pending && !session.answered) {
