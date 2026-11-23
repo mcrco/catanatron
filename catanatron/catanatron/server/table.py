@@ -31,6 +31,8 @@ class Table:
         self.current_color: Optional[str] = None
         self.winning_color: Optional[str] = None
         self.over = False
+        #: The last message was a decide saying the seat may offer a trade.
+        self.offer_trade = False
 
     def update(self, body: dict) -> None:
         """Take in a game message (others are ignored)."""
@@ -54,12 +56,18 @@ class Table:
         self.current_color = body["current_color"]
         self.winning_color = body["winning_color"]
         self.over = kind == "after"
+        self.offer_trade = kind == "decide" and body.get("offer_trade") is True
 
     def view(self) -> dict:
-        """The recipient's ``client_view``/``public_view`` of the game now."""
+        """The recipient's ``client_view``/``public_view`` of the game now,
+        plus ``offer_trade: true`` when its decide says it may offer a trade
+        (only in rooms with trades: otherwise exactly the view)."""
         if self.state is None:
             raise ValueError("the game has not started")
-        return {**self.state, "map": self.map, "action_records": list(self.log)}
+        view = {**self.state, "map": self.map, "action_records": list(self.log)}
+        if self.offer_trade:
+            view["offer_trade"] = True
+        return view
 
     @property
     def supply(self) -> Supply:

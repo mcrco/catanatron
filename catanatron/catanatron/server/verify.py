@@ -59,6 +59,7 @@ from catanatron.server.config import (
     default_action,
     is_over,
     new_game,
+    offer_action,
     publicly_forced,
 )
 from catanatron.server.hashing import numbers_ok
@@ -1021,6 +1022,7 @@ class _Verifier:
                     state_to_json(game),
                     self.color,
                     timeout_ms=self.config.decision_timeout_ms,
+                    trades=self.config.trades,
                 )
             elif kind == "step":
                 if body.get("index") != done + 1:
@@ -1059,6 +1061,10 @@ class _Verifier:
         asked = _asked(logged)
         playable = list(game.playable_actions)
         matches = [a for a in playable if _same(action_to_json(a), asked)]
+        if not matches:
+            # A trade offer is never listed: the room's rule says which are moves.
+            offer = offer_action(game, self.config.trades, asked)
+            matches = [offer] if offer is not None else []
         if not matches:
             self.fail(
                 f"action {index}: {_short(logged)} is not one of the moves the game offered"
@@ -1157,6 +1163,7 @@ class _Verifier:
                     self.doc,
                     self.color,
                     timeout_ms=self.config.decision_timeout_ms,
+                    trades=self.config.trades,
                 )
             elif kind == "step":
                 if body.get("index") != next_step or target != next_step:
@@ -1218,6 +1225,10 @@ class _Verifier:
             for a, js in zip(self.game.playable_actions, offered)
             if _same(js, entry.get("action"))
         ]
+        if not matches:
+            # A trade offer is never listed: the room's rule says which are moves.
+            offer = offer_action(self.game, self.config.trades, entry.get("action"))
+            matches = [offer] if offer is not None else []
         if not matches:
             self.fail(
                 f"action {index}: {_short(entry.get('action'))} is not one of the moves the game offered"

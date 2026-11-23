@@ -171,9 +171,17 @@ def before_body(
     }
 
 
-def decide_body(game: Game, doc: dict, color: str, *, timeout_ms: int) -> dict:
+def decide_body(
+    game: Game, doc: dict, color: str, *, timeout_ms: int, trades: bool = False
+) -> dict:
+    """A seat's move. In a room with trades, ``offer_trade`` says whether it
+    may also offer one (an OFFER_TRADE is never among ``playable_actions``:
+    see :func:`catanatron.server.config.offer_allowed`); rooms without trades
+    send no such key."""
+    from catanatron.server.config import offer_allowed
+
     state, records = _split(view_for(doc, color))
-    return {
+    body = {
         "type": "decide",
         "game_id": game.id,
         "color": color,
@@ -185,6 +193,9 @@ def decide_body(game: Game, doc: dict, color: str, *, timeout_ms: int) -> dict:
         "timeout_ms": timeout_ms,
         **_status(game),
     }
+    if trades:
+        body["offer_trade"] = offer_allowed(game, True)
+    return body
 
 
 def step_body(

@@ -445,6 +445,14 @@ footer details { text-align: right; }
 #modal .trade-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 #modal .trade-row .give { width: 110px; }
 #modal .foot { display: flex; justify-content: flex-end; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
+#modal h3 { margin: 14px 0 6px; font-size: 0.85rem; font-weight: 500; color: var(--muted); }
+#modal .offer { padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+#modal .offer-grid { display: grid; grid-template-columns: 1fr auto auto; gap: 4px 16px; align-items: center; }
+#modal .stepper { display: inline-flex; align-items: center; gap: 6px; }
+#modal .stepper button { width: 28px; padding: 2px 0; margin: 0; }
+#modal .stepper b { min-width: 1.2em; text-align: center; font-weight: 500; }
+#modal .offer-send { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+#modal .offer-line { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .final { width: 100%; margin: 4px 0 6px; }
 .final td { padding: 6px 4px; }
 .result { text-align: center; font-family: Lora, Georgia, serif; font-size: 1.3rem; font-weight: 500; margin: 0 0 10px; }

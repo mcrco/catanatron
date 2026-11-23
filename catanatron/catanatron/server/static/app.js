@@ -1092,11 +1092,28 @@ const BUILD_TYPES = { road: "BUILD_ROAD", settlement: "BUILD_SETTLEMENT", city: 
 // A resource, as a colored word (or a swatch when there is no room for one).
 const res = (resource) => html`<span style="color:${RES_COLORS[resource] || "#999"};font-weight:600">${RES_LABEL[resource] || String(resource).toLowerCase()}</span>`;
 const dot = (resource) => html`<span class="res res-${resource}"></span>`;
+// Five counts (wood..ore) as "2 wood + 1 ore".
+function bundleHtml(counts) {
+  const parts = [];
+  RESOURCES.forEach((r, i) => {
+    if (!counts[i]) return;
+    if (parts.length) parts.push(html` + `);
+    parts.push(html`${counts[i]} ${res(r)}`);
+  });
+  return parts.length ? html`${parts}` : html`nothing`;
+}
+// The offer under negotiation, from a trade entry's value (given, asked, then
+// the offerer's turn index or, in a confirm, the acceptee).
+function offerOf(value) {
+  return { give: value.slice(0, 5).map(Number), get: value.slice(5, 10).map(Number) };
+}
 // What the page shows besides the protocol: the build mode, the open
 // dialog, whether it was sent here to sit (and at which kind of table),
 // and which seats the house holds.
 const ui = {
   build: null, modal: null, autoSit: false, table: "", sitTried: false, retries: 0,
+  // The trade offer being built, and the last negotiation decide a dialog opened for.
+  offer: null, negotiation: null,
   seenEnd: false, houseSeats: [], houseRoom: null,
 };
 
@@ -1438,6 +1455,8 @@ function myPromptText() {
     case "BUILD_INITIAL_ROAD": return "Place a road";
     case "DISCARD": return "Discard: pick a card";
     case "MOVE_ROBBER": return "Move the robber";
+    case "DECIDE_TRADE": return "Answer the offer";
+    case "DECIDE_ACCEPTEES": return "Pick who to trade with";
     case "PLAY_TURN":
       if (has("ROLL")) return "Roll";
       if (actions.every((a) => a[1] === "BUILD_ROAD")) return "Place a free road";
@@ -1454,7 +1473,15 @@ function promptText() {
   }
   if (session.pending && !session.answered) return myPromptText();
   const prompt = THEIR_PROMPTS[game.state.current_prompt] || prettyPrompt(game.state.current_prompt);
+  if (game.state.current_prompt === "DECIDE_TRADE" && game.color && turnOwner() === game.color) {
+    return `Waiting for answers to your offer…`;
+  }
   return game.current === game.color ? "Sent" : `${nameOf(game.current)} is ${prompt}…`;
+}
+// The seat whose turn it is (during a negotiation, the offerer).
+function turnOwner() {
+  const state = session.game.state;
+  return state.colors[state.current_turn_index] || session.game.current;
 }
 const prettyPrompt = (prompt) => String(prompt || "").toLowerCase().replace(/_/g, " ");
 function renderTimer() {
@@ -1549,10 +1576,10 @@ function actionLabel(action) {
     case "BUILD_CITY": return `City at node ${value}`;
     case "BUILD_ROAD": return `Road ${value.join("-")}`;
     case "MOVE_ROBBER": return `Robber to ${value[0].join(",")}` + (value[1] ? `, steal from ${value[1]}` : "");
-    case "ACCEPT_TRADE": return "Accept the trade";
-    case "REJECT_TRADE": return "Reject the trade";
-    case "CONFIRM_TRADE": return `Trade with ${value[10]}`;
-    case "CANCEL_TRADE": return "Cancel the trade";
+    case "ACCEPT_TRADE": return "Accept";
+    case "REJECT_TRADE": return "Decline";
+    case "CONFIRM_TRADE": return `Trade with ${session && session.game ? nameOf(value[10]) : value[10]}`;
+    case "CANCEL_TRADE": return "Withdraw the offer";
     default: return type + " " + JSON.stringify(value);
   }
 }
@@ -1574,7 +1601,11 @@ function renderActions() {
     element.disabled = !enabled;
     box.append(element);
   };
-  add("Trade", null, has("MARITIME_TRADE"), () => openModal({ kind: "trade" }));
+  const mayOffer = Boolean(session.pending && !session.answered && session.pending.body.offer_trade);
+  add("Trade", null, has("MARITIME_TRADE") || mayOffer, () => {
+    ui.offer = { give: [0, 0, 0, 0, 0], get: [0, 0, 0, 0, 0] };
+    openModal({ kind: "trade" });
+  });
   add("Dev card", COSTS.dev, has("BUY_DEVELOPMENT_CARD"), () => act("BUY_DEVELOPMENT_CARD"));
   for (const [mode, label] of [["road", "Road"], ["settlement", "Settlement"], ["city", "City"]]) {
     add(label, COSTS[mode], has(BUILD_TYPES[mode]) && !boardOnly,
@@ -1583,7 +1614,8 @@ function renderActions() {
   if (has("ROLL")) add("Roll", null, true, () => act("ROLL"), "go");
   else add("End turn", null, has("END_TURN"), () => act("END_TURN"), "go");
   for (const action of actions.filter((a) => !ACTION_TYPES.has(a[1]))) {
-    box.append(button(actionLabel(action), () => session.act(action), "primary"));
+    const yes = action[1] === "ACCEPT_TRADE" || action[1] === "CONFIRM_TRADE";
+    box.append(button(actionLabel(action), () => session.act(action), yes ? "act go" : "act"));
   }
 }
 
@@ -1644,6 +1676,20 @@ function logHtml([action, result]) {
       const give = value.slice(0, 4).filter((r) => r);
       return html`${by} traded ${give.length} ${res(give[0])} for 1 ${res(value[4])}`;
     }
+    case "OFFER_TRADE": {
+      const offer = offerOf(value);
+      return html`${by} offered ${bundleHtml(offer.give)} for ${bundleHtml(offer.get)}`;
+    }
+    case "ACCEPT_TRADE": return html`${by} accepted`;
+    case "REJECT_TRADE":
+      // (The engine asks the offerer to answer its own offer: no news.)
+      if (session.game.state.colors[value[10]] === color) return null;
+      return html`<span class="muted">${by} declined</span>`;
+    case "CONFIRM_TRADE": {
+      const offer = offerOf(value);
+      return html`${by} traded ${bundleHtml(offer.give)} for ${bundleHtml(offer.get)} with ${who(value[10])}`;
+    }
+    case "CANCEL_TRADE": return html`<span class="muted">${by} withdrew the offer</span>`;
     case "END_TURN": return null;
     default: return html`${by}: ${actionLabel(action).toLowerCase()}`;
   }
@@ -1702,6 +1748,18 @@ function renderModal() {
     ui.seenEnd = true;
     ui.modal = { kind: s.aborted ? "void" : "over", seq: null };
   }
+  const prompt = s.game && s.game.state && s.game.state.current_prompt;
+  if (s.pending && !s.answered && ui.negotiation !== s.pending.env.seq &&
+      (prompt === "DECIDE_TRADE" || prompt === "DECIDE_ACCEPTEES")) {
+    ui.negotiation = s.pending.env.seq;
+    const reject = s.pending.body.playable_actions.find((a) => a[1] === "REJECT_TRADE");
+    if (reject && s.game.state.colors[reject[2][10]] === s.game.color) {
+      // Catanatron asks the offerer too (seats after it answer in turn order): decline for it.
+      s.act(reject);
+    } else if (!ui.modal) {
+      ui.modal = { kind: prompt === "DECIDE_TRADE" ? "answer" : "accepted", seq: s.pending.env.seq };
+    }
+  }
   const m = ui.modal;
   if (m && m.seq !== null && (!s.pending || s.answered || s.pending.env.seq !== m.seq)) ui.modal = null;
   if (!ui.modal) { box.hidden = true; box.innerHTML = ""; return; }
@@ -1748,7 +1806,8 @@ function renderModal() {
       foot.append(button("Cancel", closeModal));
       break;
     case "trade": {
-      setHtml(inner, html`<h2>Trade with the bank</h2>`);
+      setHtml(inner, html`<h2>Trade</h2>`);
+      if (s.pending && s.pending.body.offer_trade) inner.append(offerBuilder());
       const byGive = new Map();
       for (const action of pending.filter((a) => a[1] === "MARITIME_TRADE")) {
         const give = action[2].slice(0, 4).filter((r) => r);
@@ -1756,6 +1815,7 @@ function renderModal() {
         if (!byGive.has(key)) byGive.set(key, { give, actions: [] });
         byGive.get(key).actions.push(action);
       }
+      if (byGive.size) addHtml(inner, html`<h3>Bank</h3>`);
       for (const { give, actions } of byGive.values()) {
         const row = document.createElement("div");
         row.className = "trade-row";
@@ -1768,6 +1828,33 @@ function renderModal() {
         inner.append(row);
       }
       foot.append(button("Cancel", closeModal));
+      break;
+    }
+    case "answer": {
+      const reject = pending.find((a) => a[1] === "REJECT_TRADE");
+      const accept = pending.find((a) => a[1] === "ACCEPT_TRADE");
+      if (!reject) { ui.modal = null; break; }
+      const offer = offerOf(reject[2]);
+      const from = s.game.state.colors[reject[2][10]];
+      setHtml(inner, html`<h2>${nameOf(from)} offers</h2>
+        <p class="offer-line"><span>${bundleHtml(offer.give)}</span><span class="muted">for your</span><span>${bundleHtml(offer.get)}</span></p>
+        ${accept ? html`` : html`<p class="muted">You don't have those cards.</p>`}`);
+      if (accept) foot.append(button("Accept", () => { closeModal(); session.act(accept); }, "primary"));
+      foot.append(button("Decline", () => { closeModal(); session.act(reject); }));
+      break;
+    }
+    case "accepted": {
+      const confirms = pending.filter((a) => a[1] === "CONFIRM_TRADE");
+      const cancel = pending.find((a) => a[1] === "CANCEL_TRADE");
+      if (!cancel) { ui.modal = null; break; }
+      const offer = confirms.length ? offerOf(confirms[0][2]) : null;
+      setHtml(inner, html`<h2>Accepted</h2>${offer ? html`<p class="offer-line"><span>${bundleHtml(offer.give)}</span><span class="muted">for</span><span>${bundleHtml(offer.get)}</span></p>` : html``}`);
+      for (const action of confirms) {
+        const partner = action[2][10];
+        choose(html`${avatarHtml(seatInfo(partner), partner)} Trade with ${nameOf(partner)}`, action);
+      }
+      inner.append(choices);
+      foot.append(button("Withdraw", () => { closeModal(); session.act(cancel); }));
       break;
     }
     case "over":
@@ -1793,6 +1880,55 @@ function renderModal() {
       ui.modal = null;
   }
   inner.append(foot);
+}
+
+// The "offer to players" half of the Trade dialog: what you give (up to your
+// hand) and what you ask for, never the same kind on both sides.
+function offerBuilder() {
+  const box = document.createElement("div");
+  box.className = "offer";
+  const game = session.game;
+  const hand = RESOURCES.map((r) => Number(ps(game.color, r + "_IN_HAND")) || 0);
+  const offer = ui.offer || (ui.offer = { give: [0, 0, 0, 0, 0], get: [0, 0, 0, 0, 0] });
+  addHtml(box, html`<h3>Offer to players</h3>`);
+  const grid = document.createElement("div");
+  grid.className = "offer-grid";
+  addHtml(grid, html`<span></span><span class="muted">give</span><span class="muted">ask for</span>`);
+  const stepper = (side, i, max) => {
+    const cell = document.createElement("span");
+    cell.className = "stepper";
+    const less = button("−", () => { offer[side][i] -= 1; renderModal(); });
+    less.disabled = offer[side][i] <= 0;
+    const more = button("+", () => {
+      offer[side][i] += 1;
+      offer[side === "give" ? "get" : "give"][i] = 0;
+      renderModal();
+    });
+    more.disabled = offer[side][i] >= max;
+    const count = document.createElement("b");
+    count.textContent = String(offer[side][i]);
+    cell.append(less, count, more);
+    return cell;
+  };
+  RESOURCES.forEach((r, i) => {
+    const label = document.createElement("span");
+    setHtml(label, html`${dot(r)} ${RES_LABEL[r]} <span class="muted">${hand[i]}</span>`);
+    grid.append(label, stepper("give", i, hand[i]), stepper("get", i, 19));
+  });
+  box.append(grid);
+  const ready = offer.give.some(Boolean) && offer.get.some(Boolean);
+  const send = button("Offer", () => {
+    const value = [...offer.give, ...offer.get];
+    closeModal();
+    session.act([game.color, "OFFER_TRADE", value]);
+  }, "primary");
+  send.disabled = !ready;
+  const row = document.createElement("div");
+  row.className = "offer-send";
+  addHtml(row, ready ? html`<span>${bundleHtml(offer.give)} <span class="muted">for</span> ${bundleHtml(offer.get)}</span>` : html`<span class="muted">Pick what you give and what you want.</span>`);
+  row.append(send);
+  box.append(row);
+  return box;
 }
 
 // ===== the lobby's ascii board =====

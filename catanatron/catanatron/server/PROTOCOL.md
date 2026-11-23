@@ -41,7 +41,7 @@ Server bodies:
 | `commitments` | once, when every seat is taken | exactly `type`, `room_id`, `server_key`, `config`, `seats` (per seat exactly: `seat`, `color`, `kind`, `name`, `spec`, `public_key`, `requested_seat`, `client_commitment`, `nonce`, `pop`), `seed_commitment`, `reveal_timeout_ms` |
 | `received` | the answer to a `reveal` or an `action` | `submission`, `index` (the action's claimed index, or null), `accepted`, `reason` |
 | `before` | the game starts (or a spectator arrives) | the whole `commitments` body, `client_seeds`, `reveals`, `game_id`, the board and the recipient's view |
-| `decide` | the recipient's move | `index`, view, `playable_actions`, `timeout_ms` |
+| `decide` | the recipient's move | `index`, view, `playable_actions`, `timeout_ms`; in a room whose config has `trades`, also `offer_trade` (see below) |
 | `step` | a move was played | `index`, view, the move's log entry, `forced` (null, `only`, `timeout`, `bot_error`) |
 | `after` | the game is over | view, `reveal`: `server_seed`, every salt, every action |
 | `aborted` | the room is void | `room_id`, `game_id` (the game's, or null if it had not started), `reason`, `blame` (seat indices), `server_seed` |
@@ -62,6 +62,21 @@ A receipt's `submission` is `H({statement, sig})`: for an action, its
 statement; for a reveal, the reveal statement above. Statement and signature
 together, so a receipt for a badly signed copy is not a receipt for the real
 thing.
+
+**Domestic trades.** A room whose config has `trades: true` lets the seat to
+move offer one: `offer_trade` in its `decide` says whether it may now (its own
+turn, after the roll, not placing free roads, a card in hand, fewer than
+`MAX_OFFERS_PER_TURN` = 3 offers this turn; all public, see
+`config.offer_allowed`). An `OFFER_TRADE` is then a valid answer although it is
+never among `playable_actions` (there are too many): ten integer counts, what
+the offerer gives and what it asks for, each side non-empty, no kind on both
+sides, at most 19 of a kind, and what it gives in its hand
+(`config.offer_action`). Catanatron then asks every other seat in turn order
+(the offerer too, if it comes after the first responder) to accept or reject,
+and the offerer to confirm one acceptee or cancel; those are ordinary listed
+moves. A verifier replays offers by the same rule, so an offer the rule
+refuses fails verification like any move the game did not offer. Rooms
+without `trades` send no `offer_trade` and refuse offers.
 
 The game's master seed is `sha256("catanatron-seed/1" ‖ canonical({server_seed,
 client_seeds (seat order, null for server bots), binding: C}))`; the board,

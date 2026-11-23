@@ -14,14 +14,23 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional, Sequence
 
 from catanatron.game import TURNS_LIMIT, Game
-from catanatron.models.decks import BASE_SUPPLY, EXTENSION_SUPPLY, Supply
+from catanatron.models.decks import (
+    BASE_SUPPLY,
+    EXTENSION_SUPPLY,
+    Supply,
+    freqdeck_contains,
+)
 from catanatron.models.dice import DICE_MODES
 from catanatron.models.enums import Action, ActionPrompt, ActionType
 from catanatron.models.map import CatanMap, Layout, build_map, layout_graph
 from catanatron.models.player import Color, Player
 from catanatron.server.hashing import derive_seed
 from catanatron.server.maps import MapError, normalize_map, parse_map
-from catanatron.state_functions import player_has_rolled, player_num_dev_cards
+from catanatron.state_functions import (
+    get_player_freqdeck,
+    player_has_rolled,
+    player_num_dev_cards,
+)
 
 MAP_TYPES = ("BASE", "MINI", "TOURNAMENT")
 NUMBER_PLACEMENTS = ("official_spiral", "random")
@@ -31,7 +40,11 @@ SUPPLIES = {"base": BASE_SUPPLY, "extension": EXTENSION_SUPPLY}
 ROBBER_MODES = ("normal", "friendly_public")
 #: Keys :meth:`GameConfig.to_json` leaves out at their defaults, so a config
 #: written before they existed is still in its canonical form.
-OPTIONAL_DEFAULTS = {"robber_mode": "normal", "dice_mode": "random"}
+OPTIONAL_DEFAULTS = {"robber_mode": "normal", "dice_mode": "random", "trades": False}
+#: Trade offers one seat may make in one turn (each asks every other seat).
+MAX_OFFERS_PER_TURN = 3
+#: The most cards of one kind either side of an offer may name.
+MAX_OFFER_CARDS = 19
 
 
 class ConfigError(ValueError):
@@ -68,6 +81,11 @@ class GameConfig:
     #: Play a seat's move without asking it when everyone can see it has
     #: only one (see :func:`publicly_forced`).
     autoplay_forced: bool = True
+    #: Domestic trades: a seat may offer one (see :func:`offer_allowed`),
+    #: which every other seat answers and the offerer confirms with one of
+    #: those who accepted. Offers are not among the playable actions (there
+    #: are too many): a decide says ``offer_trade`` when one may be made.
+    trades: bool = False
 
     def __post_init__(self):
         if self.supply is None and type(self.num_players) is int:
@@ -119,7 +137,7 @@ class GameConfig:
             raise ConfigError(f"dice_mode must be one of {DICE_MODES}")
         if _int(self.decision_timeout_ms) not in range(100, 24 * 3600 * 1000 + 1):
             raise ConfigError("decision_timeout_ms must be 100 ms to a day")
-        for name in ("friendly_robber", "autoplay_forced"):
+        for name in ("friendly_robber", "autoplay_forced", "trades"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} must be true or false")
         if self.friendly_robber and self.robber_mode != "normal":
@@ -289,6 +307,61 @@ def publicly_forced(game: Game) -> bool:
     return (
         not player_has_rolled(state, color) and player_num_dev_cards(state, color) == 0
     )
+
+
+def offers_this_turn(game: Game) -> int:
+    """Offers the seat whose turn it is has made since its turn began."""
+    count = 0
+    for record in reversed(game.state.action_records):
+        kind = record.action.action_type
+        if kind == ActionType.END_TURN:
+            break
+        if kind == ActionType.OFFER_TRADE:
+            count += 1
+    return count
+
+
+def offer_allowed(game: Game, trades: bool) -> bool:
+    """Whether the seat to move may offer a domestic trade now: trades are on,
+    it is its own turn after the roll (not placing free roads), it holds a
+    card, and it has made fewer than :data:`MAX_OFFERS_PER_TURN` offers this
+    turn. Everything here is public, so a verifier checks it too."""
+    if not trades or game.winning_color() is not None:
+        return False
+    state = game.state
+    color = state.current_color()
+    return (
+        state.current_prompt == ActionPrompt.PLAY_TURN
+        and state.current_player_index == state.current_turn_index
+        and not state.is_road_building
+        and player_has_rolled(state, color)
+        and sum(get_player_freqdeck(state, color)) > 0
+        and offers_this_turn(game) < MAX_OFFERS_PER_TURN
+    )
+
+
+def offer_action(game: Game, trades: bool, action: Any) -> Optional[Action]:
+    """The OFFER_TRADE ``action`` (its JSON) names, if the seat to move may
+    make it now: ten integer counts, what it gives then what it asks, each
+    side non-empty, no kind on both sides, at most :data:`MAX_OFFER_CARDS` of
+    a kind, and what it gives in its hand (Catanatron checks only the form,
+    and a confirm debits blindly). None otherwise."""
+    if not offer_allowed(game, trades):
+        return None
+    if not isinstance(action, list) or len(action) != 3 or action[1] != "OFFER_TRADE":
+        return None
+    color = game.state.current_color()
+    value = action[2]
+    if action[0] != color.value or not isinstance(value, list) or len(value) != 10:
+        return None
+    if not all(type(n) is int and 0 <= n <= MAX_OFFER_CARDS for n in value):
+        return None
+    give, ask = value[:5], value[5:]
+    if not sum(give) or not sum(ask) or any(g and a for g, a in zip(give, ask)):
+        return None
+    if not freqdeck_contains(get_player_freqdeck(game.state, color), give):
+        return None
+    return Action(color, ActionType.OFFER_TRADE, tuple(value))
 
 
 #: What a seat that ran out of time plays, in order of preference: the moves

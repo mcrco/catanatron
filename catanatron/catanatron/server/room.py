@@ -43,6 +43,7 @@ from catanatron.server.config import (
     default_action,
     is_over,
     new_game,
+    offer_action,
     publicly_forced,
 )
 from catanatron.server.crypto import (
@@ -210,6 +211,8 @@ class Pending:
     playable: list  # the server's own Action objects
     playable_json: list
     future: asyncio.Future
+    #: The decide said the seat may also offer a trade.
+    offer_trade: bool = False
 
 
 @dataclass
@@ -847,6 +850,12 @@ class Room:
                 # Play the server's own Action, never the client's encoding.
                 pending.future.set_result((action, statement, signature))
                 return "accepted"
+        if pending.offer_trade:
+            # An offer: the decide said one may be made; the rule decides which.
+            offer = offer_action(self.game, self.config.trades, statement["action"])
+            if offer is not None:
+                pending.future.set_result((offer, statement, signature))
+                return "accepted"
         return "refused: that action was not offered"
 
     # ===== the game =====
@@ -1009,6 +1018,7 @@ class Room:
             self.doc,
             seat.color.value,
             timeout_ms=self.config.decision_timeout_ms,
+            trades=self.config.trades,
         )
         seat.table.update(body)
         if len(playable) == 1:
@@ -1059,6 +1069,7 @@ class Room:
             self.doc,
             seat.color.value,
             timeout_ms=self.config.decision_timeout_ms,
+            trades=self.config.trades,
         )
         envelope = seat.outbox.push(body, self._commit())
         seat.decisions += 1
@@ -1071,6 +1082,7 @@ class Room:
             playable=playable,
             playable_json=body["playable_actions"],
             future=future,
+            offer_trade=bool(body.get("offer_trade")),
         )
 
         def deadline() -> None:
