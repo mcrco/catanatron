@@ -19,7 +19,9 @@ from catanatron.models.player import Color, Player
 #: under 3 actual victory points, hidden victory point cards included, so
 #: whether a move is legal can depend on (and reveal) hidden cards.
 #: ``friendly_public``: OpenHex's friendly robber, on public points only (see
-#: ``catanatron.models.actions.robber_possibilities``), which reveals nothing.
+#: ``catanatron.models.actions.robber_possibilities``), which reveals nothing:
+#: not on a tile with a building of any seat at 2 public points or fewer, the
+#: mover's own included; with no such tile the robber is not moved at all.
 ROBBER_MODES = ("normal", "friendly", "friendly_public")
 
 
@@ -106,10 +108,12 @@ class State:
             ``balanced`` (OpenHex's, see catanatron.models.dice).
         balanced_dice (BalancedDice): The balanced dice's state (None under
             random dice).
-        largest_army_taken_from (Color): Under ``friendly_public``, at the
-            robber prompt of a knight that took Largest Army: the seat it took
-            it from, which keeps its 2 points for that robber move (OpenHex
-            places a knight's robber before it awards). None otherwise.
+        largest_army_taken_from (Color): No longer used: always None in
+            play, and read by nothing. (OpenHex's friendly robber once judged
+            a knight's robber on the points before the knight's Largest Army
+            award, and this named the seat the award was taken from. It now
+            judges on the points after it.) Kept, with its field in
+            ``friendly_public`` documents, so positions saved before load.
     """
 
     def __init__(

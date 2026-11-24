@@ -22,6 +22,7 @@ from catanatron.models.decks import (
     freqdeck_add,
     freqdeck_can_draw,
     freqdeck_contains,
+    freqdeck_count,
     freqdeck_draw,
     freqdeck_from_listdeck,
     freqdeck_replenish,
@@ -29,6 +30,7 @@ from catanatron.models.decks import (
 )
 from catanatron.models.actions import (
     road_building_possibilities,
+    robber_move_owed,
 )
 from catanatron.state import State
 from catanatron.state_functions import (
@@ -36,7 +38,6 @@ from catanatron.state_functions import (
     build_road,
     build_settlement,
     buy_dev_card,
-    get_largest_army,
     maintain_longest_road,
     play_dev_card,
     player_can_afford_dev_card,
@@ -310,8 +311,7 @@ def apply_roll(state: State, action: Action, action_record=None):
         else:
             state.discard_counts = [0] * len(state.colors)
             # state.current_player_index stays the same
-            state.current_prompt = ActionPrompt.MOVE_ROBBER
-            state.is_moving_knight = True
+            _prompt_robber_move(state, action.color)
     else:
         payout, _ = yield_resources(state.board, state.resource_freqdeck, number)
         for color, resource_freqdeck in payout.items():
@@ -357,12 +357,23 @@ def apply_discard(state: State, action: Action):
             # state.current_prompt stays the same
         else:
             state.current_player_index = state.current_turn_index
-            state.current_prompt = ActionPrompt.MOVE_ROBBER
             state.is_discarding = False
-            state.is_moving_knight = True
             state.discard_counts = [0] * len(state.colors)
+            _prompt_robber_move(state, state.colors[state.current_turn_index])
 
     return ActionRecord(action=action, result=discarded)
+
+
+def _prompt_robber_move(state: State, color):
+    """After a 7 (its discards done): ``color``, whose turn it is and who is
+    already the seat to move, moves the robber. Under OpenHex's friendly
+    robber every tile can be shielded; then no move is owed, the robber stays,
+    nobody is robbed, and the turn goes on as after a robber move."""
+    if robber_move_owed(state, color):
+        state.current_prompt = ActionPrompt.MOVE_ROBBER
+        state.is_moving_knight = True
+    else:
+        state.current_prompt = ActionPrompt.PLAY_TURN
 
 
 def apply_move_robber(state: State, action: Action, action_record=None):
@@ -377,6 +388,7 @@ def apply_move_robber(state: State, action: Action, action_record=None):
         player_deck_draw(state, robbed_color, robbed_resource)
         player_deck_replenish(state, action.color, robbed_resource)
     state.board.robber_coordinate = coordinate
+    # Play never sets it; a position saved under the older rule may carry it.
     state.largest_army_taken_from = None
 
     # state.current_player_index stays the same
@@ -389,19 +401,19 @@ def apply_play_knight_card(state: State, action: Action):
     if not player_can_play_dev(state, action.color, "KNIGHT"):
         raise ValueError("Player cant play knight card now")
 
-    holder, _ = get_largest_army(state)
+    # The card counts and Largest Army is settled first: OpenHex's friendly
+    # robber judges the knight's robber on the points after the award
+    # (models.actions.robber_possibilities).
     play_dev_card(state, action.color, "KNIGHT")
-    if (
-        state.robber_mode == "friendly_public"
-        and holder is not None
-        and not state.player_state[f"{player_key(state, holder)}_HAS_ARMY"]
-    ):
-        # Read by the robber's shields: OpenHex places a knight's robber
-        # before it awards Largest Army (models.actions.robber_possibilities).
-        state.largest_army_taken_from = holder
 
     # state.current_player_index stays the same
-    state.current_prompt = ActionPrompt.MOVE_ROBBER
+    if robber_move_owed(state, action.color):
+        state.current_prompt = ActionPrompt.MOVE_ROBBER
+    else:
+        # Every tile shielded (OpenHex's friendly robber): the knight is
+        # played, and moves no robber. The turn goes on where it was (the
+        # roll, if the knight came before it).
+        state.current_prompt = ActionPrompt.PLAY_TURN
     return ActionRecord(action=action, result=None)
 
 
@@ -571,6 +583,12 @@ def roll_dice(rng=None):
 def yield_resources(board: Board, resource_freqdeck, number):
     """Computes resource payouts for given board and dice roll number.
 
+    A short bank (OpenHex's rule, and cppanatron's; the rulebook's too): each
+    resource is judged over every claim on it. When the bank holds fewer
+    cards of it than the roll's buildings claim, a sole claimant takes what
+    the bank has left, and with several claimants, or an empty bank, nobody
+    gets any. A claimant is a player, however many of its buildings claim.
+
     Args:
         board (Board): Board state
         resource_freqdeck (List[int]): Bank's resource freqdeck
@@ -579,8 +597,10 @@ def yield_resources(board: Board, resource_freqdeck, number):
     Returns:
         (dict, List[int]): 2-tuple.
             First element is color => freqdeck mapping. e.g. {Color.RED: [0,0,0,3,0]}.
-            Second is an array of resources that couldn't be yieleded
-            because they depleted.
+            It never asks the bank for more than it holds.
+            Second is an array of the resources the bank could not pay in
+            full, in RESOURCES order: those nobody got, and those whose sole
+            claimant got only the bank's remainder.
     """
     intented_payout: Dict[Color, Dict[FastResource, int]] = defaultdict(
         lambda: defaultdict(int)
@@ -604,10 +624,15 @@ def yield_resources(board: Board, resource_freqdeck, number):
 
     # for each resource, check enough in deck to yield.
     depleted = []
+    #: What a depleted resource's sole claimant still gets: the bank's remainder.
+    remainder: Dict[FastResource, int] = {}
     for resource in RESOURCES:
         total = resource_totals[resource]
         if not freqdeck_can_draw(resource_freqdeck, total, resource):
             depleted.append(resource)
+            claimants = sum(1 for claims in intented_payout.values() if resource in claims)
+            if claimants == 1:
+                remainder[resource] = freqdeck_count(resource_freqdeck, resource)
 
     # build final data color => freqdeck structure
     payout = {}
@@ -617,6 +642,8 @@ def yield_resources(board: Board, resource_freqdeck, number):
         for resource, count in player_payout.items():
             if resource not in depleted:
                 freqdeck_replenish(payout[player], count, resource)
+            elif remainder.get(resource, 0) > 0:
+                freqdeck_replenish(payout[player], remainder[resource], resource)
 
     return payout, depleted
 

@@ -5,10 +5,11 @@ A game with ``dice_mode="balanced"`` rolls these instead of two fair dice
 (same integer weights, same state). A roll by ``roller`` (the seat whose
 turn it is):
 
-1. If at most 13 cards remain, the deck is first refilled to all 36. Only
-   the deck resets: the recent totals, the sevens and the streak carry over.
-   A game starts with a full deck and no history, and the deck is refilled
-   again when the main phase starts (as OpenHex does).
+1. If fewer than 13 cards remain, the deck is first refilled to all 36 (a
+   roll can take the 13th-last card; the next one refills). Only the deck
+   resets: the recent totals, the sevens and the streak carry over. A game
+   starts with a full deck and no history, and the deck is refilled again
+   when the main phase starts (as OpenHex does).
 2. Total k in 2..12 weighs c_k * max(0, 1 - 0.34 a_k), with c_k of the cards
    left of total k and a_k the times k is among the last five totals.
 3. With two or more seats, the 7's weight is multiplied by
@@ -17,11 +18,15 @@ turn it is):
    (1/n) once the 7s rolled so far S reach the n seats (s the roller's),
    else 1.
 4. The total is drawn by weight, then the card uniformly among that total's
-   cards left. (All-zero weights would draw a card uniformly; at least 14
-   cards span three totals, which rules it out.)
-5. The card leaves the deck, the total joins the window (dropping the oldest
-   of six), a 7 counts for the roller and extends its run or starts one of 1,
-   and any other total ends the run.
+   cards left. (All-zero weights would draw a card uniformly. That cannot
+   happen: a draw is from at least 13 cards, two totals hold at most 6 + 5
+   of them, so three totals have cards; and at most two weigh nothing, the 7
+   by its multiplier and the one total that can be three of the last five.)
+5. The card leaves the deck and the total joins the window (dropping the
+   oldest of six). Only a 7 moves the run of 7s: it counts for the roller,
+   and extends the run if the roller owns it, else starts a new one of 1 (a
+   run is one seat's; the 7s need not be consecutive rolls). Any other total
+   leaves the run, owner and length, as it is.
 
 All of it is public: every roll is, and the deck has no order (a card's
 chance depends only on its total), so views show it whole. The weights are
@@ -41,8 +46,8 @@ CARDS: Tuple[Tuple[int, int], ...] = tuple(
 )
 FULL_DECK = (1 << len(CARDS)) - 1
 TOTALS = tuple(range(2, 13))
-#: A draw first refills the deck when at most this many cards remain.
-RESHUFFLE_AT = 13
+#: A draw first refills the deck when fewer than this many cards remain.
+RESHUFFLE_BELOW = 13
 #: Totals remembered for the recency penalty.
 WINDOW = 5
 SEVEN = TOTALS.index(7)
@@ -150,7 +155,7 @@ class BalancedDice:
 
     def drawable(self) -> int:
         """The deck the next draw takes from: the full deck when it refills first."""
-        return FULL_DECK if self.remaining <= RESHUFFLE_AT else self.deck
+        return FULL_DECK if self.remaining < RESHUFFLE_BELOW else self.deck
 
     def counts(self) -> List[int]:
         """Cards per total 2..12 in :meth:`drawable`."""
@@ -244,14 +249,13 @@ class BalancedDice:
         self.recent = (self.recent + [total])[-WINDOW:]
         if roller is None:
             return
-        if total == 7:
-            self.sevens[roller] += 1
-            if self.streak_player == roller:
-                self.streak_count += 1
-            else:
-                self.streak_player, self.streak_count = roller, 1
+        if total != 7:
+            return  # the run of 7s stands
+        self.sevens[roller] += 1
+        if self.streak_player == roller:
+            self.streak_count += 1
         else:
-            self.streak_player, self.streak_count = None, 0
+            self.streak_player, self.streak_count = roller, 1
 
     def refill(self) -> None:
         """Only the deck resets (the main phase starts)."""

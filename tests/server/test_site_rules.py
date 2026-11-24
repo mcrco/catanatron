@@ -12,10 +12,18 @@ import random
 import pytest
 
 from catanatron.models.dice import BalancedDice
-from catanatron.models.enums import ActionPrompt, ActionRecord, ActionType
+from catanatron.models.actions import generate_playable_actions
+from catanatron.models.enums import SETTLEMENT, ActionPrompt, ActionRecord, ActionType
 from catanatron.serialization import state_to_json
 from catanatron.server.client import GameClient, Refused, create_room
-from catanatron.server.config import ConfigError, GameConfig, new_game, publicly_forced
+from catanatron.server.config import (
+    ConfigError,
+    GameConfig,
+    default_action,
+    is_over,
+    new_game,
+    publicly_forced,
+)
 from catanatron.server.room import Room
 from catanatron.server.verify import load_transcript, verify_transcript, verify_transcripts
 
@@ -101,6 +109,30 @@ def test_a_lone_robber_move_is_publicly_forced_on_public_points_only():
         assert publicly_forced(game) is forced
 
 
+def test_a_seven_that_owes_no_robber_move_leaves_the_roller_to_play_on():
+    """Every tile shielded: the game asks for no robber move, so there is none
+    for the server to prompt, autoplay or time out on. The roller is asked for
+    the rest of its turn, and a timeout ends it."""
+    game = new_game(GameConfig.from_json(SITE), b"\2" * 32, "g")
+    while game.state.is_initial_build_phase:
+        game.execute(game.playable_actions[0])
+    roller = game.state.current_color()
+    opponent = next(c for c in game.state.colors if c != roller)
+    board = game.state.board
+    for tile in board.map.land_tiles.values():
+        if not any(board.buildings.get(n, (None,))[0] == opponent for n in tile.nodes.values()):
+            free = next(n for n in tile.nodes.values() if n not in board.buildings)
+            board.buildings[free] = (opponent, SETTLEMENT)
+    game.playable_actions = generate_playable_actions(game.state)
+    roll = next(a for a in game.playable_actions if a.action_type == ActionType.ROLL)
+    robber = board.robber_coordinate
+    game.execute(roll, action_record=ActionRecord(roll, (1, 6)))
+    assert game.state.current_prompt == ActionPrompt.PLAY_TURN
+    assert game.state.current_color() == roller and board.robber_coordinate == robber
+    assert not is_over(game) and not publicly_forced(game)
+    assert default_action(game.playable_actions).action_type == ActionType.END_TURN
+
+
 # ===== rooms =====
 def test_rooms_open_under_the_site_rules_and_old_configs_still_open():
     async def scenario():
@@ -140,7 +172,7 @@ def test_a_game_under_the_site_rules_verifies(tmp_path):
         assert result.winning_color is not None
     assert game.state.robber_mode == "friendly_public"
     rolls = [r.result for r in game.state.action_records if r.action.action_type == ActionType.ROLL]
-    assert len(rolls) > 23  # past the first refill of the deck
+    assert len(rolls) > 24  # past the first refill of the deck
     dice = BalancedDice.fresh(2)
     for record in game.state.action_records:
         if record.action.action_type == ActionType.ROLL:

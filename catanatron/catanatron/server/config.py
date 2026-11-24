@@ -67,7 +67,8 @@ class GameConfig:
     #: victory point cards included, are spared).
     friendly_robber: bool = False
     #: ``normal``, or ``friendly_public``: OpenHex's friendly robber, on public
-    #: points only (see catanatron.models.actions.robber_possibilities).
+    #: points only (see catanatron.models.actions.robber_possibilities). With
+    #: every tile shielded it asks for no robber move at all.
     robber_mode: str = "normal"
     #: ``random`` (two fair dice) or ``balanced`` (OpenHex's balanced dice,
     #: see catanatron.models.dice).
@@ -290,8 +291,8 @@ def publicly_forced(game: Game) -> bool:
     the table what is in that hand. Holds for the initial placements, robber
     moves (victims are chosen by public card counts) unless Catanatron's own
     friendly robber counts hidden victory point cards (``friendly_public``
-    counts public points only), free roads, and the roll of a seat that holds
-    no development card.
+    counts public points only, and a robber it lets go nowhere is never asked
+    for), free roads, and the roll of a seat that holds no development card.
     """
     if len(game.playable_actions) != 1:
         return False

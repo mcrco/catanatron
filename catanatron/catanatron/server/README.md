@@ -98,23 +98,38 @@ they existed are unchanged. Together with `num_players: 2`, `vps_to_win: 15`
 and `discard_limit: 9` they are OpenHex's 1v1 rules:
 
 - `robber_mode: friendly_public` (catanatron.models.actions.robber_possibilities):
-  a tile with an opponent of the mover at 2 public points or fewer
-  (settlements, cities, Longest Road, Largest Army; never victory point cards)
-  is off limits, unless every tile but the robber's is, when all are open. A
-  knight's tile is judged on the points before the knight's Largest Army
-  award (OpenHex validates it first), so the seat the knight took the award
-  from keeps its 2 points for that robber move (the document's
-  `largest_army_taken_from`). Victims are not filtered. Since it reads public
-  points only, the legal moves reveal nothing, and a lone robber move is
-  publicly forced.
+  a tile with a building of any seat at 2 public points or fewer (settlements,
+  cities, Longest Road, Largest Army; never victory point cards) is off
+  limits, the mover's own buildings included. When that leaves no tile but
+  the robber's, the robber does not move and nobody is robbed: after a 7 the
+  discards still happen, then the roller's turn goes on with no `MOVE_ROBBER`
+  prompt; a knight is still played (it leaves the hand, counts for Largest
+  Army and is the turn's development card) and no `MOVE_ROBBER` prompt
+  follows it. A knight's robber is judged on the points after the knight's
+  Largest Army award: a seat the knight took the award from is back at its
+  points without it, a mover the award lifted past 2 no longer shields its
+  own tiles. Victims are not filtered. Since it reads public points only, the
+  legal moves reveal nothing, and a lone robber move is publicly forced. (The
+  document's `largest_army_taken_from` is from an earlier form of the rule:
+  always null now, kept so documents keep their shape.)
 - `dice_mode: balanced` (catanatron.models.dice): a 36-card deck of face pairs,
-  refilled to 36 before a roll when 13 or fewer are left (and when the main
+  refilled to 36 before a roll when fewer than 13 are left (and when the main
   phase starts); a total weighs its cards left times max(0, 1 - 0.34 x its
   count among the last 5 totals), the 7 further times
-  clamp(imbalance + 0.4 per 7 of the current run, negative for the run's
-  owner, 0, 2). The dice's state is public (the document's `balanced_dice`,
-  in every view), and the game's random stream draws from it, so the verifier
-  replays the rolls from the revealed seeds as it does fair ones.
+  clamp(imbalance + 0.4 per 7 of the current run of 7s, negative for the
+  run's owner, 0, 2). Only a 7 moves the run: the owner's extends it, another
+  seat's starts a new run of 1, and other totals leave it standing. The dice's
+  state is public (the document's `balanced_dice`, in every view), and the
+  game's random stream draws from it, so the verifier replays the rolls from
+  the revealed seeds as it does fair ones.
+
+In every game, whatever its config, a roll the bank cannot pay in full is
+settled resource by resource, as OpenHex does (catanatron.apply_action.
+yield_resources): when the roll's buildings claim more cards of a resource
+than the bank holds, a sole claimant (one seat, however many of its buildings
+claim) takes what the bank has left, and with several claimants, or an empty
+bank, nobody gets any of that resource. (Before, a sole claimant got nothing
+either; a transcript in which that happened no longer verifies.)
 
 An explicit map lists every tile, in the order that numbers the nodes (the order
 `CatanMap.from_tiles` walks):

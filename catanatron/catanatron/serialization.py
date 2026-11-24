@@ -291,6 +291,8 @@ def state_to_json(game: Game):
         "acceptees": list(s.acceptees),
     }
     if s.robber_mode == "friendly_public":
+        # No longer used (State.largest_army_taken_from): null from play. The
+        # field stays so these documents keep their shape and older ones load.
         taken = s.largest_army_taken_from
         doc["largest_army_taken_from"] = None if taken is None else taken.value
     if s.balanced_dice is not None:

@@ -213,34 +213,51 @@ def city_possibilities(state, color) -> List[Action]:
 def robber_possibilities(state, color) -> List[Action]:
     """Where ``color`` may move the robber (state.ROBBER_MODES).
 
-    Under a friendly robber some tiles are shielded, and are off limits
-    unless every tile but the robber's is shielded (then all are open). Under
-    ``friendly``, a tile with an opponent under 3 actual victory points
-    (hidden victory point cards count) is shielded. Under ``friendly_public``
-    (OpenHex's, and cppanatron's friendly robber), a tile with an opponent of
-    at most 2 public points (settlements, cities, Longest Road, Largest Army;
-    never victory point cards) is, so the legal moves reveal nothing; a
-    knight's tile is judged on the points before the knight's Largest Army
-    award (OpenHex validates the knight's tile, then awards), so a seat the
-    knight took the award from keeps its 2 points for that robber move. The
-    victims are not filtered.
+    Under a friendly robber some tiles are shielded, and are off limits.
+
+    Under ``friendly``, a tile with an opponent under 3 actual victory points
+    (hidden victory point cards count) is shielded; when every tile but the
+    robber's is, all are open.
+
+    Under ``friendly_public`` (OpenHex's, and cppanatron's friendly robber), a
+    tile with a building of any seat at 2 public points or fewer (settlements,
+    cities, Longest Road, Largest Army; never victory point cards) is
+    shielded, the mover's own buildings included, so the legal moves reveal
+    nothing. There is no fallback: when every tile but the robber's is
+    shielded this is empty, and the robber does not move. The game then never
+    asks for a robber move (``robber_move_owed``): a 7 goes on with the
+    roller's turn once the discards are done, and a knight is played without
+    one. The points are the current ones: a knight's robber is judged after
+    the knight's Largest Army award (apply_play_knight_card awards first).
+
+    The victims are not filtered.
     """
     actions = _robber_possibilities_without_friendly_robber(state, color)
     if state.robber_mode == "normal":
         return actions
-    shielded = (
-        _robber_action_shields_public_points
-        if state.robber_mode == "friendly_public"
-        else _robber_action_blocks_low_vp_enemy
-    )
+    if state.robber_mode == "friendly_public":
+        return [
+            action
+            for action in actions
+            if not _robber_action_shields_public_points(state, action)
+        ]
 
     filtered_actions = list(
         filter(
-            lambda action: not shielded(state, color, action),
+            lambda action: not _robber_action_blocks_low_vp_enemy(state, color, action),
             actions,
         )
     )
     return filtered_actions if len(filtered_actions) > 0 else actions
+
+
+def robber_move_owed(state, color) -> bool:
+    """Whether ``color`` has anywhere to move the robber. Only OpenHex's
+    friendly robber (``friendly_public``) can say no: every tile but the
+    robber's has a building of a seat at 2 public points or fewer."""
+    if state.robber_mode != "friendly_public":
+        return True
+    return len(robber_possibilities(state, color)) > 0
 
 
 def _robber_possibilities_without_friendly_robber(state, color) -> List[Action]:
@@ -292,22 +309,16 @@ def _robber_action_blocks_low_vp_enemy(state, color, action) -> bool:
     return False
 
 
-def _robber_action_shields_public_points(state, color, action) -> bool:
+def _robber_action_shields_public_points(state, action) -> bool:
+    """Whether any seat at 2 public points or fewer, the mover included, has
+    a building on the action's tile."""
     coordinate, _ = action.value
     tile = state.board.map.land_tiles[coordinate]
     for node_id in tile.nodes.values():
         building = state.board.buildings.get(node_id, None)
         if building is None:
             continue
-
-        candidate_color = building[0]
-        if color == candidate_color:
-            continue
-
-        points = get_visible_victory_points(state, candidate_color)
-        if candidate_color == state.largest_army_taken_from:
-            points += 2  # still on the points before the knight's award
-        if points <= 2:
+        if get_visible_victory_points(state, building[0]) <= 2:
             return True
 
     return False

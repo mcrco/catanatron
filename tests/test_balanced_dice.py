@@ -48,8 +48,42 @@ def test_a_seven_starts_a_streak_and_joins_the_window():
     assert dice.sum_weights(1)[5] == 5 * 33 * 7
     assert dice.sum_weights(1)[6] == 5 * 50 * 5  # an 8: untouched
     dice.apply((1, 1), 1)
-    assert (dice.streak_player, dice.streak_count) == (None, 0)
     assert dice.recent == [7, 2]
+
+
+def test_only_a_seven_moves_the_streak():
+    dice = BalancedDice.fresh(3)
+    dice.apply((3, 4), 0)
+    # Other totals, whoever rolls them, leave the streak (owner and count) standing.
+    for card, roller in [((1, 1), 1), ((2, 2), 0), ((6, 6), 2), ((1, 2), 0)]:
+        dice.apply(card, roller)
+        assert (dice.streak_player, dice.streak_count) == (0, 1)
+        assert dice.sevens == [1, 0, 0]
+    # So it still weighs on the next 7: 1 - 0.4 for its owner, 1 + 0.4 for the others.
+    assert dice.seven_multiplier(0) == (3, 5)
+    assert dice.seven_multiplier(1) == dice.seven_multiplier(2) == (7, 5)
+    # The owner's next 7 extends it, though other rolls came between.
+    dice.apply((1, 6), 0)
+    assert (dice.streak_player, dice.streak_count) == (0, 2) and dice.sevens == [2, 0, 0]
+    assert dice.seven_multiplier(0) == (1, 5) and dice.seven_multiplier(1) == (9, 5)
+    dice.apply((4, 4), 0)
+    assert (dice.streak_player, dice.streak_count) == (0, 2)
+    # Another seat's 7 takes it over: a new streak of 1.
+    dice.apply((2, 5), 2)
+    assert (dice.streak_player, dice.streak_count) == (2, 1) and dice.sevens == [2, 0, 1]
+    dice.apply((5, 5), 0)
+    assert (dice.streak_player, dice.streak_count) == (2, 1)
+    # 3 sevens over 3 seats: imbalance 1 + (1/3 - s/3) * 3 = 2 - s, then the streak's 0.4.
+    assert dice.seven_multiplier(0) == (6, 15)  # 0 + 0.4
+    assert dice.seven_multiplier(1) == (30, 15)  # 2 + 0.4, clamped to 2
+    assert dice.seven_multiplier(2) == (9, 15)  # 1 - 0.4
+
+
+def test_a_roller_of_none_moves_no_streak():
+    dice = BalancedDice(2, sevens=[1, 0], streak_player=0, streak_count=1)
+    dice.apply((3, 4), None)
+    assert dice.recent == [7] and dice.sevens == [1, 0]
+    assert (dice.streak_player, dice.streak_count) == (0, 1)
 
 
 def test_the_imbalance_term_and_the_clamp():
@@ -81,16 +115,43 @@ def test_the_window_holds_the_last_five_totals():
 
 
 # ===== the deck =====
-def test_the_deck_refills_before_a_draw_at_13_cards():
-    left = CARDS[:13]
+def test_a_draw_is_taken_from_13_cards_without_a_refill():
+    left = CARDS[:13]  # (1, 1) .. (1, 6), (2, 1) .. (2, 6), (3, 1)
+    dice = BalancedDice(2, deck=deck_of(left))
+    assert dice.remaining == 13 and dice.drawable() == dice.deck
+    assert dice.counts() == [1, 2, 3, 2, 2, 2, 1, 0, 0, 0, 0]
+    assert not dice.can_draw((6, 6)) and dice.can_draw((3, 1))
+    with pytest.raises(ValueError, match="not in the balanced deck"):
+        dice.apply((6, 6), 0)
+    rng = random.Random(0)
+    assert all(dice.draw(rng, 0) in left for _ in range(500))
+    dice.apply((3, 1), 0)
+    assert dice.remaining == 12 and dice.deck == deck_of(CARDS[:12])
+
+
+def test_the_deck_refills_before_a_draw_at_12_cards():
+    left = CARDS[:12]
     dice = BalancedDice(2, deck=deck_of(left), recent=[6], sevens=[2, 1], streak_player=1, streak_count=1)
-    assert dice.remaining == 13 and dice.drawable() == FULL_DECK
+    assert dice.remaining == 12 and dice.drawable() == FULL_DECK
     assert dice.counts() == FULL_COUNTS
     assert dice.can_draw((6, 6))  # long drawn, but the deck refills first
     dice.apply((6, 6), 0)
     # Only the deck reset: the window, the sevens and the streak carried over.
     assert dice.remaining == 35 and not dice.can_draw((6, 6))
-    assert dice.recent == [6, 12] and dice.sevens == [2, 1] and dice.streak_count == 0
+    assert dice.recent == [6, 12] and dice.sevens == [2, 1]
+    assert (dice.streak_player, dice.streak_count) == (1, 1)
+
+
+def test_thirteen_cards_always_leave_a_total_to_draw():
+    # The fewest totals 13 cards can span is three (two hold at most 6 + 5), and at
+    # most two can weigh nothing: the 7 by its multiplier, one total by the window.
+    left = [c for c in CARDS if sum(c) in (6, 7)] + [(2, 6), (3, 5)]
+    dice = BalancedDice(2, deck=deck_of(left), recent=[6, 6, 6, 2, 3], sevens=[0, 4], streak_player=1,
+                        streak_count=4)
+    assert dice.remaining == 13 and dice.drawable() == dice.deck
+    weights = dice.sum_weights(1)
+    assert [i + 2 for i, w in enumerate(weights) if w] == [8]
+    assert sum(dice.draw(random.Random(1), 1)) == 8
 
 
 def test_a_card_no_longer_in_the_deck_is_refused_and_changes_nothing():
@@ -166,8 +227,8 @@ def test_a_balanced_game_rolls_from_its_deck():
             seen.append(record.result)
         else:  # end the turn, or discard / move the robber first
             game.execute(kinds.get(ActionType.END_TURN, game.playable_actions[0]))
-    # A deck yields 23 draws (36 down to 13) before it refills: no card repeats among them.
-    assert len(set(seen[:23])) == 23
+    # A deck yields 24 draws (36 down to 12) before it refills: no card repeats among them.
+    assert len(set(seen[:24])) == 24
 
 
 def test_the_deck_refills_when_the_main_phase_starts():
