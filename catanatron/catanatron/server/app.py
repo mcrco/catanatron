@@ -13,9 +13,11 @@ Routes (one port, HTTP and WebSocket):
 House mode (``--house-token-file``): the server is a place to play its
 operator's bots, not a platform. Only connections that present the house
 token (the ``X-Catanatron-House`` header) may create rooms or seat server
-bots, and a room takes at most one seat from anyone else, so every game is
-one person against the house. A person who leaves a game for good (no
-connection for ``human_away_s``) voids it, so their table frees up.
+bots; people take the seats the house leaves open. A room the house opens
+with ``bots_on_request`` lets a person seated in it ask for a bot
+(``add_bot``): the room's ``bot_requests`` grows and the house sends one to
+an open seat. A game whose people have all left for good (no connection for
+``human_away_s``) is void, so its table frees up.
     WS  /lobby             create_room, list_rooms, players
     WS  /room/ROOM_ID      join a seat, or spectate, and play
 
@@ -209,14 +211,7 @@ class GameServer:
         return [s for s in room.seats if s.kind == "remote" and s.public_key not in keys]
 
     def describe_room(self, room: Room) -> dict:
-        out = room.describe()
-        if self.house:
-            keys = self.house_keys.get(room.id, set())
-            out["house_seats"] = [
-                s.index for s in room.seats
-                if s.kind == "bot" or (s.kind == "remote" and s.public_key in keys)
-            ]
-        return out
+        return room.describe()  # in house mode it names the house's seats
 
     # ===== rooms =====
     def create_room(
@@ -225,6 +220,7 @@ class GameServer:
         seats: Optional[list] = None,
         name: str = "",
         address: Optional[str] = None,
+        bots_on_request: bool = False,
     ) -> Room:
         game_config = GameConfig.from_json(config)
         if game_config.friendly_robber:
@@ -262,6 +258,9 @@ class GameServer:
         for index, spec in enumerate(seats):
             if spec is not None:
                 room.set_bot(index, spec, address)
+        room.bots_on_request = bool(bots_on_request)
+        if self.house:
+            room.house_keys = self.house_keys[room_id]
         self.rooms[room_id] = room
         if address is not None:
             self.room_owner[room_id] = address
@@ -520,6 +519,8 @@ class GameServer:
                         str(request.get("name") or ""),
                         # The house's own rooms count against no address.
                         address=None if house else address,
+                        bots_on_request=house
+                        and request.get("bots_on_request") is True,
                     )
                     reply = {"type": "room_created", "room": room.describe()}
                 elif kind == "list_rooms":
@@ -569,14 +570,10 @@ class GameServer:
                     kind = request.get("type")
                     if kind in ("join", "rejoin") and seat is None and not watching:
                         if kind == "join":
-                            if self.house and not house and self.guests(room):
-                                raise RoomError(
-                                    "room_full",
-                                    "this table already has its player; pick another",
-                                )
                             seat = room.join(outbox, peer, request)
                             if house:
                                 self.house_keys[room.id].add(seat.public_key)
+                                room.bot_arrived()
                         else:
                             seat = room.rejoin(outbox, peer, request)
                         assert seat.outbox is not None
@@ -600,6 +597,18 @@ class GameServer:
                         room.set_bot(
                             request.get("seat"), request.get("spec"), peer.address
                         )
+                    elif kind == "add_bot":
+                        if (
+                            not self.house
+                            or house
+                            or seat is None
+                            or seat.public_key in self.house_keys.get(room.id, ())
+                        ):
+                            raise RoomError(
+                                "bad_request",
+                                "only a person seated at a house table asks for bots",
+                            )
+                        room.want_bot()
                     elif kind == "ping":
                         pass
                     else:

@@ -56,7 +56,7 @@ the `hello` on the connection the request is sent on):
 | `rejoin {protocol_version, public_key K, sig, last_seq}` | `sig = sign_K({domain: "catanatron-rejoin/1", room_id, nonce: N})` |
 | `reveal {client_seed, sig}` | `sig = sign_K({domain: "catanatron-reveal/1", commitments: C})` |
 | `action {statement, sig}` | `statement = {domain: "catanatron-action/1", commitments: C, index, seq, decide: H(head of the decide envelope), action}`, `sig = sign_K(statement)` |
-| `spectate`, `seat_bot {seat, spec}`, `ping` | none |
+| `spectate`, `seat_bot {seat, spec}`, `add_bot`, `ping` | none |
 
 A receipt's `submission` is `H({statement, sig})`: for an action, its
 statement; for a reveal, the reveal statement above. Statement and signature
@@ -102,7 +102,12 @@ commitment and join, and the server's seed commitment.
   connection's nonce), that the key holds no seat here, and that neither key
   nor address is banned, then sends `joined` on that connection's chain,
   which from then on is the seat's chain. `seat_bot` puts a server bot in an
-  open seat. A seat whose connection drops is held for `seat_grace_s` (it
+  open seat (in house mode, only the house's connections may). In house
+  mode a room the house opened with `bots_on_request` takes `add_bot` from a
+  person seated in it: the room's `bot_requests` (a count that only grows)
+  and `bots_wanted` (requests no house seat has answered yet, at most the
+  open seats) go up in its `room` message, the house follows the count and
+  joins a bot to an open seat, and each house join answers one. A seat whose connection drops is held for `seat_grace_s` (it
   can `rejoin`), then freed; a freed key can sit again only by a fresh join,
   signed over a fresh nonce.
 * **revealing.** When no seat is open the server builds the one `commitments`

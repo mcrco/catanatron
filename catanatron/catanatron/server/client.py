@@ -145,15 +145,16 @@ async def create_room(
     seats: Optional[list] = None,
     name: str = "",
     house_token: Optional[str] = None,
+    bots_on_request: bool = False,
 ) -> dict:
     """Create a room; ``seats`` lists a registry spec (a server bot) or None
     (open) per seat. Returns the room's description. (A server in house mode
-    takes rooms only from its house: see :func:`house_headers`.)"""
-    reply = await lobby_request(
-        url,
-        {"type": "create_room", "config": config, "seats": seats, "name": name},
-        house_token,
-    )
+    takes rooms only from its house: see :func:`house_headers`; the house's
+    ``bots_on_request`` lets the people seated ask it for bots.)"""
+    request = {"type": "create_room", "config": config, "seats": seats, "name": name}
+    if bots_on_request:
+        request["bots_on_request"] = True
+    reply = await lobby_request(url, request, house_token)
     return reply["room"]
 
 
@@ -322,6 +323,14 @@ class GameClient:
         self.messages.append(envelope)
         self.head = envelope_hash(envelope)
         return envelope["body"]
+
+    async def add_bot(self) -> None:
+        """Ask the house for a bot in an open seat (a seat in a waiting room
+        the house opened with ``bots_on_request``; see app.py). The room's
+        next ``room`` message counts the request, or an ``error`` says no."""
+        if self.connection is None or self.seat is None or self.spectate:
+            raise RuntimeError("only a seated client asks for bots")
+        await self.connection.send(json.dumps({"type": "add_bot"}))
 
     # ----- playing -----
     async def play(self, decide: Optional[Decide] = None) -> GameResult:

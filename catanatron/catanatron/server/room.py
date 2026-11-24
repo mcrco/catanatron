@@ -338,6 +338,15 @@ class Room:
         self.task: Optional[asyncio.Task] = None
         self.timer: Optional[asyncio.TimerHandle] = None
         self.worker = BotWorker()
+        #: A house room whose people may ask the house for bots (app.py):
+        #: the requests so far (a count that only grows, which the house
+        #: follows) and those no house seat has answered yet.
+        self.bots_on_request = False
+        self.bot_requests = 0
+        self.bots_wanted = 0
+        #: In house mode, the keys the house holds seats with (app.py's set):
+        #: the room then names the house's seats, so a person sees who is a bot.
+        self.house_keys: Optional[set] = None
         self.finished = asyncio.Event()
         self.on_finish = on_finish
         self._room_broadcast = False
@@ -356,6 +365,16 @@ class Room:
             "seats": [seat.describe() for seat in self.seats],
             "spectators": len(self.spectators),
             "game_id": self.game_id if self.status in ("playing", "finished") else None,
+            **({"house_seats": self.house_seats()} if self.house_keys is not None else {}),
+            **(
+                {
+                    "bots_on_request": True,
+                    "bot_requests": self.bot_requests,
+                    "bots_wanted": min(self.bots_wanted, self._open_count()),
+                }
+                if self.bots_on_request
+                else {}
+            ),
         }
 
     def hello_body(self, nonce: str) -> dict:
@@ -600,6 +619,35 @@ class Room:
         seat.address = address  # who seated it, for the per-address limit
         self._seats_changed()
         return seat
+
+    def house_seats(self) -> list:
+        keys = self.house_keys or set()
+        return [
+            s.index
+            for s in self.seats
+            if s.kind == "bot" or (s.kind == "remote" and s.public_key in keys)
+        ]
+
+    def _open_count(self) -> int:
+        return sum(1 for seat in self.seats if seat.kind == "open")
+
+    def want_bot(self) -> None:
+        """A person here asks the house for a bot in an open seat: the room
+        tells everyone (``bot_requests`` grows) and the house sends one."""
+        if not self.bots_on_request:
+            raise RoomError("bad_request", "this table takes no more bots")
+        if self.status != "waiting":
+            raise RoomError("game_started", "seats are fixed once every seat is taken")
+        if min(self.bots_wanted, self._open_count()) >= self._open_count():
+            raise RoomError("room_full", "every open seat has a bot coming")
+        self.bot_requests += 1
+        self.bots_wanted = min(self.bots_wanted, self._open_count()) + 1
+        self.last_seen = time.time()
+        self._broadcast_room()
+
+    def bot_arrived(self) -> None:
+        """A house seat joined: one request fewer to answer."""
+        self.bots_wanted = max(0, self.bots_wanted - 1)
 
     def _open_seat(self, index: Any) -> Seat:
         if index is None:

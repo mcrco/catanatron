@@ -277,12 +277,18 @@ async function refreshRooms() {
   $("#hidden-count").textContent = hidden && !showDone ? `(${hidden} hidden)` : "";
 }
 const isHouseRoom = (room) => Array.isArray(room.house_seats) && room.house_seats.length > 0;
-// A house room a person can sit in now: every seat but one held by the
-// house (and connected), the last one open.
+// A house room a person can sit in now: the house's seats connected, the
+// others open or held by people waiting there, at least one open.
 function readyRoom(room) {
-  return isHouseRoom(room) && room.status === "waiting" && room.house_seats.length === room.seats.length - 1 &&
-    room.seats.every((s, i) => (room.house_seats.includes(i) ? s.connected : s.kind === "open"));
+  if (!isHouseRoom(room) || room.status !== "waiting") return false;
+  const others = room.seats.filter((s, i) => !room.house_seats.includes(i));
+  return room.seats.every((s, i) => !room.house_seats.includes(i) || s.connected) &&
+    others.some((s) => s.kind === "open") && others.every((s) => s.kind === "open" || s.kind === "remote");
 }
+// People already sitting in a house room (not the house's seats).
+const peopleIn = (room) => room.seats.filter((s, i) => s.kind === "remote" && !room.house_seats.includes(i)).length;
+// The room to send a person to: one where people wait, so they play together.
+const bestRoom = (rooms) => rooms.filter(readyRoom).sort((a, b) => peopleIn(b) - peopleIn(a))[0];
 // The house's tables, by room name: what they play, who the bots are, how
 // many games are on, and a room to sit in if there is one.
 function tableKinds(rooms) {
@@ -290,13 +296,14 @@ function tableKinds(rooms) {
   for (const room of rooms) {
     if (!isHouseRoom(room)) continue;
     let kind = kinds.get(room.name);
-    if (!kind) kinds.set(room.name, (kind = { name: room.name, config: room.config, bots: [], playing: 0, open: null }));
+    if (!kind) kinds.set(room.name, (kind = { name: room.name, config: room.config, bots: [], playing: 0, open: null, onRequest: false }));
+    if (room.bots_on_request) kind.onRequest = true;
     for (const index of room.house_seats) {
       const name = room.seats[index] && room.seats[index].name;
       if (name && !kind.bots.includes(name)) kind.bots.push(name);
     }
     if (room.status === "playing" || room.status === "revealing") kind.playing++;
-    if (!kind.open && readyRoom(room)) kind.open = room;
+    if (readyRoom(room) && (!kind.open || peopleIn(room) > peopleIn(kind.open))) kind.open = room;
   }
   return [...kinds.values()].sort((a, b) => a.config.num_players - b.config.num_players);
 }
@@ -314,10 +321,12 @@ function renderTables(rooms) {
     entry.className = "entry";
     const n = Number(kind.config.num_players) || 0;
     const bots = kind.bots.join(", ");
-    const status = kind.open ? html`<span class="open">open</span>`
+    const waiting = kind.open ? peopleIn(kind.open) : 0;
+    const status = kind.open ? html`<span class="open">open</span>${waiting ? html` · ${waiting} waiting` : html``}`
       : html`busy${kind.playing ? html` · ${kind.playing} playing` : html``}`;
+    const versus = kind.onRequest ? html`vs ${bots}, more bots or players` : html`vs ${n - 1 > 1 ? html`${n - 1} × ` : html``}${bots}`;
     setHtml(entry, html`<div class="entry-header"><h3>${kind.name}</h3><span class="entry-meta">${status}<span class="sep">·</span></span></div>
-      <p class="muted">${rulesText(kind.config)} · vs ${n - 1 > 1 ? html`${n - 1} × ` : html``}${bots}</p>`);
+      <p class="muted">${rulesText(kind.config)} · ${versus}</p>`);
     const play = button("play", () => playTable(kind.name), "link");
     play.disabled = !kind.open;
     entry.querySelector(".entry-meta").append(play);
@@ -349,7 +358,7 @@ async function playTable(name) {
   saveName();
   let rooms = [];
   try { rooms = await (await fetch(apiUrl("/api/rooms"))).json(); } catch (error) { /* shown below */ }
-  const room = rooms.find((r) => r.name === name && readyRoom(r));
+  const room = bestRoom(rooms.filter((r) => r.name === name));
   if (!room) {
     lobbyNotice = `${name} is busy. A table opens when a game ends.`;
     if (location.hash) location.hash = ""; else showLobby();
@@ -1009,6 +1018,12 @@ class Session {
     this.send({ type: "seat_bot", seat: index, spec });
   }
 
+  // At a house table that takes them: ask the house for a bot in an open seat.
+  addBot() {
+    if (!this.seated || this.game) return;
+    this.send({ type: "add_bot" });
+  }
+
   async act(action) {
     if (!this.pending || this.answered || this.ended || this.halted) return;
     // Only under the commitments this page revealed for.
@@ -1217,13 +1232,17 @@ function renderSeating() {
     addHtml(box, html`<label>Name <input id="my-name" maxlength="32" placeholder="Guest" value="${storedName()}"></label>`);
     $("#my-name").onchange = (e) => localStorage.setItem("catanatron-name", e.target.value);
   }
+  // Bots asked for take the first open seats.
+  let coming = room.bots_wanted || 0;
   for (const seat of room.seats) {
     const row = document.createElement("div");
     row.className = "seat-row";
     const mine = session.seated && session.saved.seat === seat.seat;
+    const houseSeat = Array.isArray(room.house_seats) ? room.house_seats.includes(seat.seat) : house;
     const away = seat.kind === "remote" && !seat.connected ? html` <span class="muted">(away)</span>` : html``;
-    const who = seat.kind === "open" ? html`<span class="muted">open</span>`
-      : html`<b>${seat.name}</b>${mine ? html` <span class="muted">(you)</span>` : seat.kind === "bot" || house ? html` <span class="tag">bot</span>` : html``}${away}`;
+    const botComing = seat.kind === "open" && coming-- > 0;
+    const who = seat.kind === "open" ? html`<span class="muted">${botComing ? "bot joining…" : "open"}</span>`
+      : html`<b>${seat.name}</b>${mine ? html` <span class="muted">(you)</span>` : seat.kind === "bot" || houseSeat ? html` <span class="tag">bot</span>` : html``}${away}`;
     setHtml(row, html`<span class="swatch" style="background:${swatch(seat.color)}"></span><span class="grow">${who}</span>`);
     if (seat.kind === "open" && room.status === "waiting") {
       if (canSit) row.append(button("Sit here", () => session.takeSeat(seat.seat), "primary"));
@@ -1243,7 +1262,11 @@ function renderSeating() {
   else if (session.commitments) status = html`<p><span class="spinner"></span>Starting…</p>`;
   else if (session.seated) status = html`<p><span class="spinner"></span>Waiting for the other seats…</p>`;
   else if (session.spectating) status = html`<p class="muted">Watching.</p>`;
+  const open = room.seats.filter((seat) => seat.kind === "open").length;
+  const canAdd = house && room.bots_on_request && session.seated && !session.commitments && room.status === "waiting" &&
+    (room.bots_wanted || 0) < open;
   addHtml(box, status);
+  if (canAdd) box.append(button("Add bot", () => session.addBot(), "primary"));
   for (const problem of session.problems.slice(-1)) addHtml(box, html`<p class="error">${problem}</p>`);
   const foot = document.createElement("div");
   foot.className = "foot";

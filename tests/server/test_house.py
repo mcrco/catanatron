@@ -1,8 +1,8 @@
 """House mode: the server is a place to play its operator's bots.
 
-Only connections showing the house token open rooms and seat bots, a room
-takes at most one seat from anyone else, and a game its person has left for
-good is void.
+Only connections showing the house token open rooms and seat bots, people
+take the seats the house leaves open (and, where the house allows it, ask it
+for bots), and a game its person has left for good is void.
 """
 
 import asyncio
@@ -55,7 +55,7 @@ def test_a_server_without_a_token_is_not_in_house_mode():
     assert run(scenario())["house"] is False
 
 
-def test_a_house_room_takes_one_person_and_no_bots_from_people(house_env):
+def test_a_house_room_takes_people_in_its_open_seats_and_no_bots_from_them(house_env):
     async def scenario():
         async with serving(house_token=TOKEN) as (server, base):
             room = await create_room(base, {"num_players": 4}, [None] * 4)
@@ -73,7 +73,7 @@ def test_a_house_room_takes_one_person_and_no_bots_from_people(house_env):
             request, _, _ = join_request(hello)
             await ws.send(json.dumps(request))
             joined = await next_body(ws, "joined", "error")
-            # ...and a second person is turned away.
+            # ...and a second person takes another.
             other, hello = await raw_connect(url)
             request, _, _ = join_request(hello)
             await other.send(json.dumps(request))
@@ -86,8 +86,67 @@ def test_a_house_room_takes_one_person_and_no_bots_from_people(house_env):
     refused_bot, joined, second, listed = run(scenario())
     assert refused_bot["code"] == "bad_bot"
     assert joined["type"] == "joined"
-    assert (second["type"], second["code"]) == ("error", "room_full")
+    assert second["type"] == "joined" and second["seat"] != joined["seat"]
     assert listed[0]["house_seats"] == [0]
+    assert "bots_on_request" not in listed[0]
+
+
+async def _room_body(ws, timeout=10):
+    return (await next_body(ws, "room", timeout=timeout))["room"]
+
+
+def test_people_ask_the_house_for_bots_where_it_allows_them(house_env):
+    async def scenario():
+        async with serving(house_token=TOKEN) as (server, base):
+            room = await create_room(base, {"num_players": 4}, [None] * 4, bots_on_request=True)
+            plain = await create_room(base, {"num_players": 3}, [None] * 3)
+            url = f"{base}/room/{room['id']}"
+            house_ws, hello = await raw_connect(url, {"X-Catanatron-House": TOKEN})
+            request, _, _ = join_request(hello)
+            await house_ws.send(json.dumps(request))
+            await next_body(house_ws, "joined")
+            # The house asks for nothing; a person not seated asks for nothing.
+            await house_ws.send(json.dumps({"type": "add_bot"}))
+            by_house = await next_body(house_ws, "error")
+            ws, hello = await raw_connect(url)
+            await ws.send(json.dumps({"type": "add_bot"}))
+            unseated = await next_body(ws, "error")
+            request, _, _ = join_request(hello)
+            await ws.send(json.dumps(request))
+            await next_body(ws, "joined")
+            # Two open seats: two requests, then no more.
+            for _ in range(3):
+                await ws.send(json.dumps({"type": "add_bot"}))
+            seen = await _room_body(house_ws)
+            while seen["bot_requests"] < 2:  # the person's join, then the requests (maybe one push)
+                seen = await _room_body(house_ws)
+            third = await next_body(ws, "error")
+            # A house seat answers one.
+            bot_ws, hello = await raw_connect(url, {"X-Catanatron-House": TOKEN})
+            request, _, _ = join_request(hello)
+            await bot_ws.send(json.dumps(request))
+            await next_body(bot_ws, "joined")
+            answered = await _room_body(house_ws)
+            listed = await asyncio.to_thread(_get, base, f"/api/rooms/{room['id']}")
+            # A room opened without bots_on_request takes no requests.
+            purl = f"{base}/room/{plain['id']}"
+            pws, hello = await raw_connect(purl)
+            request, _, _ = join_request(hello)
+            await pws.send(json.dumps(request))
+            await next_body(pws, "joined")
+            await pws.send(json.dumps({"type": "add_bot"}))
+            refused = await next_body(pws, "error")
+            for socket in (house_ws, ws, bot_ws, pws):
+                await socket.close()
+            return by_house, unseated, seen, third, answered, listed, refused
+
+    by_house, unseated, seen, third, answered, listed, refused = run(scenario())
+    assert by_house["code"] == unseated["code"] == "bad_request"
+    assert (seen["bot_requests"], seen["bots_wanted"]) == (2, 2)
+    assert third["code"] == "room_full"
+    assert (answered["bot_requests"], answered["bots_wanted"]) == (2, 1)
+    assert listed["bots_on_request"] is True and listed["house_seats"] == [0, 2]
+    assert refused["code"] == "bad_request"
 
 
 def test_a_game_its_person_left_is_void(house_env, monkeypatch):
