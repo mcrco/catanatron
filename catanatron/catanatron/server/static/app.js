@@ -2232,7 +2232,7 @@ function renderReplayMove() {
     if (move) {
       const grade = GRADES[move.g] || { mark: "", label: move.g };
       const loss = move.b - move.p;
-      rows[2] = html`<span class="grade grade-${move.g}">${grade.mark ? html`<b>${grade.mark}</b> ` : html``}${grade.label}</span>${loss > 0 ? html` <span class="muted">(−${(loss / 10).toFixed(1)} pts of win chance)</span>` : html``}`;
+      rows[2] = html`<span class="grade grade-${move.g}">${grade.mark ? html`<b>${grade.mark}</b> ` : html``}${grade.label}</span>${loss > 0 ? html` <span class="muted">(−${(loss / 10).toFixed(1)} pts of win chance)</span>` : html``}${move.d ? html` <span class="muted">· checked with ${move.d} sims</span>` : html``}`;
       rows[3] = move.g !== "best" ? html`best: ${actionLabel(move.a)} · ${pct(move.b)} to win, played ${pct(move.p)}`
         : html`${pct(move.p)} to win · ${move.n} options`;
     } else if (r.analysis) {
@@ -2373,7 +2373,7 @@ function renderReview() {
   });
   const table = document.createElement("table");
   table.className = "review-table";
-  setHtml(table, html`<tr><th></th><th>accuracy</th><th>?! ? ??</th></tr>${rows}`);
+  setHtml(table, html`<tr><th></th><th title="each move weighted by how much its choice mattered: free choices and decided positions count for little">accuracy</th><th>?! ? ??</th></tr>${rows}`);
   box.append(table);
 }
 
