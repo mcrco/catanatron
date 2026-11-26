@@ -2068,13 +2068,16 @@ async function refreshGames() {
   for (const game of games) {
     const item = document.createElement("li");
     const me = mine ? game.seats.find((s) => sameName(s.name, name)) : null;
-    const seats = game.seats.map((s) => html`<span class="seat${s.color === game.winner ? " won" : ""}"><span class="swatch" style="background:${swatch(s.color)}"></span>${s.name || s.color.toLowerCase()} ${s.points}</span>`);
+    const seats = game.seats.map((s) => html`<span class="seat${s.color === game.winner ? " won" : ""}${me && s.color === me.color ? " me" : ""}" title="${s.name || s.color.toLowerCase()}"><span class="swatch" style="background:${swatch(s.color)}"></span><span class="seat-name">${s.name || s.color.toLowerCase()}</span> <span class="pts">${s.points}</span></span>`);
     let result = html``;
-    if (me) result = !game.winner ? html`<span class="muted">unfinished</span>` : me.color === game.winner ? html`<span class="won">won</span>` : html`lost`;
+    if (!game.winner) result = html`<span class="muted">unfinished</span>`;
+    else if (me) result = me.color === game.winner ? html`<span class="won">won</span>` : html`<span>lost</span>`;
     const accuracy = me && game.analysis && game.analysis.accuracy && game.analysis.accuracy[me.color];
-    setHtml(item, html`<span class="when muted">${when(game.finished_at)}</span><span class="room-name">${game.name || "game"}</span>
-      <span class="grow">${seats}</span>${result}${accuracy !== undefined && accuracy !== null ? html`<span class="muted">accuracy ${accuracy}%</span>` : html``}`);
-    item.append(button("review", () => { location.hash = "game=" + game.game_id; }, "link"));
+    // Two columns: what the game was (room, when, seats) and what it was for this name.
+    setHtml(item, html`<div class="game-main"><div class="game-head"><span class="room-name">${game.name || "game"}</span> <span class="when muted">${when(game.finished_at)}</span></div>
+      <div class="game-seats">${seats}</div></div>
+      <div class="game-side">${result}${accuracy !== undefined && accuracy !== null ? html`<span class="muted">${accuracy}% acc.</span>` : html``}</div>`);
+    item.querySelector(".game-side").append(button("review", () => { location.hash = "game=" + game.game_id; }, "link"));
     list.append(item);
   }
   if (!list.children.length) list.innerHTML = `<li class="muted">${mine ? "no games under this name yet" : "none yet"}</li>`;

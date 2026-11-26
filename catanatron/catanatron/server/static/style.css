@@ -489,7 +489,19 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
 }
 
 /* ===== past games and their review ===== */
-.games .when { min-width: 11ch; }
+.live.games li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.15rem 1.25rem; align-items: start;
+  padding: 0.55rem 0; border-bottom: 1px solid var(--line); }
+.live.games li:last-child { border-bottom: 0; }
+.games .game-main { min-width: 0; display: grid; gap: 0.2rem; }
+.games .game-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.75rem; }
+.games .when { font-size: 0.85em; }
+.games .game-seats { display: flex; flex-wrap: wrap; gap: 0.1rem 1.1rem; color: var(--muted); }
+.games .seat { white-space: nowrap; display: inline-flex; align-items: baseline; max-width: 100%; }
+.games .seat-name { overflow: hidden; text-overflow: ellipsis; max-width: 18ch; }
+.games .seat .pts { margin-left: 0.35em; font-variant-numeric: tabular-nums; }
+.games .seat.me .seat-name { color: var(--text); }
+.games .game-side { display: grid; justify-items: end; gap: 0.1rem; text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums; }
 .games .seat.won, .won { color: var(--good); }
 #games-toggle { font-size: 0.8rem; text-transform: none; }
 .move-card { display: flex; flex-direction: column; gap: 2px; width: 100%; font-size: 0.85rem; }
