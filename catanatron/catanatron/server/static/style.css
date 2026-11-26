@@ -506,6 +506,8 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
 #games-toggle { font-size: 0.8rem; text-transform: none; }
 .move-card { display: flex; flex-direction: column; gap: 2px; width: 100%; font-size: 0.85rem; }
 .move-card .label { font-size: 0.8rem; color: var(--muted); }
+.move-card > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; height: 1.45em; line-height: 1.45em; }
+#me .move-card { min-width: 0; }
 .move-line .who { font-weight: 500; }
 .grade { font-weight: 500; }
 .grade-best { color: var(--good); }

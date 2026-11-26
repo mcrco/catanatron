@@ -2213,26 +2213,35 @@ function replayPromptText() {
 // The move just played (the log entry before this position), its grade and
 // what the search preferred.
 function renderReplayMove() {
+  // Always four single lines (move, action, grade, detail), so the bar keeps its
+  // height from move to move; a line too long for it ends in an ellipsis and
+  // shows in full on hover.
   const r = session, box = $("#me");
-  if (r.at === 0) { setHtml(box, html`<div class="move-card"><div class="label">Every hand is face up. Step with ← →.</div></div>`); return; }
-  const entry = r.data.log[r.at - 1];
-  let line = null;
-  try { line = logHtml(entry); } catch (error) { line = null; }
-  const move = r.moves[r.at - 1];
-  const parts = [html`<div class="label">move ${r.at}</div><div class="move-line">${line || html`${who(entry[0][0])}: ${actionLabel(entry[0]).toLowerCase()}`}</div>`];
-  if (move) {
-    const grade = GRADES[move.g] || { mark: "", label: move.g };
-    const loss = move.b - move.p;
-    parts.push(html`<div class="grade grade-${move.g}">${grade.mark ? html`<b>${grade.mark}</b> ` : html``}${grade.label}${loss > 0 ? html` <span class="muted">(−${(loss / 10).toFixed(1)} pts of win chance)</span>` : html``}</div>`);
-    if (move.g !== "best") {
-      parts.push(html`<div class="muted">best: ${actionLabel(move.a)} · ${pct(move.b)} to win, played ${pct(move.p)}</div>`);
-    } else {
-      parts.push(html`<div class="muted">${pct(move.p)} to win · ${move.n} options</div>`);
+  const rows = ["", "", "", ""].map(() => html`&nbsp;`);
+  if (r.at === 0) {
+    rows[0] = html`start`;
+    rows[1] = html`Every hand is face up. Step with ← →.`;
+  } else {
+    const entry = r.data.log[r.at - 1];
+    let line = null;
+    try { line = logHtml(entry); } catch (error) { line = null; }
+    rows[0] = html`move ${r.at} of ${r.length}`;
+    rows[1] = line || html`${who(entry[0][0])}: ${actionLabel(entry[0]).toLowerCase()}`;
+    const move = r.moves[r.at - 1];
+    if (move) {
+      const grade = GRADES[move.g] || { mark: "", label: move.g };
+      const loss = move.b - move.p;
+      rows[2] = html`<span class="grade grade-${move.g}">${grade.mark ? html`<b>${grade.mark}</b> ` : html``}${grade.label}</span>${loss > 0 ? html` <span class="muted">(−${(loss / 10).toFixed(1)} pts of win chance)</span>` : html``}`;
+      rows[3] = move.g !== "best" ? html`best: ${actionLabel(move.a)} · ${pct(move.b)} to win, played ${pct(move.p)}`
+        : html`${pct(move.p)} to win · ${move.n} options`;
+    } else if (r.analysis) {
+      rows[2] = html`<span class="muted">not graded</span>`;
+      rows[3] = html`forced, or a trade`;
     }
-  } else if (r.analysis) {
-    parts.push(html`<div class="muted">not graded (forced, or a trade)</div>`);
   }
-  setHtml(box, html`<div class="move-card">${parts}</div>`);
+  const classes = ["label", "move-line", "grade-line", "muted"];
+  setHtml(box, html`<div class="move-card">${rows.map((row, i) => html`<div class="${classes[i]}">${row}</div>`)}</div>`);
+  for (const line of box.querySelectorAll(".move-card > div")) line.title = line.textContent.trim();
 }
 function renderReplayControls() {
   const r = session, box = $("#actions");
