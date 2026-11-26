@@ -349,6 +349,7 @@ class GameStore:
             "winner": row["winner"],
             "actions": row["actions"],
             "turns": row["turns"],
+            "people": row["people"],
             "analysis": analysis,
         }
 

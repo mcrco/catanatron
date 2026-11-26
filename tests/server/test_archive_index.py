@@ -66,6 +66,8 @@ def test_a_finished_game_is_listed_under_its_players_names_and_replays(tmp_path)
     assert names["Ada"] == "person" and names["F"] == "bot"
     assert game["winner"] in {s["color"] for s in game["seats"]}
     assert replay == plain and missing == 404
+    # The page asks for a review only of games the house reviews (people played them).
+    assert game["people"] == replay["game"]["people"] == 1
     assert len(replay["frames"]) == len(replay["log"]) + 1 == game["actions"] + 1
     end = replay["frames"][-1]
     winner = end["colors"].index(game["winner"])
