@@ -1150,6 +1150,7 @@ function render() {
   if (!session) return;
   $("#fairness-box").hidden = Boolean(session.replay);
   $("#review").hidden = !session.replay;
+  $("#actions").classList.toggle("replay-controls", Boolean(session.replay));
   if (session.replay) { renderReplay(); return; }
   renderSeating();
   maybeSit();
@@ -2244,17 +2245,32 @@ function renderReplayMove() {
   for (const line of box.querySelectorAll(".move-card > div")) line.title = line.textContent.trim();
 }
 function renderReplayControls() {
+  // Built once per replay and then only updated: rebuilding the bar on every
+  // step would drop the slider out from under a drag.
   const r = session, box = $("#actions");
-  box.innerHTML = "";
-  box.append(button("|<", () => { r.seek(0); render(); }, "act nav"));
-  box.append(button("<", () => r.step(-1), "act nav"));
-  box.append(button(r.timer ? "pause" : "play", () => r.play(), "act go nav"));
-  box.append(button(">", () => r.step(1), "act nav"));
-  box.append(button(">|", () => { r.seek(r.length); render(); }, "act nav"));
-  const slider = document.createElement("input");
-  Object.assign(slider, { type: "range", min: 0, max: r.length, value: r.at, className: "scrub" });
-  slider.oninput = () => { r.seek(Number(slider.value)); render(); };
-  box.append(slider);
+  let slider = box.querySelector("input.scrub");
+  if (!slider || box.dataset.replay !== r.id) {
+    box.innerHTML = "";
+    box.dataset.replay = r.id;
+    box.append(button("|<", () => { r.seek(0); render(); }, "act nav"));
+    box.append(button("<", () => r.step(-1), "act nav"));
+    box.append(button("play", () => r.play(), "act go nav play"));
+    box.append(button(">", () => r.step(1), "act nav"));
+    box.append(button(">|", () => { r.seek(r.length); render(); }, "act nav"));
+    slider = document.createElement("input");
+    Object.assign(slider, { type: "range", min: 0, step: 1, className: "scrub", id: "replay-scrub" });
+    slider.setAttribute("aria-label", "move");
+    slider.oninput = () => {
+      if (session !== r) return;
+      if (r.timer) r.play();  // dragging stops the playback
+      r.seek(Number(slider.value));
+      render();
+    };
+    box.append(slider);
+  }
+  slider.max = String(r.length);
+  if (Number(slider.value) !== r.at) slider.value = String(r.at);
+  box.querySelector("button.play").textContent = r.timer ? "pause" : "play";
 }
 function replayKey(event) {
   const r = session;

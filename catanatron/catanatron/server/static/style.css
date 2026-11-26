@@ -507,7 +507,8 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
 .move-card { display: flex; flex-direction: column; gap: 2px; width: 100%; font-size: 0.85rem; }
 .move-card .label { font-size: 0.8rem; color: var(--muted); }
 .move-card > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; height: 1.45em; line-height: 1.45em; }
-#me .move-card { min-width: 0; }
+/* The card takes its width from the bar, never from its text (long lines end in an ellipsis). */
+#me .move-card { min-width: 0; contain: inline-size; }
 .move-line .who { font-weight: 500; }
 .grade { font-weight: 500; }
 .grade-best { color: var(--good); }
@@ -533,3 +534,6 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
 #log li.clickable { cursor: pointer; }
 #log li.here { background: var(--soft); }
 #actions button.nav { flex: 1 1 0; min-width: 0; }
+/* A replay's controls keep one width whatever the play button says (the box would size to its labels). */
+#actions.replay-controls { flex: 0 1 26rem; min-width: 0; }
+#actions.replay-controls button.nav { padding-left: 0; padding-right: 0; }
