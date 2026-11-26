@@ -36,6 +36,7 @@ import ipaddress
 import json
 import logging
 import os
+import gzip
 import secrets
 import signal
 import sys
@@ -44,6 +45,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Optional, Sequence
+from urllib.parse import parse_qs
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
@@ -53,6 +55,7 @@ from websockets.http11 import Request, Response
 from catanatron.registry import REGISTRY, describe
 from catanatron.server.config import ConfigError, GameConfig
 from catanatron.server.crypto import SigningKey
+from catanatron.server.games import GameStore, stamp
 from catanatron.server.hashing import MAX_SAFE_INTEGER
 from catanatron.server.messages import PROTOCOL_VERSION
 from catanatron.server.room import Outbox, Peer, Room, RoomError, RoomLimits
@@ -194,6 +197,13 @@ class GameServer:
         self.house_token = house_token or None
         self.house_keys: dict = defaultdict(set)
         self.away_since: dict = {}
+        #: The index of the archive (games by name, replays, analyses).
+        self.games: Optional[GameStore] = None
+        if archive_dir:
+            try:
+                self.games = GameStore(archive_dir)
+            except Exception:  # the games stay archived; only the index is missing
+                logger.exception("the archive at %s cannot be indexed", archive_dir)
 
     @property
     def house(self) -> bool:
@@ -402,9 +412,15 @@ class GameServer:
             "commitments": room.state_commitments,
             "final_state": room.doc,
         }
-        path = os.path.join(self.archive_dir, f"{room.id}-{room.game_id}.json")
+        name = f"{room.id}-{room.game_id}.json"
+        path = os.path.join(self.archive_dir, name)
         with open(path, "w") as file:
-            json.dump(record, file)
+            json.dump(stamp(record), file)
+        if self.games is not None:
+            try:
+                self.games.add(record, name)
+            except Exception:
+                logger.exception("game %s could not be indexed", room.game_id)
 
     # ===== HTTP =====
     def process_request(self, connection: ServerConnection, request: Request):
@@ -432,6 +448,8 @@ class GameServer:
             return _json_response(self.describe_room(room))
         if path == "/api/players":
             return _json_response(_players())
+        if path == "/api/games" or path.startswith("/api/games/") or path == "/api/analysis/queue":
+            return self._games_request(path, request)
         if path == "/api/server":
             return _json_response(
                 {
@@ -439,8 +457,59 @@ class GameServer:
                     "protocol_version": PROTOCOL_VERSION,
                     "app_sha256": self.app_sha256,
                     "house": self.house,
+                    "games": self.games is not None,
                 }
             )
+        return _json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def _games_request(self, path: str, request: Request) -> Response:
+        """The archive's index (see catanatron.server.games): /api/games
+        (?player=NAME, &before=T, &limit=N), /api/games/ID (the replay,
+        gzipped), and for the house /api/games/ID/record and
+        /api/analysis/queue."""
+        store = self.games
+        if store is None:
+            return _json_response({"error": "this server keeps no games"}, HTTPStatus.NOT_FOUND)
+        query = parse_qs(request.path.split("?", 1)[1]) if "?" in request.path else {}
+        house = self.house_token is not None and hmac.compare_digest(
+            request.headers.get("X-Catanatron-House", "").encode(), self.house_token.encode()
+        )
+        try:
+            if path == "/api/games":
+                before = query.get("before", [None])[0]
+                games = store.games(
+                    query.get("player", [None])[0],
+                    limit=int(query.get("limit", ["50"])[0]),
+                    before=float(before) if before is not None else None,
+                )
+                return _json_response({"games": games})
+            if path == "/api/analysis/queue":
+                if not house:
+                    return _json_response({"error": "for the house only"}, HTTPStatus.FORBIDDEN)
+                return _json_response({"games": store.queue()})
+            rest = path[len("/api/games/") :].split("/")
+            if len(rest) == 2 and rest[1] == "record":
+                if not house:
+                    return _json_response({"error": "for the house only"}, HTTPStatus.FORBIDDEN)
+                record = store.record(rest[0])
+                if record is None:
+                    return _json_response({"error": "no such game"}, HTTPStatus.NOT_FOUND)
+                return _json_response(record)
+            if len(rest) == 1:
+                body = store.replay(rest[0])
+                if body is None:
+                    return _json_response({"error": "no such game"}, HTTPStatus.NOT_FOUND)
+                if "gzip" in request.headers.get("Accept-Encoding", ""):
+                    response = _response(HTTPStatus.OK, body, "application/json")
+                    response.headers["Content-Encoding"] = "gzip"
+                    response.headers["Vary"] = "Accept-Encoding"
+                    return response
+                return _response(HTTPStatus.OK, gzip.decompress(body), "application/json")
+        except ValueError as error:
+            return _json_response({"error": str(error)[:200]}, HTTPStatus.BAD_REQUEST)
+        except Exception:
+            logger.exception("games request %s failed", path)
+            return _json_response({"error": "the server failed"}, HTTPStatus.INTERNAL_SERVER_ERROR)
         return _json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     # ===== WebSocket =====
@@ -530,6 +599,13 @@ class GameServer:
                     }
                 elif kind == "players":
                     reply = {"type": "players", "players": _players()}
+                elif kind == "submit_analysis":
+                    if not house or self.games is None:
+                        raise TooMuch("analyses come from the house")
+                    self.games.submit(
+                        request.get("game_id"), request.get("analysis"), request.get("error")
+                    )
+                    reply = {"type": "analysis_stored", "game_id": request.get("game_id")}
                 else:
                     reply = {"type": "error", "message": "unknown request type"}
             except (ValueError, AttributeError, RoomError, TooMuch) as error:

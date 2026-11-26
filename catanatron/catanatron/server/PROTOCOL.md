@@ -84,6 +84,16 @@ turn order, deck and every roll come from it, in stock Catanatron. `C` names
 the room, the server's key, the rules, every seat with its key, fresh seed
 commitment and join, and the server's seed commitment.
 
+**Finished games** (servers run with `--archive`; outside the signed
+protocol, see `games.py`). `GET /api/games` lists the games people played,
+newest first (`?player=NAME`: the games a seat sat in under that name, case
+and spacing folded; `&before=T`, `&limit=N`); `GET /api/games/ID` is a
+game's replay (every hand face up: the game's reveal made everything public)
+with its analysis, if any. The house reads `GET /api/analysis/queue` and
+`GET /api/games/ID/record` (the archive record) and sends an analysis on the
+lobby as `submit_analysis {game_id, analysis}` (or `{game_id, error}`), with
+the house token; an analysis is integers and strings only, like every request.
+
 ## 2. A room's state machine
 
 ```

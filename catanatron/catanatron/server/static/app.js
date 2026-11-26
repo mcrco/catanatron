@@ -231,6 +231,7 @@ async function showLobby() {
   $("#lobby-notice").textContent = lobbyNotice;
   lobbyNotice = "";
   $("#lobby-name").value = storedName();
+  refreshGames();
   await refreshRooms();
   if (!house) {
     if (!players.length) players = await (await fetch(apiUrl("/api/players"))).json();
@@ -1147,6 +1148,9 @@ async function openRoom(roomId) {
 // ===== rendering =====
 function render() {
   if (!session) return;
+  $("#fairness-box").hidden = Boolean(session.replay);
+  $("#review").hidden = !session.replay;
+  if (session.replay) { renderReplay(); return; }
   renderSeating();
   maybeSit();
   loadHouseSeats();
@@ -1190,7 +1194,7 @@ function seatName(color) {
   return twins ? `${name} (${String(color).toLowerCase()})` : name;
 }
 function nameOf(color) {
-  if (session.game && color === session.game.color) return "You";
+  if (session.game && color === session.game.color && !session.replay) return "You";
   return seatName(color);
 }
 function avatarHtml(seat, color) {
@@ -1438,6 +1442,7 @@ function renderBoard() {
     spot.onclick = () => { ui.build = null; session.act(action); };
     board.append(spot);
   }
+  if (session.replay) drawReplayHint(board, positions);
   $("#prompt").textContent = promptText();
 }
 // A road's ends, pulled in from the nodes (so roads stop short of buildings).
@@ -1488,6 +1493,7 @@ function myPromptText() {
   }
 }
 function promptText() {
+  if (session.replay) return replayPromptText();
   if (session.aborted) return `Void: ${session.aborted.reason}`;
   const game = session.game;
   if (game.over) {
@@ -1527,7 +1533,7 @@ function ps(color, key) { return session.game.state.player_state[`P${seatIndex(c
 function vpOf(color) {
   const game = session.game;
   const actual = ps(color, "ACTUAL_VICTORY_POINTS");
-  return (color === game.color || game.over) && actual !== undefined && actual !== null ? actual : ps(color, "VICTORY_POINTS");
+  return (color === game.color || game.over || session.replay) && actual !== undefined && actual !== null ? actual : ps(color, "VICTORY_POINTS");
 }
 // The same, as shown: a winner whose victory point cards stay hidden has at
 // least the points to win.
@@ -1662,6 +1668,7 @@ function renderPlayers() {
       <div class="who"><span>${seatName(color)}</span>${mine ? html`<span class="tag">you</span>` : botTag(seat)}</div>
       <div class="vp">${vpText(color)}<small>pts</small></div>
       <div class="stats"><span>${resources} cards</span><span>${devs} dev</span><span>${ps(color, "PLAYED_KNIGHT")} knights</span><span>road ${ps(color, "LONGEST_ROAD_LENGTH")}</span></div>
+      ${session.replay ? replayHandHtml(color) : html``}
       ${badges.length ? html`<div class="badges">${badges}</div>` : html``}`);
     box.append(row);
   }
@@ -1728,9 +1735,10 @@ function renderLog() {
     if (!line) continue;
     const item = document.createElement("li");
     setHtml(item, line);
+    if (session.replay) decorateLogItem(item, i);
     list.append(item);
   }
-  if (stick) list.scrollTop = list.scrollHeight;
+  if (stick || session.replay) list.scrollTop = list.scrollHeight;
 }
 
 function renderFairness() {
@@ -1895,6 +1903,9 @@ function renderModal() {
       }
       const name = s.room && s.room.name;
       if (serverInfo.house && name) foot.append(button("Play again", () => { ui.retries = 0; playTable(name); }, "primary"));
+      if (game && game.gameId && ui.modal.kind === "over" && serverInfo.games) {
+        foot.append(button("Review", () => { location.hash = "game=" + game.gameId; }));
+      }
       foot.append(button("Board", closeModal));
       foot.append(button("Lobby", () => { location.hash = ""; }));
       break;
@@ -2019,10 +2030,332 @@ function renderAsciiBoard() {
 }
 
 // ===== routing =====
+// ===== past games and their review =====
+// The server keeps every finished game (GET /api/games, by the names people
+// sat under) and replays it with every hand face up; the house analyzes the
+// games people played (each decision searched by a network from the mover's
+// seat: every seat's chance to win, the move's grade, the search's choice).
+const GRADES = {
+  best: { mark: "", label: "best" }, excellent: { mark: "", label: "excellent" }, good: { mark: "", label: "good" },
+  inaccuracy: { mark: "?!", label: "inaccuracy" }, mistake: { mark: "?", label: "mistake" }, blunder: { mark: "??", label: "blunder" },
+};
+const sameName = (a, b) => String(a || "").trim().replace(/\s+/g, " ").toLowerCase() === String(b || "").trim().replace(/\s+/g, " ").toLowerCase();
+function when(seconds) {
+  const d = new Date(seconds * 1000);
+  return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
+}
+const pct = (pm) => `${(pm / 10).toFixed(1)}%`;
+
+async function refreshGames() {
+  const panel = $("#games-panel");
+  if (!serverInfo.games) { panel.hidden = true; return; }
+  panel.hidden = false;
+  const name = $("#lobby-name").value.trim();
+  const mine = Boolean(name) && !ui.allGames;
+  $("#games-title").textContent = mine ? `games as ${name}` : "recent games";
+  $("#games-toggle").textContent = mine ? "everyone's" : (name ? `only ${name}'s` : "");
+  $("#games-toggle").hidden = !name;
+  const list = $("#games");
+  let games = [];
+  try {
+    const query = mine ? `?player=${encodeURIComponent(name)}&limit=50` : "?limit=20";
+    games = (await (await fetch(apiUrl("/api/games" + query))).json()).games || [];
+  } catch (error) {
+    list.innerHTML = '<li class="muted">unavailable</li>';
+    return;
+  }
+  list.innerHTML = "";
+  for (const game of games) {
+    const item = document.createElement("li");
+    const me = mine ? game.seats.find((s) => sameName(s.name, name)) : null;
+    const seats = game.seats.map((s) => html`<span class="seat${s.color === game.winner ? " won" : ""}"><span class="swatch" style="background:${swatch(s.color)}"></span>${s.name || s.color.toLowerCase()} ${s.points}</span>`);
+    let result = html``;
+    if (me) result = !game.winner ? html`<span class="muted">unfinished</span>` : me.color === game.winner ? html`<span class="won">won</span>` : html`lost`;
+    const accuracy = me && game.analysis && game.analysis.accuracy && game.analysis.accuracy[me.color];
+    setHtml(item, html`<span class="when muted">${when(game.finished_at)}</span><span class="room-name">${game.name || "game"}</span>
+      <span class="grow">${seats}</span>${result}${accuracy !== undefined && accuracy !== null ? html`<span class="muted">accuracy ${accuracy}%</span>` : html``}`);
+    item.append(button("review", () => { location.hash = "game=" + game.game_id; }, "link"));
+    list.append(item);
+  }
+  if (!list.children.length) list.innerHTML = `<li class="muted">${mine ? "no games under this name yet" : "none yet"}</li>`;
+}
+
+// A replay stands in for the live session: the render functions read the
+// same fields (game.state, game.log, game.seats...), and nothing is pending.
+class Replay {
+  constructor(id, data, at) {
+    Object.assign(this, {
+      replay: true, id, data, room: null, roomId: null, pending: null, answered: false, problems: [], unverified: 0,
+      messages: [], verifiedCount: 0, aborted: null, seated: false, spectating: true, saved: null, timer: null,
+    });
+    const summary = data.game;
+    this.game = {
+      gameId: id, color: null, config: summary.config, board: data.board, log: [], over: false,
+      seats: summary.seats.map((s) => ({ ...s, kind: s.kind === "person" ? "remote" : "bot" })),
+    };
+    this.setAnalysis(data.analysis || null);
+    this.seek(at === null || at === undefined || Number.isNaN(at) ? 0 : at);
+    this.waits = 0;
+    if (!this.analysis && this.reviewed()) this.watch();
+  }
+  // Whether the house reviews this game: people played it, for 20 actions or more.
+  reviewed() { return (this.data.game.people || 0) > 0 && (this.data.game.actions || 0) >= 20; }
+  setAnalysis(analysis) {
+    this.analysis = analysis;
+    this.moves = {};
+    for (const move of (analysis && analysis.moves) || []) this.moves[move.i] = move;
+    this.evals = ((analysis && analysis.evals) || []).slice().sort((a, b) => a[0] - b[0]);
+  }
+  // A game without its review yet: ask again every 30 s for ten minutes (the house
+  // reviews a game a minute or two after it ends).
+  watch() {
+    if (this.waits >= 20) return;
+    this.poll = setTimeout(async () => {
+      this.poll = null;
+      if (session !== this) return;
+      this.waits += 1;
+      try {
+        const data = await (await fetch(apiUrl("/api/games/" + this.id))).json();
+        if (session === this && data.analysis) { this.setAnalysis(data.analysis); render(); return; }
+      } catch (error) { /* try again */ }
+      if (session === this) this.watch();
+    }, 30000);
+  }
+  get length() { return this.data.log.length; }
+  seek(position) {
+    const p = Math.max(0, Math.min(this.length, Math.round(position)));
+    const state = this.data.frames[p];
+    Object.assign(this.game, {
+      state, log: this.data.log.slice(0, p), index: p, current: state.colors[state.current_player_index],
+      over: p === this.length, winner: p === this.length ? this.data.game.winner : null,
+    });
+    this.at = p;
+    try { history.replaceState(null, "", `#game=${this.id}&at=${p}`); } catch (error) { /* cosmetic */ }
+  }
+  step(delta) { this.seek(this.at + delta); render(); }
+  // Every seat's chance (per mille, the frames' seat order) at a position:
+  // the next searched decision's, from the state it was searched in.
+  evalAt(p) {
+    const colors = this.data.frames[0].colors;
+    if (p >= this.length && this.data.game.winner) return colors.map((c) => (c === this.data.game.winner ? 1000 : 0));
+    for (const [index, values] of this.evals) if (index >= p) return values;
+    return this.evals.length ? this.evals[this.evals.length - 1][1] : null;
+  }
+  play() {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; render(); return; }
+    if (this.at >= this.length) this.seek(0);
+    this.timer = setInterval(() => {
+      if (!session || session !== this || this.at >= this.length) { clearInterval(this.timer); this.timer = null; }
+      else this.seek(this.at + 1);
+      render();
+    }, 450);
+    render();
+  }
+  close() {
+    if (this.timer) clearInterval(this.timer);
+    if (this.poll) clearTimeout(this.poll);
+    this.timer = null; this.poll = null;
+  }
+}
+
+async function openReplay(gameId, at) {
+  $("#lobby").hidden = true;
+  $("#room").hidden = false;
+  $("#topbar").hidden = false;
+  closeModal();
+  Object.assign(ui, { build: null, sitTried: false, seenEnd: true, houseSeats: [], houseRoom: null, autoSit: false });
+  if (session && session.replay && session.id === gameId) {
+    if (at !== null && at !== session.at) { session.seek(at); render(); }
+    return;
+  }
+  if (session) session.close();
+  session = null;
+  $("#room-title").textContent = "loading…";
+  let data;
+  try {
+    data = await (await fetch(apiUrl("/api/games/" + gameId))).json();
+  } catch (error) {
+    data = { error: "the game could not be loaded" };
+  }
+  if (data.error || !Array.isArray(data.frames)) {
+    lobbyNotice = data.error || "the game could not be loaded";
+    location.hash = "";
+    return;
+  }
+  session = new Replay(gameId, data, at);
+  $("#room-title").textContent = `${data.game.name || "game"} · ${when(data.game.finished_at)} · review`;
+  render();
+}
+
+function renderReplay() {
+  $("#seating").innerHTML = "";
+  $("#timer").className = "";
+  renderBoard();
+  renderReplayMove();
+  renderReplayControls();
+  renderPlayers();
+  renderBank();
+  renderLog();
+  renderDice();
+  renderReview();
+  $("#modal").hidden = true;
+}
+function replayPromptText() {
+  const r = session;
+  if (r.at === 0) return "Start of the game";
+  if (r.game.over) return r.game.winner ? `${seatName(r.game.winner)} wins` : "Game over";
+  return `Move ${r.at} of ${r.length}`;
+}
+
+// The move just played (the log entry before this position), its grade and
+// what the search preferred.
+function renderReplayMove() {
+  const r = session, box = $("#me");
+  if (r.at === 0) { setHtml(box, html`<div class="move-card"><div class="label">Every hand is face up. Step with ← →.</div></div>`); return; }
+  const entry = r.data.log[r.at - 1];
+  let line = null;
+  try { line = logHtml(entry); } catch (error) { line = null; }
+  const move = r.moves[r.at - 1];
+  const parts = [html`<div class="label">move ${r.at}</div><div class="move-line">${line || html`${who(entry[0][0])}: ${actionLabel(entry[0]).toLowerCase()}`}</div>`];
+  if (move) {
+    const grade = GRADES[move.g] || { mark: "", label: move.g };
+    const loss = move.b - move.p;
+    parts.push(html`<div class="grade grade-${move.g}">${grade.mark ? html`<b>${grade.mark}</b> ` : html``}${grade.label}${loss > 0 ? html` <span class="muted">(−${(loss / 10).toFixed(1)} pts of win chance)</span>` : html``}</div>`);
+    if (move.g !== "best") {
+      parts.push(html`<div class="muted">best: ${actionLabel(move.a)} · ${pct(move.b)} to win, played ${pct(move.p)}</div>`);
+    } else {
+      parts.push(html`<div class="muted">${pct(move.p)} to win · ${move.n} options</div>`);
+    }
+  } else if (r.analysis) {
+    parts.push(html`<div class="muted">not graded (forced, or a trade)</div>`);
+  }
+  setHtml(box, html`<div class="move-card">${parts}</div>`);
+}
+function renderReplayControls() {
+  const r = session, box = $("#actions");
+  box.innerHTML = "";
+  box.append(button("|<", () => { r.seek(0); render(); }, "act nav"));
+  box.append(button("<", () => r.step(-1), "act nav"));
+  box.append(button(r.timer ? "pause" : "play", () => r.play(), "act go nav"));
+  box.append(button(">", () => r.step(1), "act nav"));
+  box.append(button(">|", () => { r.seek(r.length); render(); }, "act nav"));
+  const slider = document.createElement("input");
+  Object.assign(slider, { type: "range", min: 0, max: r.length, value: r.at, className: "scrub" });
+  slider.oninput = () => { r.seek(Number(slider.value)); render(); };
+  box.append(slider);
+}
+function replayKey(event) {
+  const r = session;
+  const moves = { ArrowLeft: -1, ArrowRight: 1, PageUp: -20, PageDown: 20 };
+  if (event.key in moves) r.step(moves[event.key]);
+  else if (event.key === "Home") { r.seek(0); render(); }
+  else if (event.key === "End") { r.seek(r.length); render(); }
+  else if (event.key === " ") r.play();
+  else return;
+  event.preventDefault();
+}
+function replayHandHtml(color) {
+  const cards = RESOURCES.map((r) => html`<span class="hand-count">${dot(r)}${ps(color, r + "_IN_HAND")}</span>`);
+  const devs = DEV_CARDS.map((c) => [c, ps(color, c + "_IN_HAND")]).filter(([, n]) => n > 0)
+    .map(([c, n]) => html`<span class="hand-count dev-count">${DEV_NAME[c]}${n > 1 ? ` ×${n}` : ""}</span>`);
+  const summary = session.analysis && session.analysis.summary;
+  const accuracy = summary && summary.accuracy && summary.accuracy[color];
+  return html`<div class="hand-line">${cards}${devs}${accuracy !== undefined && accuracy !== null ? html`<span class="accuracy">accuracy ${accuracy}%</span>` : html``}</div>`;
+}
+function decorateLogItem(item, index) {
+  const move = session.moves[index];
+  if (move && GRADES[move.g] && GRADES[move.g].mark) {
+    const mark = document.createElement("b");
+    mark.className = `grade grade-${move.g}`;
+    mark.textContent = " " + GRADES[move.g].mark;
+    item.append(mark);
+  }
+  if (index === session.at - 1) item.classList.add("here");
+  item.classList.add("clickable");
+  item.onclick = () => { session.seek(index + 1); render(); };
+}
+
+// The search's choice, where it differs from the move played and is on the board.
+function drawReplayHint(board, positions) {
+  const r = session;
+  const move = r.moves[r.at - 1];
+  const last = r.at > 0 ? r.data.log[r.at - 1][0] : null;
+  const mark = (action, color, dashed) => {
+    const [, type, value] = action;
+    const style = { fill: "none", stroke: color, "stroke-width": 3.5, opacity: 0.95, "pointer-events": "none" };
+    if (dashed) style["stroke-dasharray"] = "5 3";
+    if ((type === "BUILD_SETTLEMENT" || type === "BUILD_CITY") && positions[value]) {
+      const [x, y] = positions[value];
+      board.append(svg("circle", { cx: x, cy: y, r: 13, ...style }));
+    } else if (type === "BUILD_ROAD" && positions[value[0]] && positions[value[1]]) {
+      const [x1, y1, x2, y2] = inset(positions[value[0]], positions[value[1]], 0.1);
+      board.append(svg("line", { x1, y1, x2, y2, ...style, "stroke-width": 13, opacity: 0.55, "stroke-linecap": "round" }));
+    } else if (type === "MOVE_ROBBER") {
+      const [cx, cy] = pixel(value[0]);
+      board.append(svg("polygon", { points: hexPoints(cx, cy, SIZE - 5), ...style }));
+    }
+  };
+  if (last && ON_BOARD.has(last[1])) mark(last, "#ffffff", false);
+  if (move && move.g !== "best" && move.g !== "excellent" && ON_BOARD.has(move.a[1])) mark(move.a, "#22c55e", true);
+}
+
+// The side panel: the eval bar, the graph of every seat's chance over the
+// game (click to jump), and the summary.
+function renderReview() {
+  const r = session, box = $("#review");
+  const colors = r.data.frames[0].colors;
+  if (!r.analysis) {
+    const why = r.reviewed() ? "No review yet: the house reviews a game a minute or two after it ends. It shows here when it lands."
+      : "Not reviewed: the house reviews games people played, of 20 moves or more.";
+    setHtml(box, html`<h3>Review</h3><p class="muted">${why}</p>`);
+    return;
+  }
+  const values = r.evalAt(r.at) || colors.map(() => Math.round(1000 / colors.length));
+  const bar = colors.map((c, i) => html`<span style="width:${values[i] / 10}%;background:${swatch(c)}" title="${seatName(c)} ${pct(values[i])}">${values[i] >= 120 ? pct(values[i]) : ""}</span>`);
+  const engine = (r.analysis.engine && r.analysis.engine.label) || "the network";
+  setHtml(box, html`<h3>Review <span class="muted">· ${engine}'s search</span></h3>
+    <div class="evalbar">${bar}</div><svg id="eval-graph" viewBox="0 0 300 90" preserveAspectRatio="none"></svg>
+    <div class="muted small">chance to win, by the mover's search at each decision</div>`);
+  const graph = $("#eval-graph");
+  const n = Math.max(1, r.length);
+  const x = (p) => (300 * p) / n, y = (pm) => 88 - (86 * pm) / 1000;
+  graph.append(svg("line", { x1: 0, y1: y(1000 / colors.length), x2: 300, y2: y(1000 / colors.length), stroke: "var(--line)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }));
+  const points = r.evals.map(([index, v]) => [index, v]);
+  if (r.data.game.winner) points.push([r.length, colors.map((c) => (c === r.data.game.winner ? 1000 : 0))]);
+  colors.forEach((c, i) => {
+    const d = points.map(([index, v], k) => `${k ? "L" : "M"}${x(index).toFixed(1)} ${y(v[i]).toFixed(1)}`).join(" ");
+    if (d) graph.append(svg("path", { d, fill: "none", stroke: inkOf(c), "stroke-width": 1.6, "vector-effect": "non-scaling-stroke" }));
+  });
+  for (const move of Object.values(r.moves)) {
+    if (move.g !== "blunder" && move.g !== "mistake") continue;
+    graph.append(svg("circle", { cx: x(move.i + 1), cy: y(move.p), r: 2.4, fill: move.g === "blunder" ? "var(--error)" : "var(--gold)" }));
+  }
+  graph.append(svg("line", { x1: x(r.at), y1: 0, x2: x(r.at), y2: 90, stroke: "var(--text)", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }));
+  graph.onclick = (event) => {
+    const rect = graph.getBoundingClientRect();
+    r.seek(((event.clientX - rect.left) / rect.width) * n);
+    render();
+  };
+  const grades = (r.analysis.summary && r.analysis.summary.grades) || {};
+  const rows = colors.map((c) => {
+    const counts = grades[c] || {};
+    const accuracy = r.analysis.summary.accuracy ? r.analysis.summary.accuracy[c] : null;
+    const marks = ["inaccuracy", "mistake", "blunder"].map((g) => (counts[g] ? html`<span class="grade grade-${g}">${counts[g]}${GRADES[g].mark}</span>` : html`<span class="grade muted">0${GRADES[g].mark}</span>`));
+    return html`<tr><td><span class="swatch" style="background:${swatch(c)}"></span>${seatName(c)}</td><td>${accuracy !== null && accuracy !== undefined ? `${accuracy}%` : "–"}</td><td>${marks}</td></tr>`;
+  });
+  const table = document.createElement("table");
+  table.className = "review-table";
+  setHtml(table, html`<tr><th></th><th>accuracy</th><th>?! ? ??</th></tr>${rows}`);
+  box.append(table);
+}
+
 function route() {
   const params = new URLSearchParams(location.hash.replace(/^#/, ""));
   const roomId = params.get("room");
-  if (roomId && /^[A-Za-z0-9_-]+$/.test(roomId)) {
+  const gameId = params.get("game");
+  if (gameId && /^[A-Za-z0-9_-]+$/.test(gameId)) {
+    openReplay(gameId, params.has("at") ? Number(params.get("at")) : null);
+  } else if (roomId && /^[A-Za-z0-9_-]+$/.test(roomId)) {
     ui.autoSit = params.get("sit") === "1" && !cryptoProblem;
     ui.table = params.get("table") || "";
     openRoom(roomId);
@@ -2040,11 +2373,15 @@ window.addEventListener("load", async () => {
   $("#create [name=num_players]").addEventListener("change", renderSeatSpecs);
   $("#refresh").onclick = refreshRooms;
   $("#show-finished").onchange = refreshRooms;
-  $("#lobby-name").onchange = saveName;
+  $("#lobby-name").onchange = () => { saveName(); refreshGames(); };
+  $("#games-toggle").onclick = () => { ui.allGames = !ui.allGames; refreshGames(); };
   $("#home").onclick = (event) => { event.preventDefault(); location.hash = ""; };
   renderAsciiBoard();
   $("#ascii-board").onclick = renderAsciiBoard;
-  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && ui.modal) closeModal(); });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && ui.modal) closeModal();
+    if (session && session.replay && !event.target.closest("input, textarea, select")) replayKey(event);
+  });
   setInterval(() => {
     if (session && session.game && session.pending && !session.answered) {
       $("#prompt").textContent = promptText();

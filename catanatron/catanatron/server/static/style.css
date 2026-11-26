@@ -487,3 +487,35 @@ svg text { pointer-events: none; font-family: "IBM Plex Mono", ui-monospace, mon
 @media (max-width: 370px) {
   #ascii-board { font-size: 0.625rem; }
 }
+
+/* ===== past games and their review ===== */
+.games .when { min-width: 11ch; }
+.games .seat.won, .won { color: var(--good); }
+#games-toggle { font-size: 0.8rem; text-transform: none; }
+.move-card { display: flex; flex-direction: column; gap: 2px; width: 100%; font-size: 0.85rem; }
+.move-card .label { font-size: 0.8rem; color: var(--muted); }
+.move-line .who { font-weight: 500; }
+.grade { font-weight: 500; }
+.grade-best { color: var(--good); }
+.grade-excellent, .grade-good { color: var(--muted); }
+.grade-inaccuracy { color: var(--gold); }
+.grade-mistake { color: #d9730d; }
+.grade-blunder { color: var(--error); }
+#actions .scrub { flex: 1 1 100%; min-width: 160px; accent-color: var(--text); }
+.evalbar { display: flex; height: 18px; border: 1px solid var(--line); margin: 4px 0 6px; overflow: hidden; }
+.evalbar span { display: flex; align-items: center; justify-content: center; color: #fff; font-size: 0.68rem;
+  text-shadow: 0 0 2px #000; transition: width 0.2s; white-space: nowrap; overflow: hidden; }
+#eval-graph { width: 100%; height: 90px; border: 1px solid var(--line); cursor: pointer; display: block; }
+.small { font-size: 0.72rem; }
+.review-table { width: 100%; font-size: 0.78rem; margin-top: 6px; border-collapse: collapse; }
+.review-table th { font-weight: 400; color: var(--muted); text-align: left; }
+.review-table td { padding: 1px 4px 1px 0; }
+.review-table .grade { margin-right: 0.8em; }
+.review-table .swatch, .games .swatch { display: inline-block; width: 0.7em; height: 0.7em; margin-right: 0.4em; }
+.player .hand-line { grid-column: 2 / -1; display: flex; gap: 8px; flex-wrap: wrap; font-size: 0.75rem; align-items: center; }
+.hand-count { display: inline-flex; align-items: center; gap: 2px; }
+.dev-count { color: var(--dev); }
+.player .accuracy { margin-left: auto; color: var(--muted); }
+#log li.clickable { cursor: pointer; }
+#log li.here { background: var(--soft); }
+#actions button.nav { flex: 1 1 0; min-width: 0; }
